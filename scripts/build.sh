@@ -56,9 +56,15 @@ SERVICES=(
 # ── Step 1: Build lakefusion_utility wheel ──────────────────────────────────
 info "Building lakefusion_utility wheel"
 UTIL_DIR="$REPO_ROOT/lakefusion-utility"
+# Use timestamp-based version so the wheel filename changes on every build.
+# This forces Databricks Apps to reinstall even when requirements.txt is cached.
+BUILD_VERSION="1.0.$(date +%Y%m%d%H%M%S)"
 (
     cd "$UTIL_DIR"
+    sed "s/version=\"1.0.0\"/version=\"${BUILD_VERSION}\"/" setup.py > /tmp/lf_util_setup.py
+    cp /tmp/lf_util_setup.py setup.py
     python3 -m pip wheel --no-deps --wheel-dir "$OUT/wheels" . 2>&1 | tail -3
+    git checkout setup.py 2>/dev/null  # restore original
 )
 WHEEL_FILE=$(ls "$OUT/wheels"/lakefusion_utility-*.whl 2>/dev/null | head -1)
 if [[ -z "$WHEEL_FILE" ]]; then

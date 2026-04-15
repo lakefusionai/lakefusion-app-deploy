@@ -112,6 +112,13 @@ cp -R "$REPO_ROOT/dbx_pipeline_artifacts" "$OUT/dbx_pipeline_artifacts"
 find "$OUT/dbx_pipeline_artifacts" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 find "$OUT/dbx_pipeline_artifacts" -name "*.pyc" -delete 2>/dev/null || true
 
+# ── Step 3d: Copy deployment utilities ───────────────────────────────────────
+if [[ -d "$REPO_ROOT/utilities" ]]; then
+    info "Copying utilities → deployments/"
+    mkdir -p "$OUT/deployments"
+    cp -R "$REPO_ROOT/utilities/"* "$OUT/deployments/"
+fi
+
 # ── Step 4: Copy MCP static files if they exist ────────────────────────────
 if [[ -d "$REPO_ROOT/lakefusion-mcp-service/app/static" ]]; then
     info "Copying MCP static files"

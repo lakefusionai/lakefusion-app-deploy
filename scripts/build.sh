@@ -5,7 +5,7 @@
 # Assembles the unified LakeFusion Databricks App from the monorepo services.
 # - Builds lakefusion_utility as a wheel (installed via requirements.txt)
 # - Copies each service's app/ folder as a subpackage, rewrites `from app.` imports
-# - Generates a unified main.py, merged requirements.txt, and app.yaml
+# - Generates a unified main.py, merged requirements.txt, and app.yml
 #
 # Usage:  bash scripts/build_lakefusion_app.sh
 # =============================================================================
@@ -747,9 +747,9 @@ with open(out_path, 'w') as f:
 print(f"Wrote {len(sorted_pkgs)} packages + utility wheel to {out_path}")
 MERGE_SCRIPT
 
-# ── Step 10: Generate app.yaml ──────────────────────────────────────────────
-info "Generating app.yaml"
-cat > "$OUT/app.yaml" << 'YAMLEOF'
+# ── Step 10: Generate app.yml ──────────────────────────────────────────────
+info "Generating app.yml"
+cat > "$OUT/app.yml" << 'YAMLEOF'
 name: lakefusion-app
 
 # Allow Authorization header to pass through for API routes

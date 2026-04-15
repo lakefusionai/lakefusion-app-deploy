@@ -1,8 +1,0 @@
-{
-  "imports": {
-    "@lakefusion/root-config": "/static/lakefusion-root-config.js",
-    "@lakefusion/main-portal": "/static/lakefusion-main.js",
-    "@lakefusion/utility-portal": "/static/lakefusion-utility.js",
-    "@lakefusion/selfservice": "/static/lakefusion-selfservice.js"
-  }
-}

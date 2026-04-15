@@ -227,10 +227,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Middleware
+# Middleware to handle Databricks Apps authentication
+from fastapi import Request as FastAPIRequest
+
+@app.middleware("http")
+async def databricks_auth_middleware(request: FastAPIRequest, call_next):
+    """
+    Handle Databricks authentication for API routes.
+    In Databricks Apps, authentication is handled automatically via cookies/headers.
+    This middleware ensures proper header propagation.
+    """
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

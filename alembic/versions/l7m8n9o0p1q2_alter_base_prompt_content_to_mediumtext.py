@@ -1,7 +1,7 @@
 """alter base_prompt content to mediumtext with utf8mb4
 
 Revision ID: l7m8n9o0p1q2
-Revises: k6l7m8n9o0p1
+Revises: d4e5f6a7b8c9
 Create Date: 2026-02-26
 
 Alter base_prompts.content from TEXT (~64KB) to MEDIUMTEXT (~16MB)
@@ -17,7 +17,7 @@ from sqlalchemy.dialects import mysql
 
 # revision identifiers, used by Alembic.
 revision: str = 'l7m8n9o0p1q2'
-down_revision: Union[str, None] = 'k6l7m8n9o0p1'
+down_revision: Union[str, None] = 'd4e5f6a7b8c9'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

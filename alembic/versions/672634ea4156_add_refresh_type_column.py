@@ -1,7 +1,7 @@
 """add_refresh_type_column
 
 Revision ID: 672634ea4156
-Revises: 7c2da5be97b2
+Revises: 2a8b9c1d3e4f
 Create Date: 2026-01-27 12:02:35.271953
 
 """
@@ -15,7 +15,7 @@ import logging
 
 # revision identifiers, used by Alembic.
 revision: str = '672634ea4156'
-down_revision: Union[str, None] = '7c2da5be97b2'
+down_revision: Union[str, None] = '2a8b9c1d3e4f'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1,7 +1,7 @@
 """add_audit_logs_extended_fields
 
 Revision ID: 8f737e01bcd2
-Revises: 1ace0c7b0781
+Revises: o0p1q2r3s4t5
 Create Date: 2026-01-20 16:25:09.133457
 
 Adds new columns to audit_logs table for comprehensive request tracking:
@@ -21,7 +21,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '8f737e01bcd2'
-down_revision: Union[str, None] = '1ace0c7b0781'
+down_revision: Union[str, None] = 'o0p1q2r3s4t5'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

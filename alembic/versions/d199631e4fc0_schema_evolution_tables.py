@@ -1,7 +1,7 @@
 """schema evolution tables
 
 Revision ID: d199631e4fc0
-Revises: l7m8n9o0p1q2
+Revises: k6l7m8n9o0p1
 Create Date: 2026-03-02 00:13:18.271369
 
 """
@@ -15,7 +15,7 @@ import logging
 
 # revision identifiers, used by Alembic.
 revision: str = 'd199631e4fc0'
-down_revision: Union[str, None] = 'o0p1q2r3s4t5'
+down_revision: Union[str, None] = 'k6l7m8n9o0p1'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

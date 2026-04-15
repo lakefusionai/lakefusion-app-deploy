@@ -14,7 +14,10 @@ app_logger = get_logger(__name__)
 
 # Environment variables for Databricks configuration
 databricks_host = os.environ.get("DATABRICKS_HOST", "https://adb-490026345444040.0.azuredatabricks.net")
-portal_url = os.environ.get("REDIRECT_URI", "http://localhost:3000")
+if databricks_host and not databricks_host.startswith(("http://", "https://")):
+    databricks_host = f"https://{databricks_host}"
+databricks_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+portal_url = os.environ.get("REDIRECT_URI", databricks_app_url or "http://localhost:3000")
 databricks_oidc_client_id = os.environ.get("DATABRICKS_OIDC_CLIENT_ID", "")
 databricks_oidc_client_secret = os.environ.get("DATABRICKS_OIDC_CLIENT_SECRET", "")
 

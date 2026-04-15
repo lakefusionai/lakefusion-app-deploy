@@ -1,0 +1,7 @@
+{
+  "revision": "4baa643b7fe5_unified_prod_testmigration",
+  "down_revision": "0ea5a919a9ee_test_migration",
+  "description": "Create entity-specific testmigration table based on unified_prod schema",
+  "created_at": "2024-11-20T11:00:00Z",
+  "author": "nbharadwaj@lakefusion.ai"
+}

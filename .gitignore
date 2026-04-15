@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.so
+.Python
+venv/
+.venv/
+.idea/
+.vscode/
+.env
+.env.local
+.databricks/
+*.log

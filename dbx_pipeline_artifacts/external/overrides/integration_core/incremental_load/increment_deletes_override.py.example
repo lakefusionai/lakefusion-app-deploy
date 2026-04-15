@@ -1,0 +1,124 @@
+"""
+Example Override for IncrementDeletes.
+
+This file allows customers to customize the pre and post execution
+phases of Increment Deletes without modifying the core LakeFusion code.
+
+Location:
+    external/overrides/integration_core/incremental_load/increment_deletes_override.py.example
+
+To enable:
+1. Copy this file and remove the .example extension
+2. Implement pre_execute() and/or post_execute() methods
+3. The executor will automatically detect and use these overrides
+
+Override Modes:
+    - Replace (default): Your methods run INSTEAD of default task methods
+    - Extend (opt-in): Default methods run FIRST, then your methods run
+
+    To enable extend mode, add class attributes:
+        extend_pre_execute = True   # Default pre_execute runs first, then yours
+        extend_post_execute = True  # Default post_execute runs first, then yours
+
+Note: The execute() phase (core business logic) cannot be overridden.
+"""
+
+from lakefusion_core_engine.executors.models import TaskContext, TaskResult
+
+
+class IncrementDeletesExtended:
+    """
+    Extended class to override Increment Deletes pre/post execution.
+
+    Override Modes:
+        - Replace (default): Methods run INSTEAD of default (no attributes needed)
+        - Extend (opt-in): Set extend_pre_execute=True and/or extend_post_execute=True
+
+    Methods:
+        pre_execute(context) - Called BEFORE core logic
+        post_execute(context, result) - Called AFTER core logic
+    """
+
+    # ============================================================
+    # OVERRIDE MODE CONFIGURATION
+    # ============================================================
+    # Uncomment the following to enable EXTEND mode:
+    # When True, default task method runs FIRST, then your method runs
+    # When False or omitted (default), your method REPLACES the default
+    #
+    # extend_pre_execute = True
+    # extend_post_execute = True
+    # ============================================================
+
+    def pre_execute(self, context: TaskContext) -> TaskContext:
+        """
+        Custom PRE phase.
+
+        Mode behavior:
+            - Replace (default): Runs INSTEAD of default pre_execute()
+            - Extend: Runs AFTER default pre_execute()
+
+        Use cases:
+        - Add custom validation rules
+        - Enrich context with additional data
+        - Log to external systems
+        - Apply customer-specific business rules
+
+        Args:
+            context: TaskContext with inputs
+
+        Returns:
+            Modified TaskContext
+        """
+        print("="*60)
+        print("CUSTOM PRE-EXECUTE: IncrementDeletesExtended")
+        print("="*60)
+
+        # Example: Add custom validation
+        # if not context.params.get('required_param'):
+        #     raise ValueError("required_param is missing")
+
+        # Example: Add custom state
+        # context.state['custom_flag'] = True
+
+        print(f"  Entity: {context.entity}")
+        print(f"  Catalog: {context.catalog_name}")
+
+        return context
+
+    def post_execute(self, context: TaskContext, result: TaskResult) -> TaskResult:
+        """
+        Custom POST phase.
+
+        Mode behavior:
+            - Replace (default): Runs INSTEAD of default post_execute()
+            - Extend: Runs AFTER default post_execute()
+
+        Use cases:
+        - Send notifications (email, Slack, etc.)
+        - Write to external audit systems
+        - Transform results for downstream systems
+        - Add custom metadata
+
+        Args:
+            context: TaskContext with state
+            result: TaskResult from execute phase
+
+        Returns:
+            Modified TaskResult
+        """
+        print("="*60)
+        print("CUSTOM POST-EXECUTE: IncrementDeletesExtended")
+        print("="*60)
+
+        # Example: Add custom metadata
+        # result.metrics['custom_flag'] = True
+
+        # Example: Send notification
+        # if result.is_success:
+        #     send_notification(f"Task completed: {result.message}")
+
+        print(f"  Status: {result.status}")
+        print(f"  Message: {result.message}")
+
+        return result

@@ -1,0 +1,7 @@
+{
+  "revision": "a3a1ccf81894_migrate_entity_v3_to_v4",
+  "down_revision": null,
+  "description": "Migrating Entity from v3.0.0 to v4.0.0",
+  "created_at": "2025-12-01T05:50:08Z",
+  "author": "lstany@lakefusion.ai"
+}

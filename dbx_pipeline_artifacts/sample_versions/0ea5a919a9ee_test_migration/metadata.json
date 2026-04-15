@@ -1,0 +1,7 @@
+{
+  "revision": "0ea5a919a9ee_test_migration",
+  "down_revision": null,
+  "description": "Create test_migration table in silver schema",
+  "created_at": "2024-11-20T10:00:00Z",
+  "author": "nbharadwaj@lakefusion.ai"
+}

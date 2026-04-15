@@ -172,33 +172,28 @@ def upload_to_databricks(session: Session, entity_id: int, survivorship_data: li
     Returns True if successful, False otherwise.
     """
     try:
-        from databricks.sdk import WorkspaceClient
+        from lakefusion_utility.utils.databricks_util import _create_workspace_client
         from io import BytesIO
-        
+
         # Get Databricks configuration
-        databricks_host = os.environ.get('DATABRICKS_HOST')
         databricks_token = os.environ.get('DATABRICKS_TOKEN')
-        
-        if not databricks_host or not databricks_token:
-            print(f"  Warning: DATABRICKS_HOST or DATABRICKS_TOKEN not set. Skipping Databricks upload.")
-            return False
-        
+
         # Get catalog name from config
         catalog_query = text("""
-            SELECT config_value 
-            FROM config_properties 
+            SELECT config_value
+            FROM config_properties
             WHERE config_key = 'catalog_name'
         """)
         catalog_result = session.execute(catalog_query).fetchone()
-        
+
         if not catalog_result:
             print(f"  Warning: catalog_name not found in config. Skipping Databricks upload.")
             return False
-        
+
         catalog_name = catalog_result.config_value
-        
+
         # Initialize Databricks client
-        w = WorkspaceClient(host=databricks_host, token=databricks_token)
+        w = _create_workspace_client(databricks_token)
         
         # Build volume path for production survivorship
         volume_path = f"/Volumes/{catalog_name}/metadata/metadata_files"

@@ -79,21 +79,17 @@ def upgrade() -> None:
     ).fetchone()
 
     if result is None:
-        # Key doesn't exist yet — use savepoint so a failed INSERT doesn't abort
-        # the entire PG transaction (MySQL auto-recovers, PG does not)
-        nested = conn.begin_nested()
+        # Key doesn't exist yet — config_defaults may seed it later, safe to skip
         try:
             conn.execute(
                 sa.text(
                     "INSERT INTO db_config_properties (config_key, config_value, config_value_type, config_label, config_desc, config_category, config_show) "
-                    "VALUES ('default_prompt', :val, 'STRING', 'Default Prompt', "
+                    "VALUES ('default_prompt', :val, 'string', 'Default Prompt', "
                     "'Provides the base instruction for entity matching and similarity scoring.', 'GENERAL', 1)"
                 ),
                 {"val": NEW_PROMPT}
             )
-            nested.commit()
         except Exception as e:
-            nested.rollback()
             logger.info(f"Skipping default_prompt insert — will be seeded by config_defaults: {e}")
     elif result[0] != NEW_PROMPT:
         # Key exists but value differs, update it

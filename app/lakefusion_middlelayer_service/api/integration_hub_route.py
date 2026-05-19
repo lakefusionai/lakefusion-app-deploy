@@ -30,6 +30,8 @@ def read_integration_hub(is_active: bool = True, db: Session = Depends(get_db), 
 
 class DeleteIntegrationHubPayload(BaseModel):
     job_ids: List[int]
+    drop_tables: bool = False  # When True, also DROP entity tables/views and the VS index
+    warehouse_id: str | None = None  # SQL warehouse to run the DROP statements against
 
 @integration_hub_router.post("/sync", response_model=Integration_HubResponse)
 def sync_integration_hub(integration_hub_id: int , db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
@@ -42,7 +44,13 @@ def sync_integration_hub(integration_hub_id: int , db: Session = Depends(get_db)
 def delete_integration_hub(integration_id: int, payload: DeleteIntegrationHubPayload, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     token = check.get('token')
     service = Integration_HubService(db)
-    return service.delete_integration_hub(integration_id, payload.job_ids, token)
+    return service.delete_integration_hub(
+        integration_id,
+        payload.job_ids,
+        token,
+        drop_tables=payload.drop_tables,
+        warehouse_id=payload.warehouse_id,
+    )
 
 @integration_hub_router.patch("/{task_id}", response_model=Integration_HubResponse)
 def update_integration_hub(task: Integration_HubUpdate, task_id: int, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
@@ -111,7 +119,17 @@ def update_ref_sync_pipeline(
 @integration_hub_router.delete("/ref-sync/{task_id}")
 def delete_ref_sync_pipeline(
     task_id: int,
+    drop_tables: bool = False,
+    delete_job: bool = False,
+    warehouse_id: str | None = None,
     db: Session = Depends(get_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    return RefEntitySyncPipelineService(db).delete(task_id)
+    token = check.get('token')
+    return RefEntitySyncPipelineService(db).delete(
+        task_id,
+        token=token,
+        drop_tables=drop_tables,
+        delete_job=delete_job,
+        warehouse_id=warehouse_id,
+    )

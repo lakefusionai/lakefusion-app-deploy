@@ -125,7 +125,7 @@ master_merge_chain AS (
         ma.version as merge_version,
         ma.created_at as merge_timestamp
     FROM {merge_activities_table} ma
-    WHERE ma.action_type IN ('MASTER_JOB_MERGE', 'MASTER_MANUAL_MERGE','MANUAL_FORCE_MERGE')
+    WHERE ma.action_type IN ('MASTER_JOB_MERGE', 'MASTER_MANUAL_MERGE','MASTER_FORCE_MERGE')
 ),
 unified_contributors AS (
     -- Get all MERGED records from unified table

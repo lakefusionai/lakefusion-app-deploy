@@ -148,7 +148,7 @@ logger.info("\n" + "="*80)
 logger.info("STEP 3: PREPARE MASTER RECORDS")
 logger.info("="*80)
 
-from pyspark.sql.functions import concat_ws
+from pyspark.sql.functions import concat_ws, coalesce
 
 # Select entity attributes plus lakefusion_id
 master_columns = [id_key] + [attr for attr in entity_attributes if attr != id_key]
@@ -159,7 +159,7 @@ combine_attrs = [attr for attr in match_attributes]
 new_masters_df = unmatched_with_id_df.select(*master_columns) \
     .withColumn(
         "attributes_combined",
-        concat_ws(" | ", *[col(attr) for attr in combine_attrs])
+        concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
     )
 
 logger.info("Prepared new master records")

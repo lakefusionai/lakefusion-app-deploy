@@ -12,9 +12,13 @@ import jwt
 
 app_logger = get_logger(__name__)
 
-# Environment variables for Databricks configuration
-databricks_host = os.environ.get("DATABRICKS_HOST", "https://adb-490026345444040.0.azuredatabricks.net")
-portal_url = os.environ.get("REDIRECT_URI", "http://localhost:3000")
+# Environment variables for Databricks configuration.
+# get_databricks_host() returns the env value with https:// prefix guaranteed,
+# or empty string if unset — we keep the long-standing dev default in that case.
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+databricks_host = get_databricks_host()
+databricks_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+portal_url = os.environ.get("REDIRECT_URI", databricks_app_url or "http://localhost:3000")
 databricks_oidc_client_id = os.environ.get("DATABRICKS_OIDC_CLIENT_ID", "")
 databricks_oidc_client_secret = os.environ.get("DATABRICKS_OIDC_CLIENT_SECRET", "")
 

@@ -842,14 +842,21 @@ if all_master_updates:
         master_update_schema.add(StructField('attributes_combined', StringType(), True))
     
     df_master_updates = spark.createDataFrame(all_master_updates, schema=master_update_schema)
-    
+
     # Perform merge
     master_delta = DeltaTable.forName(spark, master_table)
-    
+
+    # Build update dict for explicit column mapping
+    update_dict = {f.name: f"source.{f.name}" for f in master_update_schema}
+    # Invalidate precomputed embedding so it recomputes on next pipeline run
+    master_cols_lower = {f.name.strip().lower() for f in spark.table(master_table).schema}
+    if "attributes_combined_embedding" in master_cols_lower:
+        update_dict["attributes_combined_embedding"] = "NULL"
+
     master_delta.alias("target").merge(
         source=df_master_updates.alias("source"),
         condition="target.lakefusion_id = source.lakefusion_id"
-    ).whenMatchedUpdateAll().execute()
+    ).whenMatchedUpdate(set=update_dict).execute()
     
     # Get new master version after updates
     new_master_version = spark.sql(f"DESCRIBE HISTORY {master_table} LIMIT 1").first()['version']
@@ -1022,7 +1029,7 @@ if deleted_lakefusion_ids:
         df_matched_keys = spark.sql(f"""
             SELECT DISTINCT u.surrogate_key
             FROM {unified_table} u
-            LATERAL VIEW explode(split(u.search_results, '[,\\\\s\\\\[\\\\]]+')) AS token
+            LATERAL VIEW explode(split(u.search_results, '[,\\\\s\\\\[\\\\]"]+')) AS token
             WHERE u.record_status = 'ACTIVE'
             AND u.search_results IS NOT NULL
             AND u.search_results != ''
@@ -1055,7 +1062,7 @@ if deleted_lakefusion_ids:
         df_matched_dedup_keys = spark.sql(f"""
             SELECT DISTINCT u.lakefusion_id
             FROM {unified_deduplicate_table} u
-            LATERAL VIEW explode(split(u.search_results, '[,\\\\s\\\\[\\\\]]+')) AS token
+            LATERAL VIEW explode(split(u.search_results, '[,\\\\s\\\\[\\\\]"]+')) AS token
             WHERE u.search_results IS NOT NULL
             AND u.search_results != ''
             AND token IN (SELECT deleted_id FROM _step6_deleted_ids)

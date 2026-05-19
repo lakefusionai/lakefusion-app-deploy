@@ -822,11 +822,9 @@ def warm_up_embedding_endpoint(
     spark = SparkSession.builder.getOrCreate()
 
     def execute_fn():
-        # Use ai_query() via Spark SQL to warm up the embedding endpoint
-        # This is the same approach used for LLM warm-up
-        warmup_query = f"SELECT ai_query('{embedding_endpoint}', 'warm up test') LIMIT 1"
+        # Force evaluation via .collect() — Spark is lazy, an unmaterialized query won't call the endpoint
+        warmup_query = f"SELECT CAST(ai_query('{embedding_endpoint}', 'warm up test') AS ARRAY<FLOAT>)"
         spark.sql(warmup_query).collect()
-        return True
 
     return _retry_with_backoff(
         endpoint_name=embedding_endpoint,

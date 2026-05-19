@@ -131,7 +131,8 @@ logger.info(f"All match attributes (combined): {all_match_attrs}")
 if not all_match_attrs:
     logger.info("No match attributes to combine - skipping")
 else:
-    match_cols = ", ".join([f"CAST(`{a}` AS STRING)" for a in all_match_attrs])
+    # Use COALESCE to preserve null positions as empty strings between separators
+    match_cols = ", ".join([f"COALESCE(CAST(`{a}` AS STRING), '')" for a in all_match_attrs])
 
     # Update master table
     logger.info(f"Updating attributes_combined on master table: {master_table}")

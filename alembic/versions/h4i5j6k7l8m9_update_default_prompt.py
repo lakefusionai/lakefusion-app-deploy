@@ -8,6 +8,7 @@ Updates the default_prompt in db_config_properties to match the prompt
 used in Entity_Matching_LLM_Experiment.py, only if the current value
 differs.
 """
+
 from typing import Sequence, Union
 
 from alembic import op
@@ -17,10 +18,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
-revision: str = 'h4i5j6k7l8m9'
-down_revision: Union[str, None] = 'g3h4i5j6k7l8'
+revision: str = "h4i5j6k7l8m9"
+down_revision: Union[str, None] = "g3h4i5j6k7l8"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
+
 
 NEW_PROMPT = """You are an expert in classifying two records as matching or not matching.
 You will be provided with a golden record and a list of potential matches.
@@ -49,12 +51,14 @@ Follow these rules for input and output:
   - match_record: Pipe-separated fields (BEFORE first comma inside brackets)
   - lakefusion_id: 32-character hexadecimal string (BETWEEN first and second comma)
   - score: Decimal number (AFTER second comma, before closing bracket)
+
 **CRITICAL EXTRACTION RULES:**
 - For EACH entry in the list, you MUST extract the lakefusion_id
 - The lakefusion_id is ALWAYS between the FIRST comma and SECOND comma inside each bracket
 - If you cannot find a valid lakefusion_id, DO NOT return that entry
 - lakefusion_id format: 32 lowercase hexadecimal characters (a-f, 0-9)
 - Example valid lakefusion_id: d728dead49f8c4bbbf0be3dcdc65d215
+
 **Output:**
 Only return a plain JSON list of objects:
 1. No extra text, no headers, no introductory phrases, and no comments.
@@ -72,35 +76,118 @@ Only return a plain JSON list of objects:
 
 def upgrade() -> None:
     """Update default_prompt only if current value differs."""
+
     conn = op.get_bind()
 
+    # --------------------------------------------------------------
+    # Check existing value
+    # --------------------------------------------------------------
+
     result = conn.execute(
-        sa.text("SELECT config_value FROM db_config_properties WHERE config_key = 'default_prompt'")
+        sa.text(
+            """
+            SELECT config_value
+            FROM db_config_properties
+            WHERE config_key = 'default_prompt'
+            """
+        )
     ).fetchone()
 
+    # --------------------------------------------------------------
+    # Insert if missing
+    # --------------------------------------------------------------
+
     if result is None:
-        # Key doesn't exist yet — config_defaults may seed it later, safe to skip
+
         try:
+
             conn.execute(
                 sa.text(
-                    "INSERT INTO db_config_properties (config_key, config_value, config_value_type, config_label, config_desc, config_category, config_show) "
-                    "VALUES ('default_prompt', :val, 'string', 'Default Prompt', "
-                    "'Provides the base instruction for entity matching and similarity scoring.', 'GENERAL', 1)"
+                    """
+                    INSERT INTO db_config_properties
+                    (
+                        config_key,
+                        config_value,
+                        config_value_type,
+                        config_label,
+                        config_desc,
+                        config_category,
+                        config_show
+                    )
+                    VALUES
+                    (
+                        :config_key,
+                        :config_value,
+                        :config_value_type,
+                        :config_label,
+                        :config_desc,
+                        :config_category,
+                        :config_show
+                    )
+                    """
                 ),
-                {"val": NEW_PROMPT}
+                {
+                    "config_key": "default_prompt",
+                    "config_value": NEW_PROMPT,
+                    "config_value_type": "string",
+                    "config_label": "Default Prompt",
+                    "config_desc": (
+                        "Provides the base instruction for entity "
+                        "matching and similarity scoring."
+                    ),
+                    "config_category": "GENERAL",
+                    "config_show": True,
+                }
             )
+
+            logger.info(
+                "Inserted default_prompt configuration successfully."
+            )
+
         except Exception as e:
-            logger.info(f"Skipping default_prompt insert — will be seeded by config_defaults: {e}")
+
+            # PostgreSQL requires rollback after failed query
+            conn.rollback()
+
+            logger.info(
+                f"Skipping default_prompt insert "
+                f"(may be seeded elsewhere): {e}"
+            )
+
+    # --------------------------------------------------------------
+    # Update if changed
+    # --------------------------------------------------------------
+
     elif result[0] != NEW_PROMPT:
-        # Key exists but value differs, update it
+
         conn.execute(
             sa.text(
-                "UPDATE db_config_properties SET config_value = :val WHERE config_key = 'default_prompt'"
+                """
+                UPDATE db_config_properties
+                SET config_value = :config_value
+                WHERE config_key = :config_key
+                """
             ),
-            {"val": NEW_PROMPT}
+            {
+                "config_key": "default_prompt",
+                "config_value": NEW_PROMPT,
+            }
+        )
+
+        logger.info(
+            "Updated default_prompt configuration successfully."
+        )
+
+    else:
+
+        logger.info(
+            "default_prompt already up to date. No changes required."
         )
 
 
 def downgrade() -> None:
-    """We don't restore the old prompt as it may vary per environment."""
+    """
+    We do not restore the old prompt because
+    values may differ across environments.
+    """
     pass

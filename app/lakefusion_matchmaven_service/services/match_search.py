@@ -10,13 +10,18 @@ from mlflow.deployments import get_deploy_client
 
 from lakefusion_utility.models.integration_hub import Integration_Hub
 from lakefusion_utility.models.dbconfig import DBConfigProperties
+from lakefusion_utility.models.entity import Entity, EntityAttributes
+from lakefusion_utility.models.dataset import Dataset
 from lakefusion_utility.utils.databricks_util import DataSetSQLService
 from lakefusion_utility.utils.logging_utils import get_logger
+from lakefusion_utility.models.httpresponse import HttpResponse
 from app.lakefusion_matchmaven_service.services.llm_response_parser import LLMResponseParser
 
 app_logger = get_logger(__name__)
 
-DATABRICKS_HOST = os.environ.get('DATABRICKS_HOST', 'https://databricks.com')
+# Shared helper guarantees the https:// prefix is present.
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+DATABRICKS_HOST = get_databricks_host() or "https://databricks.com"
 
 class MatchSearchService:
     """Service for real-time match and search operations"""
@@ -144,7 +149,11 @@ Take into account:
             
             # Build vector search index name
             entity_name = entity.name.lower().replace(' ', '_')
-            vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index"
+            embedding_mode = model_experiment.embedding_mode or "managed"
+            if embedding_mode == "precomputed":
+                vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index_v2"
+            else:
+                vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index"
             
             # Extract thresholds
             config_threshold = model_experiment.config_thresold or {}
@@ -168,6 +177,7 @@ Take into account:
                 "embedding_endpoint": embedding_endpoint,
                 "vs_endpoint": model_experiment.vs_endpoint,
                 "vs_index_name": vs_index_name,
+                "embedding_mode": embedding_mode,
                 "max_potential_matches": model_experiment.max_potential_matches or 3,
                 "match_thresholds": match_thresholds,
                 "additional_instructions": additional_instructions
@@ -404,6 +414,20 @@ Take into account:
         app_logger.info(f"Formatted input for embedding: {formatted}")
         return formatted
 
+    def _compute_query_embedding(self, text: str, config: Dict[str, Any], token: str) -> list:
+        """Compute embedding vector for query text using the embedding endpoint."""
+        os.environ['DATABRICKS_TOKEN'] = token
+        if not os.environ.get('DATABRICKS_HOST'):
+            os.environ['DATABRICKS_HOST'] = DATABRICKS_HOST
+
+        from mlflow.deployments import get_deploy_client
+        deploy_client = get_deploy_client("databricks")
+        response = deploy_client.predict(
+            endpoint=config['embedding_endpoint'],
+            inputs={"input": [text]}
+        )
+        return response['data'][0]['embedding']
+
     def query_vector_search(
         self,
         formatted_text: str,
@@ -440,11 +464,19 @@ Take into account:
             all_column_names = [attr['name'] for attr in config['all_entity_attributes']]
             columns_to_fetch = ["lakefusion_id", "attributes_combined"] + all_column_names
             
-            results = index.similarity_search(
-                query_text=formatted_text,
-                columns=columns_to_fetch,
-                num_results=top_n
-            )
+            if config.get('embedding_mode') == 'precomputed':
+                query_vector = self._compute_query_embedding(formatted_text, config, token)
+                results = index.similarity_search(
+                    query_vector=query_vector,
+                    columns=columns_to_fetch,
+                    num_results=top_n
+                )
+            else:
+                results = index.similarity_search(
+                    query_text=formatted_text,
+                    columns=columns_to_fetch,
+                    num_results=top_n
+                )
             
             # Parse results
             candidates = []
@@ -979,3 +1011,130 @@ Possible entities: {json.dumps(candidates_for_llm)}"""
                     "detail": {"entity_id": entity_id}
                 }
             )
+
+    # ── Reference Mappings for Model Experiments ─────────────────────────────
+
+    def _get_ref_entity_name(self, ref_entity_id: int) -> str:
+        """Get the snake_case name for a reference entity by ID."""
+        entity = self.db.query(Entity).filter(Entity.id == ref_entity_id).first()
+        if not entity:
+            raise HTTPException(status_code=404, detail=f"Reference entity {ref_entity_id} not found")
+        return entity.name.lower().replace(" ", "_")
+
+    def _get_ref_entities_for_master(self, entity_id: int) -> list:
+        """Get all reference entities linked to a master entity's REFERENCE_ENTITY attributes.
+        Returns list of {ref_entity_id, ref_entity_name, attribute_name, output_attr}.
+        """
+        attrs = (
+            self.db.query(EntityAttributes)
+            .filter(EntityAttributes.entity_id == entity_id, EntityAttributes.type == "REFERENCE_ENTITY")
+            .all()
+        )
+        ref_entities = []
+        seen_ref_ids = set()
+        for attr in attrs:
+            tc = attr.type_config or {}
+            if isinstance(tc, str):
+                try:
+                    tc = json.loads(tc)
+                except (json.JSONDecodeError, TypeError):
+                    tc = {}
+            ref_entity_id = tc.get("reference_entity_id")
+            if not ref_entity_id or ref_entity_id in seen_ref_ids:
+                continue
+            seen_ref_ids.add(ref_entity_id)
+            ref_entity_name = self._get_ref_entity_name(int(ref_entity_id))
+            ref_entities.append({
+                "ref_entity_id": int(ref_entity_id),
+                "ref_entity_name": ref_entity_name,
+            })
+        return ref_entities
+
+    def fetch_reference_mappings(
+        self,
+        token: str,
+        entity_id: int,
+        model_id: int,
+        ref_entity_id: int,
+        warehouse_id: str,
+        page: int = 1,
+        page_size: int = 50,
+        status_filter: list | None = None,
+        filters=None,
+    ):
+        """Fetch reference mappings for a model experiment.
+        Table: {catalog}.gold.{ref_entity_name}_reference_mappings_{model_id}
+        Logic mirrors EntitySearchService.fetch_reference_mappings_records.
+        """
+        try:
+            ref_entity_name = self._get_ref_entity_name(ref_entity_id)
+            table = f"`{self.catalog_name}`.`gold`.`{ref_entity_name}_reference_mappings_{model_id}`"
+
+            where_parts = ["status != 'REJECTED'"]
+            if status_filter:
+                quoted = ", ".join(f"'{s}'" for s in status_filter)
+                where_parts.append(f"status IN ({quoted})")
+            if filters:
+                for f in filters:
+                    col = f.get("column", "").replace("`", "")
+                    op = f.get("operator", "equals")
+                    val = f.get("value", "")
+                    if col and val:
+                        if op == "equals":
+                            where_parts.append(f"`{col}` = '{val}'")
+                        elif op == "contains":
+                            where_parts.append(f"`{col}` LIKE '%{val}%'")
+                        elif op == "not_equals":
+                            where_parts.append(f"`{col}` != '{val}'")
+
+            where_clause = f"WHERE {' AND '.join(where_parts)}"
+            offset = (page - 1) * page_size
+
+            rows = DataSetSQLService(token, warehouse_id).execute_dataset(
+                f"SELECT *, COUNT(*) OVER() AS _total FROM {table} "
+                f"{where_clause} "
+                f"ORDER BY CASE status WHEN 'NO_MATCH' THEN 1 WHEN 'PENDING' THEN 2 ELSE 3 END, mapping_id DESC "
+                f"LIMIT {page_size} OFFSET {offset}"
+            )
+
+            total_count = rows[0]["_total"] if rows else 0
+            rows = [{k: v for k, v in r.items() if k != "_total"} for r in rows]
+
+            # Enrich with source_name from app DB
+            source_ids = list({int(r["source_id"]) for r in rows if r.get("source_id") is not None})
+            if source_ids:
+                datasets = self.db.query(Dataset).filter(Dataset.id.in_(source_ids)).all()
+                dataset_name_map = {d.id: d.name for d in datasets}
+                for r in rows:
+                    sid = r.get("source_id")
+                    r["source_name"] = dataset_name_map.get(int(sid)) if sid is not None else None
+
+            # Enrich ref_record with live data from _reference_prod
+            try:
+                ref_ids = list({r["ref_lakefusion_id"] for r in rows if r.get("ref_lakefusion_id")})
+                if ref_ids:
+                    ref_prod_table = f"`{self.catalog_name}`.`gold`.`{ref_entity_name}_reference_prod`"
+                    quoted_ids = ", ".join(f"'{rid}'" for rid in ref_ids)
+                    ref_rows = DataSetSQLService(token, warehouse_id).execute_dataset(
+                        f"SELECT * FROM {ref_prod_table} WHERE ref_lakefusion_id IN ({quoted_ids})"
+                    )
+                    ref_record_map = {}
+                    for rr in ref_rows:
+                        rr_dict = rr if isinstance(rr, dict) else dict(rr)
+                        ref_lf_id = rr_dict.get("ref_lakefusion_id")
+                        if ref_lf_id:
+                            ref_record_map[ref_lf_id] = rr_dict
+                    for r in rows:
+                        rid = r.get("ref_lakefusion_id")
+                        r["ref_record"] = ref_record_map.get(rid) if rid else None
+            except Exception as e:
+                app_logger.warning(f"Failed to enrich ref_record from _reference_prod: {e}")
+
+            return HttpResponse(status=200, data=rows, totalCount=total_count, has_more=(offset + len(rows)) < total_count)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            message = traceback.format_exc()
+            app_logger.exception(f"Failed to fetch reference mappings for model {model_id}: {message}")
+            raise HTTPException(status_code=500, detail=f"Failed to fetch reference mappings: {str(e)}")

@@ -4,7 +4,7 @@ import json
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, LongType,
     DoubleType, FloatType, BooleanType, DateType, TimestampType,
-    ShortType, ByteType
+    ShortType, ByteType, ArrayType
 )
 from pyspark.sql.functions import col, lit, current_timestamp
 from delta.tables import DeltaTable
@@ -216,7 +216,8 @@ master_fields = create_schema_fields(entity_attributes, entity_attributes_dataty
 
 # Add system columns
 master_fields.extend([
-    StructField("attributes_combined", StringType(), True)
+    StructField("attributes_combined", StringType(), True),
+    StructField("attributes_combined_embedding", ArrayType(FloatType()), True),
 ])
 
 master_schema = StructType(master_fields)

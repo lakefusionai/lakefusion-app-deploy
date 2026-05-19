@@ -51,6 +51,14 @@ match_attributes = dbutils.jobs.taskValues.get(
     debugValue=dbutils.widgets.get("match_attributes")
 )
 
+# REFERENCE_ENTITY config: { attr_name: { ref_table, output_attr } }
+# Used so master.attributes_combined stores display values, not ref_lakefusion_id.
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
+
 # COMMAND ----------
 
 # Parse JSON parameters
@@ -59,10 +67,19 @@ entity_attributes_datatype = json.loads(entity_attributes_datatype)
 default_survivorship_rules = json.loads(default_survivorship_rules)
 dataset_objects = json.loads(dataset_objects)
 match_attributes = json.loads(match_attributes)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -106,6 +123,8 @@ setup_lakefusion_engine()
 # COMMAND ----------
 
 from lakefusion_core_engine.survivorship import SurvivorshipEngine, __version__
+from lakefusion_core_engine.utils import merged_record_column
+from pyspark.sql import functions as F
 
 logger.info(f"Survivorship Engine Version: {__version__}")
 
@@ -118,9 +137,35 @@ dataset_id_to_path = {dataset['id']: dataset['path'] for dataset in dataset_obje
 for rule in default_survivorship_rules:
     if rule.get('strategy') == 'Source System' and 'strategyRule' in rule:
         rule['strategyRule'] = [
-            dataset_id_to_path.get(dataset_id) 
+            dataset_id_to_path.get(dataset_id)
             for dataset_id in rule['strategyRule']
         ]
+
+# COMMAND ----------
+
+# Materialize per-attribute ref_lookup for the survivorship engine.
+# Drives Aggregation/concat (and longest/shortest) so REFERENCE_ENTITY values
+# get resolved to display before being aggregated. Empty when entity has no
+# REFERENCE_ENTITY attrs — engine then runs in current flow.
+ref_lookup = {}
+for _attr_name, _ref_cfg in (reference_attribute_config or {}).items():
+    _ref_table = _ref_cfg.get("ref_table")
+    _output_attr = _ref_cfg.get("output_attr", _attr_name)
+    if not _ref_table:
+        continue
+    try:
+        _rows = (
+            spark.read.table(_ref_table)
+                 .select(F.col("ref_lakefusion_id"), F.col(_output_attr).alias("_display"))
+                 .collect()
+        )
+        ref_lookup[_attr_name] = {
+            r["ref_lakefusion_id"]: r["_display"]
+            for r in _rows
+            if r["ref_lakefusion_id"] is not None
+        }
+    except Exception as _e:
+        logger.warning(f"Failed to load ref table {_ref_table} for attr {_attr_name}: {_e}")
 
 logger.info("Survivorship rules updated with dataset paths")
 logger.info(f"  Rules: {len(default_survivorship_rules)}")
@@ -131,10 +176,13 @@ engine = SurvivorshipEngine(
     survivorship_config=default_survivorship_rules,
     entity_attributes=entity_attributes,
     entity_attributes_datatype=entity_attributes_datatype,
-    id_key=unified_id_key
+    id_key=unified_id_key,
+    ref=ref_lookup or None,
 )
 
-logger.info("Survivorship Engine initialized")
+logger.info(
+    f"Survivorship Engine initialized — ref attrs: {list(ref_lookup.keys()) or 'none'}"
+)
 
 # COMMAND ----------
 
@@ -247,6 +295,7 @@ existing_contributors AS (
         u.{unified_id_key},
         u.source_path,
         u.master_{id_key},
+        u.__lf_modified_at,  -- Survivorship tie-breaker
         {attribute_cols}
     FROM {unified_table} u
     INNER JOIN masters_to_update m
@@ -259,6 +308,7 @@ new_contributors AS (
         u.{unified_id_key},
         u.source_path,
         mr.{id_key} as master_{id_key},
+        u.__lf_modified_at,  -- Survivorship tie-breaker
         {attribute_cols}
     FROM {unified_table} u
     INNER JOIN match_records_temp mr
@@ -367,48 +417,25 @@ for attr in entity_attributes:
     if attr == id_key:
         continue
     
-    # Get the target data type for this attribute
     target_type = entity_attributes_datatype.get(attr, "string")
     
-    # Cast the string value from merged_record to proper type
-    if target_type.lower() in ["timestamp", "date", "datetime"]:
-        master_updates_cols.append(
-            col(f"merged_record.{attr}").cast("timestamp").alias(attr)
-        )
-    elif target_type.lower() in ["int", "integer", "long", "bigint"]:
-        # Fix: Cast to double first, then to long to handle decimal strings like "28.0"
-        master_updates_cols.append(
-            col(f"merged_record.{attr}").cast("double").cast("long").alias(attr)
-        )
-    elif target_type.lower() in ["float", "double", "decimal"]:
-        master_updates_cols.append(
-            col(f"merged_record.{attr}").cast("double").alias(attr)
-        )
-    elif target_type.lower() in ["boolean", "bool"]:
-        master_updates_cols.append(
-            col(f"merged_record.{attr}").cast("boolean").alias(attr)
-        )
-    else:
-        # Default to string
-        master_updates_cols.append(
-            col(f"merged_record.{attr}").alias(attr)
-        )
+    master_updates_cols.append(merged_record_column(attr, target_type))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# Uses build_attributes_combined_column from utils/rdm_resolver, which handles
+# both single ref_lakefusion_id and concat-aggregated multi-id strings (the
+# master column always holds ids, never display).
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes and attr != id_key:
-            # Coalesce to handle nulls, convert to string
-            concat_cols.append(coalesce(col(f"merged_record.{attr}").cast("string"), lit("")))
-    
-    if concat_cols:
-        master_updates_cols.append(
-            concat_ws(" | ", *concat_cols).alias("attributes_combined")
-        )
-    else:
-        master_updates_cols.append(lit("").alias("attributes_combined"))
+    master_updates_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=id_key,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix="merged_record",
+        ).alias("attributes_combined")
+    )
 else:
     master_updates_cols.append(lit("").alias("attributes_combined"))
 
@@ -427,6 +454,10 @@ master_delta_table = DeltaTable.forName(spark, master_table)
 # Build update dict for all attributes including attributes_combined
 update_dict = {attr: f"source.{attr}" for attr in entity_attributes if attr != id_key}
 update_dict["attributes_combined"] = "source.attributes_combined"
+# Invalidate precomputed embedding so it recomputes on next pipeline run
+master_cols_lower = {f.name.strip().lower() for f in spark.table(master_table).schema}
+if "attributes_combined_embedding" in master_cols_lower:
+    update_dict["attributes_combined_embedding"] = "NULL"
 
 master_delta_table.alias("target").merge(
     master_updates_df.alias("source"),

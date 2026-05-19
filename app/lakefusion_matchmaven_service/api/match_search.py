@@ -1,6 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Body
 from sqlalchemy.orm import Session
-from typing import Optional
+from typing import Optional, List
 
 from app.lakefusion_matchmaven_service.utils.app_db import get_db, token_required_wrapper
 from app.lakefusion_matchmaven_service.services.match_search import MatchSearchService
@@ -162,3 +162,45 @@ def sync_vector_index(
     except Exception as e:
         app_logger.exception(f"Sync endpoint error: {str(e)}")
         raise
+
+
+# ── Reference Mappings for Model Experiments ──────────────────────────────────
+
+@match_search_router.get("/{entity_id}/models/{model_id}/ref-entities")
+def get_ref_entities_for_model(
+    entity_id: int,
+    model_id: int,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    """List reference entities linked to the master entity's REFERENCE_ENTITY attributes."""
+    service = MatchSearchService(db)
+    return service._get_ref_entities_for_master(entity_id)
+
+
+@match_search_router.get("/{entity_id}/models/{model_id}/ref-mappings/{ref_entity_id}")
+def get_ref_mappings_for_model(
+    entity_id: int,
+    model_id: int,
+    ref_entity_id: int,
+    warehouse_id: str = Query(...),
+    page: int = Query(1),
+    page_size: int = Query(50),
+    status_filter: Optional[str] = Query(None, description="Comma-separated status values"),
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    """Fetch reference mappings from _reference_mappings_{model_id} for a specific reference entity."""
+    token = check.get("token")
+    parsed_status = [s.strip() for s in status_filter.split(",")] if status_filter else None
+    service = MatchSearchService(db)
+    return service.fetch_reference_mappings(
+        token=token,
+        entity_id=entity_id,
+        model_id=model_id,
+        ref_entity_id=ref_entity_id,
+        warehouse_id=warehouse_id,
+        page=page,
+        page_size=page_size,
+        status_filter=parsed_status,
+    )

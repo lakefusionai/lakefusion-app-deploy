@@ -292,11 +292,19 @@ logger.info("="*80)
 # Read current master table
 current_master_df = spark.table(master_table)
 
+# Get Delta table and determine target schema
+unified_dedup_delta = DeltaTable.forName(spark, unified_dedup_table)
+target_cols = {f.name.strip().lower() for f in spark.table(unified_dedup_table).schema}
+
+# Select only master columns that exist in the target unified_dedup table
+master_cols_for_sync = [c for c in current_master_df.columns if c.strip().lower() in target_cols]
+
 # Prepare master data with empty search/scoring results for changed records only
 # For unchanged records, we'll preserve existing search_results
 master_with_results_df = (
     current_master_df
-    .withColumn("search_results", 
+    .select(*master_cols_for_sync)
+    .withColumn("search_results",
                 when(col(id_key).isin(changed_ids_list), lit(""))
                 .otherwise(lit(None)))  # NULL means don't update for unchanged records
     .withColumn("scoring_results",
@@ -306,13 +314,9 @@ master_with_results_df = (
 
 logger.info(f"  Prepared master data with conditional result clearing")
 
-# Get Delta table
-unified_dedup_delta = DeltaTable.forName(spark, unified_dedup_table)
-
-# Build update set - only update non-null columns
+# Build update set - only update columns that exist in both source and target
 # This allows us to preserve search_results for unchanged records
-update_cols = {col_name: f"source.{col_name}" 
-               for col_name in current_master_df.columns}
+update_cols = {col_name: f"source.{col_name}" for col_name in master_cols_for_sync}
 update_cols["search_results"] = "COALESCE(source.search_results, target.search_results)"
 update_cols["scoring_results"] = "COALESCE(source.scoring_results, target.scoring_results)"
 

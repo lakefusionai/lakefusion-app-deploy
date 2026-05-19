@@ -201,7 +201,7 @@ df_transformed = df_cdf.withColumn("lakefusion_id",uuid_udf())
 
 df_to_merge = df_transformed.drop("_change_type", "_commit_version", "_commit_timestamp")
 primary_table_attr_mapping["lakefusion_id"]="lakefusion_id"
-df_to_merge=df_to_merge.selectExpr(*[f"{k} as {v}" for k, v in primary_table_attr_mapping.items()]).withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+df_to_merge=df_to_merge.selectExpr(*[f"{k} as {v}" for k, v in primary_table_attr_mapping.items()]).withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
 
 # CRITICAL FIX: Materialize the UUID values by collecting and recreating the dataframe
 # This ensures the same UUID is used consistently across all operations

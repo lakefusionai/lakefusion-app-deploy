@@ -40,6 +40,11 @@ match_attributes = dbutils.jobs.taskValues.get(
     "Parse_Entity_Model_JSON", "match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
 master_id = dbutils.widgets.get("master_id")
 unified_dataset_ids = dbutils.widgets.get("unified_dataset_ids")
 
@@ -49,10 +54,19 @@ entity_attributes = json.loads(entity_attributes)
 entity_attributes_datatype = json.loads(entity_attributes_datatype)
 match_attributes = json.loads(match_attributes)
 unified_dataset_ids = json.loads(unified_dataset_ids)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -111,6 +125,26 @@ logger.info("="*80)
 # COMMAND ----------
 
 setup_lakefusion_engine()
+
+# COMMAND ----------
+
+# Capture record snapshots BEFORE any modifications for steward decisions
+try:
+    attr_cols = ", ".join(entity_attributes)
+    _sd_master_row = spark.sql(f"SELECT {attr_cols} FROM {master_table} WHERE {id_key} = '{master_id}'").collect()
+    _sd_master_attrs = _sd_master_row[0].asDict() if _sd_master_row else {}
+    _sd_match_id = not_match_surrogate_keys[0] if not_match_surrogate_keys else None
+    if _sd_match_id:
+        _sd_match_row = spark.sql(f"SELECT {attr_cols}, source_path FROM {unified_table} WHERE {unified_id_key} = '{_sd_match_id}'").collect()
+        _sd_match_attrs = _sd_match_row[0].asDict() if _sd_match_row else {}
+    else:
+        _sd_match_attrs = {}
+    logger.info(f"Steward decision snapshots captured for master={master_id}, match={_sd_match_id}")
+except Exception as e:
+    logger.warning(f"Could not capture steward decision snapshots: {e}")
+    _sd_master_attrs = {}
+    _sd_match_attrs = {}
+    _sd_match_id = not_match_surrogate_keys[0] if not_match_surrogate_keys else ""
 
 # COMMAND ----------
 
@@ -210,7 +244,8 @@ logger.info(f"\nSource paths retrieved from unified table: {existing_count}")
 if existing_count != len(not_match_surrogate_keys):
     logger.warning(f"Expected {len(not_match_surrogate_keys)} records in unified, found {existing_count}")
 
-# Materialize for serverless
+# Materialize for serverless — preserve schema so single-row / all-null columns can rebuild.
+existing_records_schema = existing_records_df.schema
 existing_records_data = existing_records_df.collect()
 logger.info(f"Materialized {len(existing_records_data)} records")
 
@@ -221,7 +256,7 @@ logger.info("STEP 3: LOG MANUAL_NOT_A_MATCH ACTIVITIES")
 logger.info("="*80)
 
 # Recreate DataFrame from materialized data
-existing_records_df = spark.createDataFrame(existing_records_data)
+existing_records_df = spark.createDataFrame(existing_records_data, schema=existing_records_schema)
 
 master_table_version = spark.sql(f"DESCRIBE HISTORY {master_table} LIMIT 1").collect()[0]["version"]
 
@@ -264,7 +299,7 @@ logger.info("="*80)
 # The processed_unified table has matches in exploded_result column
 
 # Recreate DataFrame
-existing_records_df = spark.createDataFrame(existing_records_data)
+existing_records_df = spark.createDataFrame(existing_records_data, schema=existing_records_schema)
 
 # First, get all previously rejected masters for these surrogate keys (NOT_A_MATCH history)
 not_a_match_history_query = f"""
@@ -480,7 +515,8 @@ full_records_count = full_records_df.count()
 
 logger.info(f"Fetched {full_records_count} full records from unified table")
 
-# Materialize for serverless
+# Materialize for serverless — preserve schema so createDataFrame can rebuild typed columns.
+full_records_schema = full_records_df.schema
 full_records_data = full_records_df.collect()
 logger.info(f"Materialized {len(full_records_data)} full records")
 
@@ -507,7 +543,7 @@ logger.info("STEP 8: PREPARE RECORDS FOR MASTER INSERT")
 logger.info("="*80)
 
 # Recreate full_records_df from materialized data
-full_records_df = spark.createDataFrame(full_records_data)
+full_records_df = spark.createDataFrame(full_records_data, schema=full_records_schema)
 
 # Create a mapping DataFrame for new lakefusion_ids
 new_ids_data = [{"surrogate_key": sk, "new_lakefusion_id": lf_id} 
@@ -543,27 +579,26 @@ for attr in entity_attributes:
     else:
         insert_cols.append(col(attr).alias(attr))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# Note: this build site uses " " as the inter-attribute separator (not " | ").
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(attr).cast("string"), lit("")))
-    
-    if concat_cols:
-        insert_cols.append(
-            concat_ws(" ", *concat_cols).alias("attributes_combined")
-        )
-    else:
-        insert_cols.append(lit("").alias("attributes_combined"))
+    insert_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix=None,
+            separator=" ",
+        ).alias("attributes_combined")
+    )
 else:
     insert_cols.append(lit("").alias("attributes_combined"))
 
 master_insert_df = records_with_ids_df.select(*insert_cols)
 
-logger.info(f"Prepared {master_insert_df.count()} records for master insert")
+logger.info(f"Prepared {len(full_records_data)} records for master insert")
 
 # COMMAND ----------
 
@@ -578,6 +613,13 @@ logger.info(f"  Current master version: {current_master_version}")
 # Perform insert
 master_delta_table = DeltaTable.forName(spark, master_table)
 
+# Add attributes_combined_embedding as NULL if the target table has it
+master_cols_lower = {f.name.strip().lower() for f in spark.table(master_table).schema}
+if "attributes_combined_embedding" in master_cols_lower:
+    master_insert_df = master_insert_df.withColumn(
+        "attributes_combined_embedding", lit(None).cast("array<float>")
+    )
+
 master_delta_table.alias("target").merge(
     master_insert_df.alias("source"),
     f"target.{id_key} = source.{id_key}"
@@ -588,7 +630,7 @@ new_master_version = spark.sql(f"DESCRIBE HISTORY {master_table} LIMIT 1").selec
 
 logger.info(f"Master table updated")
 logger.info(f"  New version: {new_master_version}")
-logger.info(f"  Inserted records: {master_insert_df.count()}")
+logger.info(f"  Inserted records: {len(full_records_data)}")
 
 # COMMAND ----------
 
@@ -597,7 +639,7 @@ logger.info("STEP 10: PREPARE ATTRIBUTE VERSION SOURCES")
 logger.info("="*80)
 
 # Recreate records_with_ids_df for attribute sources
-full_records_df = spark.createDataFrame(full_records_data)
+full_records_df = spark.createDataFrame(full_records_data, schema=full_records_schema)
 records_with_ids_df = full_records_df.join(new_ids_df, on=unified_id_key, how="inner")
 
 # For each record, create attribute source mapping
@@ -645,7 +687,7 @@ attr_sources_df = records_with_ids_df.select(
 )
 
 logger.info(f"Prepared attribute version sources")
-logger.info(f"  Records: {attr_sources_df.count()}")
+logger.info(f"  Records: {len(full_records_data)}")
 
 # COMMAND ----------
 
@@ -662,7 +704,7 @@ attr_sources_delta_table.alias("target").merge(
 ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
 logger.info(f"Attribute version sources updated")
-logger.info(f"  Records updated/inserted: {attr_sources_df.count()}")
+logger.info(f"  Records updated/inserted: {len(full_records_data)}")
 
 # COMMAND ----------
 
@@ -671,7 +713,7 @@ logger.info("STEP 12: LOG JOB_INSERT ACTIVITIES")
 logger.info("="*80)
 
 # Recreate records_with_ids_df
-full_records_df = spark.createDataFrame(full_records_data)
+full_records_df = spark.createDataFrame(full_records_data, schema=full_records_schema)
 records_with_ids_df = full_records_df.join(new_ids_df, on=unified_id_key, how="inner")
 
 # Prepare JOB_INSERT activities
@@ -684,9 +726,7 @@ insert_activities_df = records_with_ids_df.select(
     current_timestamp().alias("created_at")
 )
 
-insert_activities_count = insert_activities_df.count()
-
-logger.info(f"  Prepared {insert_activities_count} JOB_INSERT activities")
+logger.info(f"  Prepared {len(full_records_data)} JOB_INSERT activities")
 
 # Perform merge
 merge_activities_delta_table.alias("target").merge(
@@ -698,7 +738,7 @@ merge_activities_delta_table.alias("target").merge(
 ).whenNotMatchedInsertAll().execute()
 
 logger.info(f"JOB_INSERT activities logged")
-logger.info(f"  Records logged: {insert_activities_count}")
+logger.info(f"  Records logged: {len(full_records_data)}")
 
 # COMMAND ----------
 
@@ -707,7 +747,7 @@ logger.info("STEP 13: UPDATE UNIFIED TABLE")
 logger.info("="*80)
 
 # Recreate records_with_ids_df
-full_records_df = spark.createDataFrame(full_records_data)
+full_records_df = spark.createDataFrame(full_records_data, schema=full_records_schema)
 records_with_ids_df = full_records_df.join(new_ids_df, on=unified_id_key, how="inner")
 
 # Update unified table for inserted records:
@@ -720,7 +760,7 @@ unified_updates_df = records_with_ids_df.select(
     lit("MERGED").alias("record_status")
 )
 
-logger.info(f"  Prepared {unified_updates_df.count()} records for unified table update")
+logger.info(f"  Prepared {len(full_records_data)} records for unified table update")
 
 # Perform merge
 unified_delta_table = DeltaTable.forName(spark, unified_table)
@@ -734,7 +774,32 @@ unified_delta_table.alias("target").merge(
 }).execute()
 
 logger.info(f"Unified table updated")
-logger.info(f"  Records updated: {unified_updates_df.count()}")
+logger.info(f"  Records updated: {len(full_records_data)}")
+
+# COMMAND ----------
+
+# Write steward decision with frozen snapshots to Delta table
+try:
+    import uuid as _uuid
+    _sd_table = f"{catalog_name}.silver.{entity}_steward_decisions"
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {_sd_table} (
+        decision_id STRING, entity_id STRING, action_type STRING, master_id STRING, match_id STRING,
+        reason STRING, reason_category STRING, master_record_attributes STRING, match_record_attributes STRING,
+        master_record_source STRING, match_record_source STRING, steward STRING, decided_at TIMESTAMP, aml_status STRING
+    ) USING DELTA""")
+    _sd_match_source = _sd_match_attrs.get("source_path", "") if _sd_match_attrs else ""
+    _sd_to_str = lambda d: {k: str(v) if v is not None else None for k, v in d.items()}
+    _sql_str = lambda v: "'" + str(v).replace("'", "''") + "'" if v is not None else 'NULL'
+    _sd_m_json = json.dumps(_sd_to_str(_sd_master_attrs)) if _sd_master_attrs else None
+    _sd_r_json = json.dumps(_sd_to_str(_sd_match_attrs)) if _sd_match_attrs else None
+    spark.sql(f"""INSERT INTO {_sd_table} VALUES (
+        '{str(_uuid.uuid4()).replace("-","")}', '', 'MANUAL_NOT_A_MATCH', '{master_id}', '{_sd_match_id or ""}',
+        NULL, NULL, {_sql_str(_sd_m_json) if _sd_m_json else 'NULL'}, {_sql_str(_sd_r_json) if _sd_r_json else 'NULL'},
+        NULL, {_sql_str(_sd_match_source) if _sd_match_source else 'NULL'}, '', current_timestamp(), 'PENDING'
+    )""")
+    logger.info(f"Steward decision written for MANUAL_NOT_A_MATCH master={master_id}")
+except Exception as e:
+    logger.warning(f"Could not write steward decision: {e}")
 
 # COMMAND ----------
 

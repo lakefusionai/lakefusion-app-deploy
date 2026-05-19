@@ -98,8 +98,8 @@ class ExecuteCompareRequest(BaseModel):
     maxTokens: Optional[int] = Field(
         None,
         ge=100,
-        le=10000,
-        description="Maximum tokens in LLM response (100-10000)"
+        le=20000,
+        description="Maximum tokens in LLM response (100-20000)"
     )
     matchThreshold: Optional[float] = Field(
         None,
@@ -116,6 +116,10 @@ class ExecuteCompareRequest(BaseModel):
     enforceJsonFormat: Optional[bool] = Field(
         True,
         description="Whether to enforce JSON schema format on LLM response. Default true."
+    )
+    reasoningEffort: Optional[str] = Field(
+        None,
+        description="LLM reasoning effort level: 'low', 'medium', 'high'. Only for gpt-oss-120b/20b models."
     )
 
 
@@ -135,3 +139,4 @@ class ExecuteCompareResponse(BaseModel):
     completion_tokens: Optional[int] = Field(None, description="Number of tokens in the completion")
     total_tokens: Optional[int] = Field(None, description="Total tokens used")
     reasoning_tokens: Optional[int] = Field(None, description="Number of reasoning/thinking tokens (for models like Gemini)")
+    config_used: Optional[dict] = Field(None, description="Actual config params sent to the LLM endpoint (temperature, max_tokens, reasoning_effort)")

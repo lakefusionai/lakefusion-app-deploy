@@ -157,6 +157,7 @@ validation_results = {
     "validation_passed": True
 }
 
+missing_source_tables = []
 unreadable_tables = []
 schema_drift_issues = []
 pk_column_missing_tables = []
@@ -247,6 +248,42 @@ def get_update_delete_records(df_cdf, source_pk_column, source_table, change_typ
     ).filter(col("_rn") == 1).drop("_rn")
 
     return df_latest.filter(col("operation_type") == target_type)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Validation 0: Source Table Existence
+
+# COMMAND ----------
+
+logger.info("\n" + "=" * 60)
+logger.info("VALIDATION 0: SOURCE TABLE EXISTENCE")
+logger.info("=" * 60)
+
+for source_table in dataset_tables:
+    try:
+        exists = spark.catalog.tableExists(source_table)
+    except Exception as e:
+        exists = False
+        logger.info(f"  [WARN] tableExists check errored for {source_table}: {e}")
+
+    if not exists:
+        missing_source_tables.append({"table": source_table})
+        logger.info(f"  [FAIL] Source table missing: {source_table}")
+    else:
+        logger.info(f"  [OK] Source table exists: {source_table}")
+
+if missing_source_tables:
+    validation_results["critical_issues"].append({
+        "check": "Source Table Existence",
+        "issue": "One or more configured source tables do not exist",
+        "details": missing_source_tables,
+    })
+    validation_results["validation_passed"] = False
+    logger.info(f"\n[CRITICAL] {len(missing_source_tables)} configured source table(s) missing")
+else:
+    validation_results["checks_passed"].append("Source Table Existence")
+    logger.info(f"\n[PASSED] All {len(dataset_tables)} configured source table(s) exist")
 
 # COMMAND ----------
 

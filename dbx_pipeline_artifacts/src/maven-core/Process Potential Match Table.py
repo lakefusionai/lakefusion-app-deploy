@@ -9,6 +9,10 @@ from pyspark.sql.functions import row_number,lit
 
 # COMMAND ----------
 
+# MAGIC %run ../utils/concurrency_utils
+
+# COMMAND ----------
+
 dbutils.widgets.text("entity", "", "Entity Name")
 dbutils.widgets.text("primary_table", "", "Primary Table")
 dbutils.widgets.text("id_key", "", "Primary Key")

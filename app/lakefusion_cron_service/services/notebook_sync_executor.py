@@ -152,6 +152,12 @@ def execute_sync(db: Session, force: bool = False,
     # ── 5. Single commit ──
     db.commit()
 
+    # ── 6. Sync derived UDFs (survivorship) if source changed ──
+    udf_synced = _sync_survivorship_udf(
+        db=db, service=service, db_config_service=db_config_service,
+        sync_run_id=sync_run_id, force=force,
+    )
+
     summary = {
         "sync_run_id": sync_run_id,
         "trigger": trigger,
@@ -160,6 +166,7 @@ def execute_sync(db: Session, force: bool = False,
         "imported": imported_count,
         "skipped": len(to_skip),
         "errors": error_count,
+        "udf_synced": udf_synced,
     }
     app_logger.info(f"Notebook sync complete: {summary}")
     return summary
@@ -190,3 +197,132 @@ def _import_file(notebook_service: NotebookService, file_path: str, workspace_pa
         )
 
     app_logger.info(f"Imported: {file_path} -> {workspace_path}")
+
+
+# ===========================================================================
+# Derived UDF sync — survivorship
+# ===========================================================================
+
+UDF_ARTIFACT_PATH = "survivorship_udf"
+UDF_DISPLAY_NAME = "Survivorship UDF (auto-generated)"
+
+def _compute_survivorship_hash() -> str:
+    """Compute MD5 hash of all survivorship SDK source files combined."""
+    import hashlib
+    import inspect
+    try:
+        from lakefusion_core_engine.survivorship import engine as engine_mod
+        from lakefusion_core_engine.survivorship.utils import helpers as helpers_mod
+        from lakefusion_core_engine.survivorship.models import config as config_mod
+        from lakefusion_core_engine.survivorship.models import result as result_mod
+        from lakefusion_core_engine.survivorship.strategies import base as base_mod
+        from lakefusion_core_engine.survivorship.strategies import recency_strategy as recency_mod
+        from lakefusion_core_engine.survivorship.strategies import source_system_strategy as source_mod
+        from lakefusion_core_engine.survivorship.strategies import aggregation_strategy as agg_mod
+        from lakefusion_core_engine.survivorship.strategies import frequency_strategy as freq_mod
+
+        modules = [helpers_mod, config_mod, result_mod, base_mod,
+                   recency_mod, source_mod, agg_mod, freq_mod, engine_mod]
+        combined = "".join(inspect.getsource(mod) for mod in modules)
+        return hashlib.md5(combined.encode()).hexdigest()
+    except Exception as e:
+        app_logger.warning(f"Could not compute survivorship SDK hash: {e}")
+        return ""
+
+
+def _sync_survivorship_udf(
+    db: Session,
+    service: NotebookSyncService,
+    db_config_service: DBConfigPropertiesService,
+    sync_run_id: str,
+    force: bool = False,
+) -> bool:
+    """
+    Sync the survivorship UDF if SDK source has changed.
+    Registers a single entry in notebook_sync_registry with item_type='UDF'.
+    """
+    from lakefusion_utility.models.notebook_sync import NotebookSyncRegistry
+
+    try:
+        # Compute current hash of survivorship SDK source
+        current_hash = _compute_survivorship_hash()
+        if not current_hash:
+            app_logger.info("Survivorship SDK not available — skipping UDF sync")
+            return False
+
+        # Find or create registry entry
+        registry_item = db.query(NotebookSyncRegistry).filter(
+            NotebookSyncRegistry.artifact_path == UDF_ARTIFACT_PATH
+        ).first()
+
+        if not registry_item:
+            registry_item = NotebookSyncRegistry(
+                artifact_path=UDF_ARTIFACT_PATH,
+                item_type='UDF',
+                display_name=UDF_DISPLAY_NAME,
+                available_version=APP_VERSION,
+                status='ACTIVE',
+            )
+            db.add(registry_item)
+            db.flush()
+            app_logger.info(f"Registered UDF artifact in sync registry: {UDF_ARTIFACT_PATH}")
+
+        # Update available version
+        registry_item.available_version = APP_VERSION
+
+        # Check if sync needed
+        if not force and registry_item.deployed_hash == current_hash:
+            app_logger.info(f"Survivorship UDF up to date (hash: {current_hash[:12]}...). Skipping.")
+            service.log_audit(
+                registry_id=registry_item.id, artifact_path=UDF_ARTIFACT_PATH,
+                action='SKIPPED', from_version=registry_item.deployed_version,
+                to_version=APP_VERSION, effective_policy='SYNC_ON_UPGRADE',
+                reason='hash_match', sync_run_id=sync_run_id,
+            )
+            db.commit()
+            return False
+
+        # Hash changed or force — re-register UDF
+        app_logger.info(f"Survivorship UDF needs update (deployed: {(registry_item.deployed_hash or 'none')[:12]}..., current: {current_hash[:12]}...)")
+
+        catalog_name = db_config_service.getDBConfigProperties(key="catalog_name")
+        warehouse_id = db_config_service.getDBConfigProperties(key="cron_warehouse_id")
+
+        if not catalog_name or not warehouse_id:
+            app_logger.warning("catalog_name or cron_warehouse_id not configured — skipping UDF registration")
+            return False
+
+        from lakefusion_utility.services.catalog_setup_service import CatalogSetupService
+        svc = CatalogSetupService(
+            token=lakefusion_databricks_dapi,
+            warehouse_id=warehouse_id,
+            catalog_name=catalog_name,
+        )
+        success = svc.register_survivorship_udf()
+
+        if success:
+            service.mark_imported(registry_item, file_hash=current_hash)
+            service.log_audit(
+                registry_id=registry_item.id, artifact_path=UDF_ARTIFACT_PATH,
+                action='IMPORTED', from_version=registry_item.deployed_version,
+                to_version=APP_VERSION, effective_policy='SYNC_ON_UPGRADE',
+                reason='hash_changed' if not force else 'force_sync',
+                sync_run_id=sync_run_id,
+            )
+            db.commit()
+            app_logger.info(f"Survivorship UDF registered successfully (hash: {current_hash[:12]}...)")
+        else:
+            service.log_audit(
+                registry_id=registry_item.id, artifact_path=UDF_ARTIFACT_PATH,
+                action='SKIPPED', from_version=registry_item.deployed_version,
+                to_version=APP_VERSION, effective_policy='SYNC_ON_UPGRADE',
+                reason='registration_failed', sync_run_id=sync_run_id,
+            )
+            db.commit()
+            app_logger.warning("Survivorship UDF registration failed")
+
+        return success
+
+    except Exception as e:
+        app_logger.warning(f"Survivorship UDF sync failed (non-blocking): {e}")
+        return False

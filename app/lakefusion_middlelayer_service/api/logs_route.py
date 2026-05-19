@@ -38,7 +38,12 @@ def get_service_log_path(service: str) -> Path:
 
 
 def parse_log_date(filename: str) -> Optional[datetime]:
-    """Extract date from log filename like 'app-2026-01-20.log'."""
+    """Extract date from log filename.
+    'app.log' is the current day's active log file.
+    'app-2026-01-20.log' is a rotated file for that date.
+    """
+    if filename == 'app.log':
+        return datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     match = re.match(r'app-(\d{4}-\d{2}-\d{2})\.log', filename)
     if match:
         return datetime.strptime(match.group(1), '%Y-%m-%d')

@@ -1,7 +1,7 @@
 # Databricks notebook source
 # DBTITLE 1,Import required libraries
 import json
-from pyspark.sql.functions import col, lit, udf, concat_ws, current_timestamp, struct
+from pyspark.sql.functions import col, lit, udf, concat_ws, coalesce, current_timestamp, struct
 from pyspark.sql.types import StringType, IntegerType, LongType, DoubleType, FloatType, BooleanType, DateType, TimestampType, ArrayType, StructType, StructField, ShortType, ByteType
 from delta.tables import DeltaTable
 
@@ -117,9 +117,21 @@ attributes_mapping = dbutils.jobs.taskValues.get(
 
 experiment_id = dbutils.widgets.get("experiment_id")
 
+# RDM configs drive inline mapping resolution at ingestion (creates mapping
+# table, resolves new source values, splits approved vs PENDING/NO_MATCH rows).
+rdm_configs = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="rdm_configs",
+    debugValue="[]"
+)
+
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -134,6 +146,16 @@ entity_attributes = json.loads(entity_attributes)
 entity_attributes_datatype = json.loads(entity_attributes_datatype)
 match_attributes = json.loads(match_attributes)
 attributes_mapping = json.loads(attributes_mapping)
+rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+
+# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # COMMAND ----------
 
@@ -284,13 +306,50 @@ logger.info("="*60)
 # Get list of attributes to combine
 combine_attrs = [attr for attr in match_attributes]
 
-# Create attributes_combined by concatenating all attributes
-id_df = id_df.withColumn(
-    "attributes_combined",
-    concat_ws(" | ", *[col(attr) for attr in combine_attrs])
+# Resolve REFERENCE_ENTITY attrs inline: ensures the mapping table exists, MERGEs
+# any newly-resolved source_values, and splits the batch into approved (with
+# ref_lakefusion_id baked into the column and ref_value in <attr>__display) and
+# pending (PENDING / NO_MATCH — routed to the pending-reference table).
+primary_source_id = next(
+    (cfg["source_id"] for cfg in rdm_configs if cfg.get("source_table") == primary_table),
+    None,
+)
+id_df, id_pending_df = resolve_reference_attributes(
+    spark, id_df, rdm_configs, source_id=primary_source_id
 )
 
+# Build the concat list: use resolved display value for REF attrs, raw otherwise
+concat_cols = []
+for attr in combine_attrs:
+    display_col = f"{attr}__display"
+    src = display_col if display_col in id_df.columns else attr
+    concat_cols.append(col(src))
+
+id_df = id_df.withColumn(
+    "attributes_combined",
+    concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
+)
+
+# Drop the resolver's __display columns before downstream writes
+for attr in combine_attrs:
+    display_col = f"{attr}__display"
+    if display_col in id_df.columns:
+        id_df = id_df.drop(display_col)
+
 logger.info(f"Created attributes_combined from {len(combine_attrs)} attributes")
+
+# Route PENDING / NO_MATCH rows to the unified error log
+if id_pending_df is not None and not id_pending_df.isEmpty():
+    unified_error_handler = UnifiedErrorHandler(spark, unified_table)
+    unified_error_handler.log_errors(
+        id_pending_df.select(
+            col("surrogate_key"),
+            col("_rdm_pending_reason").alias("error_message"),
+        ),
+        stage="RDM",
+        run_id=run_id,
+    )
+    logger.info(f"  Logged {id_pending_df.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
 
 # COMMAND ----------
 
@@ -339,7 +398,10 @@ unified_select_cols = [
 ] + [col(attr) for attr in entity_attributes if attr != "lakefusion_id"] + [
     "attributes_combined",
     lit("").alias("search_results"),
-    lit("").alias("scoring_results")
+    lit("").alias("scoring_results"),
+    # Reserved system audit columns; tie-breaker for survivorship engine.
+    current_timestamp().alias("__lf_created_at"),
+    current_timestamp().alias("__lf_modified_at"),
 ]
 
 # Create unified DataFrame in one select operation

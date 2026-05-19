@@ -69,6 +69,25 @@ logger.info("="*80)
 
 # COMMAND ----------
 
+# Capture record snapshots BEFORE any modifications (both from master table)
+try:
+    _sd_excluded = {"lakefusion_id", "surrogate_key", "source_path", "source_id", "master_lakefusion_id",
+                    "record_status", "attributes_combined", "search_results", "scoring_results",
+                    "attributes_combined_embedding", "tags"}
+    _sd_all_cols = [c.name for c in spark.table(master_table).schema if c.name not in _sd_excluded]
+    _sd_attr_cols = ", ".join(_sd_all_cols) if _sd_all_cols else "*"
+    _sd_master_row = spark.sql(f"SELECT {_sd_attr_cols} FROM {master_table} WHERE {id_key} = '{master_id}'").collect()
+    _sd_master_attrs = _sd_master_row[0].asDict() if _sd_master_row else {}
+    _sd_match_row = spark.sql(f"SELECT {_sd_attr_cols} FROM {master_table} WHERE {id_key} = '{match_record_id}'").collect()
+    _sd_match_attrs = _sd_match_row[0].asDict() if _sd_match_row else {}
+    logger.info(f"Steward decision snapshots captured for master={master_id}, match={match_record_id}")
+except Exception as e:
+    logger.warning(f"Could not capture steward decision snapshots: {e}")
+    _sd_master_attrs = {}
+    _sd_match_attrs = {}
+
+# COMMAND ----------
+
 logger.info("\n" + "="*80)
 logger.info("STEP 1: VALIDATE BOTH MASTERS EXIST")
 logger.info("="*80)
@@ -177,6 +196,31 @@ logger.info(f"    Match: {match_record_id}")
 df_not_match_activity.write.mode("append").saveAsTable(merge_activities_table)
 
 logger.info(f"MANUAL_NOT_A_MATCH activity logged")
+
+# COMMAND ----------
+
+# Write steward decision with frozen snapshots to Delta table
+try:
+    import uuid as _uuid
+    _sd_table = f"{catalog_name}.silver.{entity}_steward_decisions"
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {_sd_table} (
+        decision_id STRING, entity_id STRING, action_type STRING, master_id STRING, match_id STRING,
+        reason STRING, reason_category STRING, master_record_attributes STRING, match_record_attributes STRING,
+        master_record_source STRING, match_record_source STRING, steward STRING, decided_at TIMESTAMP, aml_status STRING
+    ) USING DELTA""")
+    _sd_to_str = lambda d: {k: str(v) if v is not None else None for k, v in d.items()}
+    _sql_str = lambda v: "'" + str(v).replace("'", "''") + "'" if v is not None else 'NULL'
+    _sd_m_json = json.dumps(_sd_to_str(_sd_master_attrs)) if _sd_master_attrs else None
+    _sd_r_json = json.dumps(_sd_to_str(_sd_match_attrs)) if _sd_match_attrs else None
+    _sd_action = action_type or "MANUAL_NOT_A_MATCH"
+    spark.sql(f"""INSERT INTO {_sd_table} VALUES (
+        '{str(_uuid.uuid4()).replace("-","")}', '', '{_sd_action}', '{master_id}', '{match_record_id}',
+        NULL, NULL, {_sql_str(_sd_m_json) if _sd_m_json else 'NULL'}, {_sql_str(_sd_r_json) if _sd_r_json else 'NULL'},
+        NULL, NULL, '', current_timestamp(), 'PENDING'
+    )""")
+    logger.info(f"Steward decision written for {_sd_action} master={master_id}")
+except Exception as e:
+    logger.warning(f"Could not write steward decision: {e}")
 
 # COMMAND ----------
 

@@ -99,7 +99,7 @@ unmatched_records_df = spark.sql(query)
 # COMMAND ----------
 
 master_columns = [column for column in unmatched_records_df.columns if column in entity_attributes]
-new_master_records_df = unmatched_records_df.select(*master_columns).withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+new_master_records_df = unmatched_records_df.select(*master_columns).withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
 
 # COMMAND ----------
 

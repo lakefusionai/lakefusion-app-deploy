@@ -6,6 +6,7 @@ from lakefusion_utility.utils.databricks_util import DataSetSQLService, ComputeS
 from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.services.dataset_service import DatasetService
 from lakefusion_utility.services.quality_tasks import QualityTaskService
+from lakefusion_utility.utils.dbx_error_handler import raise_on_dbx_permission_error
 from databricks import sql
 import traceback
 import json
@@ -178,6 +179,7 @@ def create_dataset_record(token: str, db, dataset_id: int, warehouse_id: str, da
         app_logger.warning(f"HTTPException while creating record: {http_exc.status_code} - {http_exc.detail}")
         raise http_exc
     except Exception as e:
+        raise_on_dbx_permission_error(e, "create dataset record")
         app_logger.error(f"Error creating dataset record: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -288,6 +290,7 @@ def update_dataset_records(token: str, db, dataset_id: int, warehouse_id: str, p
         }
     
     except Exception as e:
+        raise_on_dbx_permission_error(e, "update dataset records")
         # Log the full exception traceback and error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to update records. Reason - {message}')
@@ -366,6 +369,7 @@ def fetch_dataset(token: str, db, dataset_id: int, warehouse_id: str, page: int 
             has_more=has_more,
         )
     except Exception as e:
+        raise_on_dbx_permission_error(e, "fetch dataset")
         error_message = str(e)
         match = re.search(r'(\[.*?\].*)', error_message, re.DOTALL)
         detail = match.group(1).strip() if match else error_message
@@ -455,6 +459,7 @@ def fetch_metadata_dataset(token: str, db, dataset_id: int, warehouse_id: str):
         app_logger.warning(f"HTTPException while fetching metadata: {http_exc.status_code} - {http_exc.detail}")
         raise http_exc
     except Exception as e:
+        raise_on_dbx_permission_error(e, "fetch dataset metadata")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch metadata. Reason - {message}')
         raise HTTPException(
@@ -512,6 +517,7 @@ def update_metadata_dataset_description(token: str, db, dataset_id: int, warehou
         app_logger.warning(f"HTTPException while updating description: {http_exc.status_code} - {http_exc.detail}")
         raise http_exc
     except Exception as e:
+        raise_on_dbx_permission_error(e, "update dataset description")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to update description. Reason - {message}')
         raise HTTPException(
@@ -663,6 +669,7 @@ def update_metadata_dataset(token: str, db, dataset_id: int, warehouse_id: str, 
         app_logger.warning(f"HTTPException while updating metadata: {http_exc.status_code} - {http_exc.detail}")
         raise http_exc
     except Exception as e:
+        raise_on_dbx_permission_error(e, "update dataset metadata")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to update metadata. Reason - {message}')
         raise HTTPException(
@@ -692,6 +699,7 @@ WHERE c1.table_name = '{table_path[2].replace("`", "")}' AND c1.table_schema = '
         # Return a successful HTTP response with the fetched metadata
         return HttpResponse(status=200, data=data)
     except Exception as e:
+        raise_on_dbx_permission_error(e, "fetch dataset metadata")
         # Log the full exception traceback and error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the metadata. Reason - {message}')
@@ -729,6 +737,7 @@ WHERE c1.table_name = '{table_path[2].replace("`", "")}' AND c1.table_schema = '
         # Return a successful HTTP response with the fetched metadata
         return HttpResponse(status=200, data=data)
     except Exception as e:
+        raise_on_dbx_permission_error(e, "fetch cleansed dataset metadata")
         # Log the full exception traceback and error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the metadata. Reason - {message}')
@@ -738,7 +747,7 @@ WHERE c1.table_name = '{table_path[2].replace("`", "")}' AND c1.table_schema = '
             detail="An internal server error occurred while fetching the metadata",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
 def fetch_columns_by_datatype(token: str, db, dataset_id: int, warehouse_id: str, datatypes: list = None):
     """
     Fetch columns and their datatypes from a dataset based on specified datatypes.
@@ -806,10 +815,11 @@ def fetch_columns_by_datatype(token: str, db, dataset_id: int, warehouse_id: str
         return HttpResponse(status=200, data=data)
     
     except Exception as e:
+        raise_on_dbx_permission_error(e, "fetch columns by datatype")
         # Log the full exception traceback and error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch columns by datatype. Reason - {message}')
-        
+
         # Raise a 500 internal server error response with appropriate headers
         raise HttpResponse(
             status_code=500,
@@ -856,6 +866,7 @@ def delete_record(token: str, db, dataset_id: int, primary_field: str, primary_f
         # })
         return affected_rows
     except Exception as e:
+        raise_on_dbx_permission_error(e, "delete dataset record")
         # Log the full exception traceback and error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to delete the record. Reason - {message}')

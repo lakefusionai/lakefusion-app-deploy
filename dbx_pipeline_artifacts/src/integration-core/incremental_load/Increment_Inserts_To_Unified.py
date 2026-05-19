@@ -117,9 +117,21 @@ has_inserts = dbutils.jobs.taskValues.get("Check_Increments_Exists", "has_insert
 tables_with_inserts = dbutils.jobs.taskValues.get("Check_Increments_Exists", "tables_with_inserts", debugValue="[]")
 table_version_info = dbutils.jobs.taskValues.get("Check_Increments_Exists", "table_version_info", debugValue="{}")
 
+# RDM configs drive inline mapping resolution at ingestion. Empty list → no
+# REFERENCE_ENTITY attrs and resolver short-circuits.
+rdm_configs = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON",
+    "rdm_configs",
+    debugValue="[]",
+)
+
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -137,6 +149,16 @@ attributes_mapping_json = json.loads(attributes_mapping_json)
 attributes = json.loads(attributes)
 tables_with_inserts = json.loads(tables_with_inserts)
 table_version_info = json.loads(table_version_info)
+rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+
+# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # Convert has_inserts to boolean if it's a string
 if isinstance(has_inserts, str):
@@ -349,6 +371,9 @@ for source_table in tables_with_inserts:
     logger.info("\n" + "=" * 80)
     logger.info(f" Processing: {source_table}")
     logger.info("=" * 80)
+
+    # Pull this source's dataset_id (drives RDM mapping lookups via rdm_configs)
+    source_id_for_resolver = (dataset_objects.get(source_table) or {}).get("id")
     
     # Get version info with error handling
     if source_table not in table_version_info:
@@ -520,18 +545,57 @@ for source_table in tables_with_inserts:
     # Add timestamps
     df_transformed = df_transformed.withColumn("created_at", current_timestamp())
     df_transformed = df_transformed.withColumn("updated_at", lit(None).cast("timestamp"))
+
+    # Reserved system audit columns used by the survivorship engine as a
+    # deterministic tie-breaker. Double-underscore prefix avoids collision
+    # with user-defined entity attributes named created_at / modified_at.
+    df_transformed = df_transformed.withColumn("__lf_created_at", current_timestamp())
+    df_transformed = df_transformed.withColumn("__lf_modified_at", current_timestamp())
     
     # Add table_name for compatibility with existing code
     df_transformed = df_transformed.withColumn("table_name", lit(source_table))
     
     # Generate attributes_combined column (for deduplication matching)
-    # Only include attributes that exist in the dataframe
     available_attributes = [attr for attr in attributes if attr in df_transformed.columns]
     if available_attributes:
+        # Resolve REFERENCE_ENTITY attrs inline via mapping table — bakes ref_id
+        # into the column and queues PENDING / NO_MATCH rows for steward review.
+        df_transformed, df_pending_ref = resolve_reference_attributes(
+            spark,
+            df_transformed,
+            rdm_configs,
+            source_id=source_id_for_resolver,
+        )
+
+        concat_inputs = []
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            src = display_col if display_col in df_transformed.columns else c
+            concat_inputs.append(regexp_replace(trim(col(src).cast("string")), r'\s+', ' '))
+
         df_transformed = df_transformed.withColumn(
             "attributes_combined",
-            concat_ws(" | ", *[regexp_replace(trim(col(c)), r'\s+', ' ') for c in available_attributes])
+            concat_ws(" | ", *[coalesce(regexp_replace(trim(col(c)), r'\s+', ' '), lit("")) for c in available_attributes])
         )
+
+        # Drop the resolver's __display columns before downstream writes
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            if display_col in df_transformed.columns:
+                df_transformed = df_transformed.drop(display_col)
+
+        # Route PENDING / NO_MATCH rows to the unified error log (stage=RDM)
+        if df_pending_ref is not None and not df_pending_ref.isEmpty():
+            unified_error_handler = UnifiedErrorHandler(spark, unified_table)
+            unified_error_handler.log_errors(
+                df_pending_ref.select(
+                    col("surrogate_key"),
+                    col("_rdm_pending_reason").alias("error_message"),
+                ),
+                stage="RDM",
+                run_id=run_id,
+            )
+            logger.info(f" Logged {df_pending_ref.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
     else:
         df_transformed = df_transformed.withColumn("attributes_combined", lit(""))
     
@@ -620,6 +684,13 @@ if not spark.catalog.tableExists(unified_table):
 
 # Merge logic: Insert only if surrogate_key doesn't exist
 delta_unified = DeltaTable.forName(spark, unified_table)
+
+# Add attributes_combined_embedding as NULL if the target table has it
+unified_cols_lower = {f.name.strip().lower() for f in spark.table(unified_table).schema}
+if "attributes_combined_embedding" in unified_cols_lower:
+    df_all_inserts_deduped = df_all_inserts_deduped.withColumn(
+        "attributes_combined_embedding", lit(None).cast("array<float>")
+    )
 
 delta_unified.alias("target").merge(
     df_all_inserts_deduped.alias("source"),

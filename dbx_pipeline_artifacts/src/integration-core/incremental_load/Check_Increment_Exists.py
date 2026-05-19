@@ -70,7 +70,8 @@ if experiment_id:
 
 # Resolve table paths: use _cleaned suffix when quality_task_enabled is true
 def resolve_table_path(source_table):
-    """If DQ is enabled for this dataset, check the _cleaned table instead."""
+    if source_table.endswith("_cleaned"):
+        return source_table  # already resolved upstream
     obj_info = dataset_objects.get(source_table, {})
     if obj_info.get("quality_task_enabled", False):
         return f"{source_table}_cleaned"

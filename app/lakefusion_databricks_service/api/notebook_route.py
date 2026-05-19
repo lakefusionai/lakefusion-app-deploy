@@ -10,7 +10,9 @@ from databricks.sdk.service.workspace import ObjectInfo
 # Initialize logger for the Notebook Management API
 app_logger = get_logger(__name__)
 
-DATABRICKS_HOST = os.environ.get('DATABRICKS_HOST', 'https://databricks.com')
+# Shared helper guarantees the https:// prefix is present.
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+DATABRICKS_HOST = get_databricks_host() or "https://databricks.com"
 
 # Initialize API Router for notebook-related operations with the prefix '/catalog'
 notebook_router = APIRouter(tags=["Notebook Management API"], prefix='/notebook')

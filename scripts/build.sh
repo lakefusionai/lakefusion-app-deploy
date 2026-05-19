@@ -5,7 +5,7 @@
 # Assembles the unified LakeFusion Databricks App from the monorepo services.
 # - Builds lakefusion_utility as a wheel (installed via requirements.txt)
 # - Copies each service's app/ folder as a subpackage, rewrites `from app.` imports
-# - Generates a unified main.py, merged requirements.txt, and app.yaml
+# - Generates a unified main.py, merged requirements.txt, and app.yml
 #
 # Usage:  bash scripts/build_lakefusion_app.sh
 # =============================================================================
@@ -56,9 +56,15 @@ SERVICES=(
 # ── Step 1: Build lakefusion_utility wheel ──────────────────────────────────
 info "Building lakefusion_utility wheel"
 UTIL_DIR="$REPO_ROOT/lakefusion-utility"
+# Use timestamp-based version so the wheel filename changes on every build.
+# This forces Databricks Apps to reinstall even when requirements.txt is cached.
+BUILD_VERSION="1.0.$(date +%Y%m%d%H%M%S)"
 (
     cd "$UTIL_DIR"
+    sed "s/version=\"1.0.0\"/version=\"${BUILD_VERSION}\"/" setup.py > /tmp/lf_util_setup.py
+    cp /tmp/lf_util_setup.py setup.py
     python3 -m pip wheel --no-deps --wheel-dir "$OUT/wheels" . 2>&1 | tail -3
+    git checkout setup.py 2>/dev/null  # restore original
 )
 WHEEL_FILE=$(ls "$OUT/wheels"/lakefusion_utility-*.whl 2>/dev/null | head -1)
 if [[ -z "$WHEEL_FILE" ]]; then
@@ -111,6 +117,13 @@ info "Copying dbx_pipeline_artifacts"
 cp -R "$REPO_ROOT/dbx_pipeline_artifacts" "$OUT/dbx_pipeline_artifacts"
 find "$OUT/dbx_pipeline_artifacts" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 find "$OUT/dbx_pipeline_artifacts" -name "*.pyc" -delete 2>/dev/null || true
+
+# ── Step 3d: Copy deployment utilities ───────────────────────────────────────
+if [[ -d "$REPO_ROOT/utilities" ]]; then
+    info "Copying utilities → deployments/"
+    mkdir -p "$OUT/deployments"
+    cp -R "$REPO_ROOT/utilities/"* "$OUT/deployments/"
+fi
 
 # ── Step 4: Copy MCP static files if they exist ────────────────────────────
 if [[ -d "$REPO_ROOT/lakefusion-mcp-service/app/static" ]]; then
@@ -398,10 +411,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Middleware
+# Middleware to handle Databricks Apps authentication
+from fastapi import Request as FastAPIRequest
+
+@app.middleware("http")
+async def databricks_auth_middleware(request: FastAPIRequest, call_next):
+    """
+    Handle Databricks authentication for API routes.
+    In Databricks Apps, authentication is handled automatically via cookies/headers.
+    This middleware ensures proper header propagation.
+    """
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    return response
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -719,9 +747,9 @@ with open(out_path, 'w') as f:
 print(f"Wrote {len(sorted_pkgs)} packages + utility wheel to {out_path}")
 MERGE_SCRIPT
 
-# ── Step 10: Generate app.yaml ──────────────────────────────────────────────
-info "Generating app.yaml"
-cat > "$OUT/app.yaml" << 'YAMLEOF'
+# ── Step 10: Generate app.yml ──────────────────────────────────────────────
+info "Generating app.yml"
+cat > "$OUT/app.yml" << 'YAMLEOF'
 name: lakefusion-app
 
 # Allow Authorization header to pass through for API routes
@@ -774,6 +802,8 @@ env:
     valueFrom: DATABRICKS_OIDC_CLIENT_ID
   - name: DATABRICKS_OIDC_CLIENT_SECRET
     valueFrom: DATABRICKS_OIDC_CLIENT_SECRET
+  - name: LAKEFUSION_DATABRICKS_DAPI
+    valueFrom: LAKEFUSION_DATABRICKS_DAPI
 YAMLEOF
 
 # ── Step 11: Build and assemble UI portals ──────────────────────────────────

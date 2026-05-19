@@ -39,6 +39,7 @@ entity_attributes = json.loads(entity_attributes)
 unified_table = f"{catalog_name}.silver.{entity}_unified"
 master_table = f"{catalog_name}.gold.{entity}_master"
 processed_unified_table = f"{catalog_name}.silver.{entity}_processed_unified"
+processed_unified_dedup_table = f"{catalog_name}.silver.{entity}_processed_unified_deduplicate"
 potential_match_table = f"{catalog_name}.gold.{entity}_master_potential_match"
 
 # Add experiment suffix if exists
@@ -46,6 +47,7 @@ if experiment_id:
     unified_table += f"_{experiment_id}"
     master_table += f"_{experiment_id}"
     processed_unified_table += f"_{experiment_id}"
+    processed_unified_dedup_table += f"_{experiment_id}"
     potential_match_table += f"_{experiment_id}"
 
 # Related tables
@@ -60,6 +62,7 @@ unified_id_key = 'surrogate_key'
 
 # Check if processed_unified_table exists
 processed_unified_exists = spark.catalog.tableExists(processed_unified_table)
+processed_unified_dedup_exists = spark.catalog.tableExists(processed_unified_dedup_table)
 
 logger.info(f"Entity: {entity}")
 logger.info(f"Master ID Key: {id_key}")
@@ -70,6 +73,8 @@ logger.info(f"Unified Table: {unified_table}")
 logger.info(f"Master Table: {master_table}")
 logger.info(f"Processed Unified Table: {processed_unified_table}")
 logger.info(f"  Exists: {processed_unified_exists}")
+logger.info(f"Processed Unified Dedup Table: {processed_unified_dedup_table}")
+logger.info(f"  Exists: {processed_unified_dedup_exists}")
 logger.info(f"Potential Match Table: {potential_match_table}")
 logger.info(f"Merge Activities Table: {merge_activities_table}")
 
@@ -168,6 +173,39 @@ else:
     all_matches_union = ""
     logger.info("Processed unified table does not exist - skipping pending matches")
 
+# Bidirectional source for master-master match scores from golden dedup.
+# When the golden dedup processed table is missing (golden dedup never ran for
+# this entity), emit an empty source so the CTE evaluates to zero rows and the
+# LEFT JOIN downstream produces NULLs (falling back to generic merge reason).
+if processed_unified_dedup_exists:
+    master_merge_scores_source = f"""
+            SELECT
+                query_{id_key}  AS survivor_{id_key},
+                match_{id_key}  AS absorbed_{id_key},
+                exploded_result.score  AS score,
+                exploded_result.reason AS reason
+            FROM {processed_unified_dedup_table}
+            WHERE exploded_result.score IS NOT NULL
+            UNION ALL
+            SELECT
+                match_{id_key}  AS survivor_{id_key},
+                query_{id_key}  AS absorbed_{id_key},
+                exploded_result.score  AS score,
+                exploded_result.reason AS reason
+            FROM {processed_unified_dedup_table}
+            WHERE exploded_result.score IS NOT NULL"""
+    logger.info("Including master-master match scores from processed_unified_deduplicate")
+else:
+    master_merge_scores_source = f"""
+            SELECT
+                CAST(NULL AS STRING) AS survivor_{id_key},
+                CAST(NULL AS STRING) AS absorbed_{id_key},
+                CAST(NULL AS DOUBLE) AS score,
+                CAST(NULL AS STRING) AS reason
+            FROM (SELECT 1)
+            WHERE 1 = 0"""
+    logger.info("Processed unified deduplicate table does not exist - no master-master scores")
+
 # Build the complete query
 query = f"""
 WITH current_contributors AS (
@@ -211,19 +249,23 @@ not_a_match_pairs AS (
 ),
 {pending_matches_ctes}
 -- Get the ORIGINAL merge activity for each source record
--- This is the first time it was merged into ANY master
+-- This is the LATEST merge-establishing action (INITIAL_LOAD/JOB_INSERT/JOB_MERGE/MANUAL_MERGE)
+-- for the contributor. Excludes SOURCE_UPDATE/MANUAL_UNMERGE/MANUAL_NOT_A_MATCH/SOURCE_DELETE
+-- so that an attribute-only update does NOT relabel an already-merged contributor's
+-- merge_status from JOB_MERGE -> SOURCE_UPDATE in the potential_matches array.
 original_merge_activity AS (
     SELECT
         ma.match_id as {unified_id_key},
         ma.master_id as original_master_id,
         ma.action_type as original_action_type,
         ROW_NUMBER() OVER (
-            PARTITION BY ma.match_id 
+            PARTITION BY ma.match_id
             ORDER BY ma.version DESC, ma.created_at DESC
         ) as rn
     FROM {merge_activities_table} ma
-    WHERE ma.match_id IS NOT NULL 
+    WHERE ma.match_id IS NOT NULL
       AND ma.match_id LIKE 'sk_%'  -- Only source records, not master merges
+      AND ma.action_type IN ('INITIAL_LOAD', 'JOB_INSERT', 'JOB_MERGE', 'MANUAL_MERGE')
 ),
 original_merge AS (
     SELECT {unified_id_key}, original_master_id, original_action_type
@@ -392,6 +434,29 @@ scoring_results_parsed AS (
         sr.reason as reason
     FROM scoring_results_exploded
 ),
+-- Master-to-master match score/reason from the GOLDEN DEDUP processed table.
+-- For contributors absorbed via MASTER_JOB_MERGE / MASTER_MANUAL_MERGE we want
+-- the reason that justified the master-master merge, NOT the source-record's
+-- own scoring_results row (which is unrelated to why the masters merged).
+-- Bidirectional: query/match positions vary in the golden dedup table.
+master_merge_scores AS (
+    SELECT survivor_{id_key}, absorbed_{id_key}, master_match_score, master_match_reason
+    FROM (
+        SELECT
+            survivor_{id_key},
+            absorbed_{id_key},
+            CAST(score AS STRING) AS master_match_score,
+            reason AS master_match_reason,
+            ROW_NUMBER() OVER (
+                PARTITION BY survivor_{id_key}, absorbed_{id_key}
+                ORDER BY score DESC NULLS LAST
+            ) AS rn
+        FROM (
+            {master_merge_scores_source}
+        )
+    )
+    WHERE rn = 1
+),
 -- Exclude unmerged records entirely from merged_contributors_enriched
 -- (they are handled by unmerged_as_match / promoted_masters).
 -- Detect force-merge chains via master_merge_final to override reason/status.
@@ -401,6 +466,12 @@ merged_contributors_enriched AS (
         cc.{unified_id_key},
         cc.source_path,
         CASE
+            WHEN force_merge_chain.final_master_id IS NOT NULL
+                AND force_merge_chain.action_type IN ('MASTER_JOB_MERGE', 'MASTER_MANUAL_MERGE')
+                THEN COALESCE(mms.master_match_score, '1.0')
+            WHEN force_merge_chain.final_master_id IS NOT NULL
+                AND force_merge_chain.action_type = 'MASTER_FORCE_MERGE'
+                THEN '1.0'
             WHEN om.original_action_type IN ('INITIAL_LOAD', 'JOB_INSERT') THEN '1.0'
             WHEN om.original_action_type IN ('JOB_MERGE', 'MANUAL_MERGE')  THEN COALESCE(srp.score, '1.0')
             ELSE '1.0'
@@ -408,12 +479,20 @@ merged_contributors_enriched AS (
         CASE
             WHEN force_merge_chain.final_master_id IS NOT NULL
                 AND force_merge_chain.action_type = 'MASTER_MANUAL_MERGE'
+                AND mms.master_match_reason IS NOT NULL
+                THEN CONCAT('Masters merged manually - ', mms.master_match_reason)
+            WHEN force_merge_chain.final_master_id IS NOT NULL
+                AND force_merge_chain.action_type = 'MASTER_MANUAL_MERGE'
                 THEN 'Masters merged manually'
+            WHEN force_merge_chain.final_master_id IS NOT NULL
+                AND force_merge_chain.action_type = 'MASTER_JOB_MERGE'
+                AND mms.master_match_reason IS NOT NULL
+                THEN CONCAT('Masters merged automatically - ', mms.master_match_reason)
             WHEN force_merge_chain.final_master_id IS NOT NULL
                 AND force_merge_chain.action_type = 'MASTER_JOB_MERGE'
                 THEN 'Masters merged automatically'
             WHEN force_merge_chain.final_master_id IS NOT NULL
-                THEN 'Force merged'
+                THEN 'Records force merged'
             WHEN om.original_action_type = 'INITIAL_LOAD'  THEN 'Record initially loaded'
             WHEN om.original_action_type = 'JOB_INSERT'    THEN 'Record inserted'
             WHEN om.original_action_type = 'JOB_MERGE'
@@ -467,6 +546,13 @@ merged_contributors_enriched AS (
         ON  om.original_master_id = force_merge_chain.old_master_id
         AND cc.master_{id_key}    = force_merge_chain.final_master_id
         AND ur_excl.{unified_id_key} IS NULL   -- only apply when not currently unmerged
+    -- Pull the master-to-master match score/reason from golden dedup for the
+    -- exact (final_master, absorbed_master) pair that justified the merge.
+    -- This replaces the previous (wrong) best_match_per_contributor lookup
+    -- which read the source-record's own scoring_results — unrelated rows.
+    LEFT JOIN master_merge_scores mms
+        ON  mms.survivor_{id_key} = cc.master_{id_key}
+        AND mms.absorbed_{id_key} = force_merge_chain.old_master_id
     WHERE cc.record_status = 'MERGED'
       AND ur_excl.{unified_id_key} IS NULL   -- FIX 1: drop unmerged records
 ),

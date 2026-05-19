@@ -19,6 +19,8 @@ from app.lakefusion_databricks_service.api.dataset_route import dataset_router
 from app.lakefusion_databricks_service.api.catalog_route import catalog_router
 from app.lakefusion_databricks_service.api.notebook_route import notebook_router
 from app.lakefusion_databricks_service.api.quality_task_route import quality_task_router
+from app.lakefusion_databricks_service.api.user_route import user_router
+from app.lakefusion_databricks_service.api.rbac_groups_route import rbac_groups_router
 from lakefusion_utility.routes.ops import ops_router
 # from app.lakefusion_databricks_service.api.reference_entity_route import reference_entity_router
 
@@ -60,6 +62,8 @@ app.include_router(dataset_router, prefix=f'{app_prefix}')
 app.include_router(catalog_router, prefix=f'{app_prefix}')
 app.include_router(notebook_router, prefix=f'{app_prefix}')
 app.include_router(quality_task_router, prefix=f'{app_prefix}')
+app.include_router(user_router, prefix=f'{app_prefix}')
+app.include_router(rbac_groups_router, prefix=f'{app_prefix}')
 app.include_router(ops_router, prefix=f'{app_prefix}')
 #app.include_router(reference_entity_router, prefix=f'{app_prefix}')
 

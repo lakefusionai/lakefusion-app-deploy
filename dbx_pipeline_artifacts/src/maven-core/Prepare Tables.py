@@ -150,7 +150,7 @@ uuid_udf = udf(lambda: uuid.uuid4().hex.lower(), StringType())
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, lit, when, concat_ws, current_timestamp
+from pyspark.sql.functions import col, lit, when, concat_ws, coalesce, regexp_replace, trim, current_timestamp
 from delta.tables import DeltaTable
 
 def get_last_processed_version(table_meta_info, entity, table_name):
@@ -232,7 +232,7 @@ if not master_table_exists:
         
         df_master = df_master.select([column for column in df_master.columns if column in entity_attributes])
        
-        df_master = df_master.withColumn(merged_desc_column, concat_ws(" | ", *[regexp_replace(trim(col(c)), r'\s+', ' ') for c in attributes]))
+        df_master = df_master.withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(regexp_replace(trim(col(c)), r'\s+', ' '), lit("")) for c in attributes]))
         df_master.withColumn(
             "lakefusion_id",
             when(col("lakefusion_id").isNull(), uuid_udf()).otherwise(col("lakefusion_id"))
@@ -416,7 +416,7 @@ dataset_objects_df = spark.createDataFrame(list(dataset_objects.values()))
 
 # COMMAND ----------
 
-from pyspark.sql.functions import col, struct,concat_ws
+from pyspark.sql.functions import col, struct, concat_ws, coalesce, lit
 
 joined_unified_df = (
     df_unified.join(dataset_objects_df, df_unified.table_name == dataset_objects_df.path)  # Fix: Remove []
@@ -427,7 +427,7 @@ joined_unified_df = (
 # COMMAND ----------
 
 # Generate merged decription
-joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
 
 # COMMAND ----------
 

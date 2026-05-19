@@ -29,6 +29,7 @@ from app.lakefusion_middlelayer_service.api.db_config_properties_route import db
 from app.lakefusion_middlelayer_service.api.base_prompt_route import base_prompt_router
 from app.lakefusion_middlelayer_service.api.dnb_integration_route import dnb_router
 from app.lakefusion_middlelayer_service.api.logs_route import logs_router
+from app.lakefusion_middlelayer_service.api.user_roles_route import user_roles_router
 from app.lakefusion_middlelayer_service.api.pt_models_route import pt_models_router
 from app.lakefusion_middlelayer_service.api.schema_evolution_route import schema_evolution_router, schema_evolution_global_router
 from app.lakefusion_middlelayer_service.api.spn_oauth_route import spn_router
@@ -87,6 +88,7 @@ app.include_router(base_prompt_router, prefix=f'{app_prefix}')
 app.include_router(pt_models_router, prefix=f'{app_prefix}')
 app.include_router(dnb_router, prefix=f'{app_prefix}')
 app.include_router(logs_router, prefix=f'{app_prefix}')
+app.include_router(user_roles_router, prefix=f'{app_prefix}')
 app.include_router(schema_evolution_router, prefix=f'{app_prefix}')
 app.include_router(notebook_sync_router, prefix=f'{app_prefix}')
 app.include_router(schema_evolution_global_router, prefix=f'{app_prefix}')

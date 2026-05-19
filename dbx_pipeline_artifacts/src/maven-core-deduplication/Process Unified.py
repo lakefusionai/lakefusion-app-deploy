@@ -222,7 +222,7 @@ joined_unified_df = (
 # COMMAND ----------
 
 # Generate merged decription
-joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
 
 # COMMAND ----------
 

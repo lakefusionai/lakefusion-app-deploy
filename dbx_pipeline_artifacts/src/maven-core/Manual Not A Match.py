@@ -75,6 +75,10 @@ for unified_dataset_id in unified_dataset_ids:
 
 # COMMAND ----------
 
+# MAGIC %run ../utils/concurrency_utils
+
+# COMMAND ----------
+
 unified_table = f"{catalog_name}.silver.{entity}_unified"
 master_table = f"{catalog_name}.gold.{entity}_master"
 processed_unified_table = f"{catalog_name}.silver.{entity}_processed_unified"
@@ -178,14 +182,14 @@ resultant_merge_activities_survivorship = (
 
 # COMMAND ----------
 
-# Define the Delta table
-delta_table = DeltaTable.forName(spark, merge_activities_table)
+def _merge_not_a_match_activities():
+    delta_table = DeltaTable.forName(spark, merge_activities_table)
+    delta_table.alias("target").merge(
+        source=resultant_merge_activities_survivorship.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-# Perform merge operation
-delta_table.alias("target").merge(
-    source=resultant_merge_activities_survivorship.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_not_a_match_activities, "merge_activities MANUAL_NOT_A_MATCH")
 
 # COMMAND ----------
 
@@ -291,7 +295,7 @@ master_columns = spark.read.table(master_table).columns
 
 master_insert_df = (
     records_to_insert
-    .withColumn("attributes_combined", concat_ws(" | ", *[col(attr) for attr in entity_attributes if attr in records_to_insert.columns]))
+    .withColumn("attributes_combined", concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in entity_attributes if attr in records_to_insert.columns]))
 )
 
 for col_name in master_columns:
@@ -309,10 +313,14 @@ records_collected = records_to_insert.collect()
 
 # Insert into master table
 logger.info("Inserting records into master table")
-DeltaTable.forName(spark, master_table).alias("target").merge(
-    source=master_insert_df.alias("source"),
-    condition=f"target.{id_key} = source.{id_key}"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+def _merge_master_table_insert():
+    DeltaTable.forName(spark, master_table).alias("target").merge(
+        source=master_insert_df.alias("source"),
+        condition=f"target.{id_key} = source.{id_key}"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+_retry_on_concurrent_append(_merge_master_table_insert, "master_table NOT_A_MATCH insert")
 
 # COMMAND ----------
 
@@ -333,16 +341,19 @@ merge_activities_df = spark.createDataFrame(merge_activities_data, spark.read.ta
 
 # COMMAND ----------
 
-DeltaTable.forName(spark, merge_activities_table).alias("target").merge(
-    source=merge_activities_df.alias("source"),
-    condition=f"""
-        target.{id_key} = source.{id_key} 
-        and target.master_{id_key} = source.master_{id_key}
-        and target.version = source.version 
-        and target.action_type = source.action_type 
-        and target.source = source.source
-    """
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+def _merge_job_insert_activities():
+    DeltaTable.forName(spark, merge_activities_table).alias("target").merge(
+        source=merge_activities_df.alias("source"),
+        condition=f"""
+            target.{id_key} = source.{id_key}
+            and target.master_{id_key} = source.master_{id_key}
+            and target.version = source.version
+            and target.action_type = source.action_type
+            and target.source = source.source
+        """
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+_retry_on_concurrent_append(_merge_job_insert_activities, "merge_activities JOB_INSERT")
 
 # COMMAND ----------
 
@@ -378,7 +389,10 @@ attribute_df = spark.createDataFrame(attribute_data, spark.read.table(master_att
 
 # COMMAND ----------
 
-DeltaTable.forName(spark, master_attribute_version_sources_table).alias("target").merge(
-    source=attribute_df.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+def _merge_attribute_version_sources():
+    DeltaTable.forName(spark, master_attribute_version_sources_table).alias("target").merge(
+        source=attribute_df.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+_retry_on_concurrent_append(_merge_attribute_version_sources, "master_attribute_version_sources_table")

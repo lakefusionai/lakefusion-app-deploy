@@ -5,8 +5,17 @@ from starlette.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from lakefusion_utility.utils.logging_utils import get_logger, init_logger
-# Initialize logger
+# Initialize logger BEFORE any lakefusion_utility import that touches
+# app_db / models — those modules call get_logger() at module-load time
+# and will raise RuntimeError("Logging not initialized") if we don't.
 init_logger(service="cron_service")
+
+# NOTE: do NOT import get_app_sp_token at module level here. The installed
+# lakefusion_utility wheel has a latent circular import between
+# databricks_util.py ↔ models/__init__.py ↔ utils/auth.py that only fires
+# when databricks_util is the FIRST submodule touched. Other imports below
+# (app_db, services, models) load the package along a safe path; once that
+# settles, lazy-importing databricks_util inside functions works fine.
 
 from app.lakefusion_cron_service.utils.app_db import engine
 from app.lakefusion_cron_service.middleware import DBCleanupMiddleware
@@ -106,8 +115,11 @@ async def lifespan(app):
                 # ------------------------------------------------------
 
                 try:
+                    # Lazy import — see note at top of file about the
+                    # latent circular import in the lakefusion_utility wheel.
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token
                     service = Integration_HubService(db=db)
-                    token = os.environ.get('LAKEFUSION_DATABRICKS_DAPI', '')
+                    token = get_app_sp_token()
                     service.sync_all_job_versions(token)
                 except Exception as e:
                     logger.error(f"Error syncing jobs versions: {e}")
@@ -130,14 +142,16 @@ async def lifespan(app):
                 # Step 6: Sync PT config to Volume
                 # ------------------------------------------------------
                 try:
-                    token = os.environ.get('LAKEFUSION_DATABRICKS_DAPI', '')
+                    # Lazy import — see note at top of file.
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token
+                    token = get_app_sp_token()
                     if token:
                         logger.info("Syncing PT config to Volume on startup...")
                         service = PTModelsConfigService(db)
                         service.sync_to_volume(token)
                         logger.info("PT config synced to Volume on startup")
                     else:
-                        logger.warning("LAKEFUSION_DATABRICKS_DAPI not set, skipping PT config startup sync")
+                        logger.warning("No SP credentials and no fallback PAT set — skipping PT config startup sync")
                 except Exception as e:
                     logger.error(f"Error during PT config startup sync: {e}")
 

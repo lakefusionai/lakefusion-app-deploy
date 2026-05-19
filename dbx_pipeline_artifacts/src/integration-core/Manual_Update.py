@@ -160,36 +160,40 @@ for attr_name, attr_value in update_attributes.items():
 
 if set_clauses:
     set_clause = ", ".join(set_clauses)
-    
+
     update_master_query = f"""
         UPDATE {master_table}
         SET {set_clause}
         WHERE lakefusion_id = '{lakefusion_id}'
     """
-    
+
     logger.info(f"Executing update query...")
     logger.info(f"  SET: {set_clause[:200]}..." if len(set_clause) > 200 else f"  SET: {set_clause}")
     spark.sql(update_master_query)
     logger.info(f"Master table updated successfully")
-    
-    # Update attributes_combined
+
+    # Update attributes_combined and invalidate precomputed embedding
     updated_record = spark.sql(f"""
         SELECT * FROM {master_table} WHERE lakefusion_id = '{lakefusion_id}'
     """).collect()
-    
+
     if updated_record:
         attr_values = []
         for attr in entity_attributes:
             if attr in updated_record[0].asDict():
                 val = updated_record[0][attr]
                 attr_values.append(str(val) if val is not None else '')
-        
+
         attributes_combined = " | ".join(attr_values)
         attributes_combined_escaped = attributes_combined.replace("'", "''")
-        
+
+        # Invalidate precomputed embedding if column exists
+        master_cols_lower = {f.name.strip().lower() for f in spark.table(master_table).schema}
+        embedding_null_clause = ", attributes_combined_embedding = NULL" if "attributes_combined_embedding" in master_cols_lower else ""
+
         spark.sql(f"""
             UPDATE {master_table}
-            SET attributes_combined = '{attributes_combined_escaped}'
+            SET attributes_combined = '{attributes_combined_escaped}'{embedding_null_clause}
             WHERE lakefusion_id = '{lakefusion_id}'
         """)
         logger.info(f"attributes_combined updated")

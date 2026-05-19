@@ -66,6 +66,7 @@ async def execute_compare(
             match_threshold=request.matchThreshold,
             possible_match_threshold=request.possibleMatchThreshold,
             enforce_json_format=request.enforceJsonFormat,
+            reasoning_effort=request.reasoningEffort,
         )
 
         return ExecuteCompareResponse(
@@ -77,7 +78,8 @@ async def execute_compare(
             prompt_tokens=result.get("prompt_tokens"),
             completion_tokens=result.get("completion_tokens"),
             total_tokens=result.get("total_tokens"),
-            reasoning_tokens=result.get("reasoning_tokens")
+            reasoning_tokens=result.get("reasoning_tokens"),
+            config_used=result.get("config_used")
         )
 
     except HTTPException as he:

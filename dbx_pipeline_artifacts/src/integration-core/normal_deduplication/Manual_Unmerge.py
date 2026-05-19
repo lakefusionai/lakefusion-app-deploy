@@ -49,6 +49,11 @@ match_attributes = dbutils.jobs.taskValues.get(
     "Parse_Entity_Model_JSON", "match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
 master_id = dbutils.widgets.get("master_id")
 unmerge_unified_dataset_ids = dbutils.widgets.get("unified_dataset_ids")
 
@@ -60,10 +65,19 @@ default_survivorship_rules = json.loads(default_survivorship_rules)
 dataset_objects = json.loads(dataset_objects)
 match_attributes = json.loads(match_attributes)
 unmerge_unified_dataset_ids = json.loads(unmerge_unified_dataset_ids)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -124,8 +138,33 @@ setup_lakefusion_engine()
 
 # COMMAND ----------
 
+# Capture record snapshots BEFORE any modifications for steward decisions
+try:
+    attr_cols = ", ".join(entity_attributes)
+    _sd_master_row = spark.sql(f"SELECT {attr_cols} FROM {master_table} WHERE {id_key} = '{master_id}'").collect()
+    _sd_master_attrs = _sd_master_row[0].asDict() if _sd_master_row else {}
+    _sd_match_id = unmerge_surrogate_keys[0] if unmerge_surrogate_keys else None
+    if _sd_match_id:
+        # Check if match_id is a surrogate_key (sk_ prefix) or a lakefusion_id
+        if str(_sd_match_id).startswith("sk_"):
+            _sd_match_row = spark.sql(f"SELECT {attr_cols}, source_path FROM {unified_table} WHERE {unified_id_key} = '{_sd_match_id}'").collect()
+        else:
+            _sd_match_row = spark.sql(f"SELECT {attr_cols} FROM {master_table} WHERE {id_key} = '{_sd_match_id}'").collect()
+        _sd_match_attrs = _sd_match_row[0].asDict() if _sd_match_row else {}
+    else:
+        _sd_match_attrs = {}
+    logger.info(f"Steward decision snapshots captured for master={master_id}, match={_sd_match_id}")
+except Exception as e:
+    logger.warning(f"Could not capture steward decision snapshots: {e}")
+    _sd_master_attrs = {}
+    _sd_match_attrs = {}
+    _sd_match_id = unmerge_surrogate_keys[0] if unmerge_surrogate_keys else ""
+
+# COMMAND ----------
+
 from lakefusion_core_engine.survivorship import SurvivorshipEngine, __version__
 from lakefusion_core_engine.identifiers import generate_lakefusion_id
+from lakefusion_core_engine.utils import merged_record_column
 
 logger.info(f"Survivorship Engine Version: {__version__}")
 
@@ -187,8 +226,10 @@ logger.info("\n" + "="*80)
 logger.info("STEP 2: FETCH ALL CONTRIBUTORS FOR THE MASTER")
 logger.info("="*80)
 
-# Build attribute columns dynamically
-attribute_cols = ", ".join([f"u.{attr}" for attr in entity_attributes])
+# Build attribute columns dynamically. Includes the survivorship audit
+# timestamp `__lf_modified_at` (added by migration c4d2e8f7a1b9) which the
+# survivorship engine uses as a deterministic tie-breaker.
+attribute_cols = ", ".join(["u.__lf_modified_at"] + [f"u.{attr}" for attr in entity_attributes])
 
 # Get all MERGED contributors for this master
 all_contributors_query = f"""
@@ -404,21 +445,20 @@ for attr in entity_attributes:
     else:
         insert_cols.append(col(attr).alias(attr))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# These rows hold a single ref_id per attribute (single contributor, no
+# concat aggregation in this path), but the helper handles both cases.
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(attr).cast("string"), lit("")))
-    
-    if concat_cols:
-        insert_cols.append(
-            concat_ws(" | ", *concat_cols).alias("attributes_combined")
-        )
-    else:
-        insert_cols.append(lit("").alias("attributes_combined"))
+    insert_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,  # don't skip any attr here
+            reference_attribute_config=reference_attribute_config,
+            source_prefix=None,
+        ).alias("attributes_combined")
+    )
 else:
     insert_cols.append(lit("").alias("attributes_combined"))
 
@@ -442,41 +482,22 @@ for attr in entity_attributes:
         continue
     
     target_type = entity_attributes_datatype.get(attr, "string")
-    
-    if target_type.lower() in ["timestamp", "date", "datetime"]:
-        master_update_cols.append(
-            col(f"merged_record.{attr}").cast("timestamp").alias(attr)
-        )
-    elif target_type.lower() in ["int", "integer", "long", "bigint"]:
-        master_update_cols.append(
-            col(f"merged_record.{attr}").cast("double").cast("long").alias(attr)
-        )
-    elif target_type.lower() in ["float", "double", "decimal"]:
-        master_update_cols.append(
-            col(f"merged_record.{attr}").cast("double").alias(attr)
-        )
-    elif target_type.lower() in ["boolean", "bool"]:
-        master_update_cols.append(
-            col(f"merged_record.{attr}").cast("boolean").alias(attr)
-        )
-    else:
-        master_update_cols.append(
-            col(f"merged_record.{attr}").alias(attr)
-        )
+    master_update_cols.append(merged_record_column(attr, target_type))
 
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(f"merged_record.{attr}").cast("string"), lit("")))
-    
-    if concat_cols:
-        master_update_cols.append(
-            concat_ws(" | ", *concat_cols).alias("attributes_combined")
-        )
-        logger.info(f"  Generated attributes_combined from: {match_attributes}")
+    # Master rebuild after unmerge — survivorship may have produced a
+    # concat-aggregated multi-id value; helper splits and resolves each id.
+    master_update_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix="merged_record",
+        ).alias("attributes_combined")
+    )
+    logger.info(f"  Generated attributes_combined from: {match_attributes}")
     else:
         master_update_cols.append(lit("").alias("attributes_combined"))
         logger.warning("No valid match attributes found, using empty string")
@@ -495,9 +516,20 @@ master_delta_table = DeltaTable.forName(spark, master_table)
 
 # Build update dict
 update_dict = {attr: f"source.{attr}" for attr in entity_attributes if attr != id_key}
+update_dict["attributes_combined"] = "source.attributes_combined"
+# Invalidate precomputed embedding so it recomputes on next pipeline run
+master_cols_lower = {f.name.strip().lower() for f in spark.table(master_table).schema}
+if "attributes_combined_embedding" in master_cols_lower:
+    update_dict["attributes_combined_embedding"] = "NULL"
 
 # Combine update and insert sources
 combined_source = master_updates_df.union(unmerge_insert_df)
+
+# Add attributes_combined_embedding as NULL if the target table has it
+if "attributes_combined_embedding" in master_cols_lower:
+    combined_source = combined_source.withColumn(
+        "attributes_combined_embedding", lit(None).cast("array<float>")
+    )
 
 # Execute merge: UPDATE for existing master_id, INSERT for new lakefusion_ids
 master_delta_table.alias("target").merge(
@@ -689,6 +721,31 @@ unified_delta_table.alias("target").merge(
 
 logger.info(f"Unified table updated")
 logger.info(f"  Records updated: {unified_updates_df.count()}")
+
+# COMMAND ----------
+
+# Write steward decision with frozen snapshots to Delta table
+try:
+    import uuid as _uuid
+    _sd_table = f"{catalog_name}.silver.{entity}_steward_decisions"
+    spark.sql(f"""CREATE TABLE IF NOT EXISTS {_sd_table} (
+        decision_id STRING, entity_id STRING, action_type STRING, master_id STRING, match_id STRING,
+        reason STRING, reason_category STRING, master_record_attributes STRING, match_record_attributes STRING,
+        master_record_source STRING, match_record_source STRING, steward STRING, decided_at TIMESTAMP, aml_status STRING
+    ) USING DELTA""")
+    _sd_match_source = _sd_match_attrs.get("source_path", "") if _sd_match_attrs else ""
+    _sd_to_str = lambda d: {k: str(v) if v is not None else None for k, v in d.items()}
+    _sql_str = lambda v: "'" + str(v).replace("'", "''") + "'" if v is not None else 'NULL'
+    _sd_m_json = json.dumps(_sd_to_str(_sd_master_attrs)) if _sd_master_attrs else None
+    _sd_r_json = json.dumps(_sd_to_str(_sd_match_attrs)) if _sd_match_attrs else None
+    spark.sql(f"""INSERT INTO {_sd_table} VALUES (
+        '{str(_uuid.uuid4()).replace("-","")}', '', 'MANUAL_UNMERGE', '{master_id}', '{_sd_match_id or ""}',
+        NULL, NULL, {_sql_str(_sd_m_json) if _sd_m_json else 'NULL'}, {_sql_str(_sd_r_json) if _sd_r_json else 'NULL'},
+        NULL, {_sql_str(_sd_match_source) if _sd_match_source else 'NULL'}, '', current_timestamp(), 'PENDING'
+    )""")
+    logger.info(f"Steward decision written for MANUAL_UNMERGE master={master_id}")
+except Exception as e:
+    logger.warning(f"Could not write steward decision: {e}")
 
 # COMMAND ----------
 

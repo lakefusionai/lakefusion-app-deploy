@@ -26,6 +26,7 @@ dbutils.widgets.text("catalog_name", "", "catalog name")
 dbutils.widgets.text("entity_attributes_datatype","","entity_attributes_datatype")
 dbutils.widgets.text("deterministic_rules","","deterministic_rules")
 dbutils.widgets.text("config_thresholds", "", "Match Thresholds Config")
+dbutils.widgets.text("reference_attribute_config", "{}", "REFERENCE_ENTITY -> {ref_table, output_attr} map")
 
 # COMMAND ----------
 
@@ -44,6 +45,16 @@ entity_attributes_datatype = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSO
 attributes = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="match_attributes", debugValue=attributes)
 rules_config = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="deterministic_rules", debugValue=deterministic_rules)
 config_thresholds = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="config_thresholds", debugValue=config_thresholds)
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue=dbutils.widgets.get("reference_attribute_config"),
+)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
@@ -101,124 +112,262 @@ df_unified = spark.read.table(unified_table).filter(F.col("search_results")!='')
 df_master=spark.read.table(master_table)
 
 # COMMAND ----------
+%pip install rapidfuzz
+
+# COMMAND ----------
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LakeFusion — Excure Match Pipeline  (v2)
+# ───────────────────────────────────────────────────────────────────────────────
+# Changes:
+#   1. all_rule_results: ALL candidates × ALL rules (passed + failed)
+#   2. condition_scores: array<{attribute, score, threshold}> replaces two maps
+#   3. NOT_A_MATCH bug fix: excludes individual candidates, not the whole record
+#      — only candidates matched by NOT_A_MATCH rules are removed from llm_candidates
+#      — remaining candidates still flow to LLM
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import DoubleType
+from rapidfuzz.distance import JaroWinkler
+from functools import reduce as ft_reduce   # alias avoids clash with pyspark.sql.functions.reduce (Spark 3.3+)
+
+# ── REFERENCE_ENTITY display resolution ──────────────────────────────────────
+# Both df_unified and df_master store REFERENCE_ENTITY columns as the raw
+# ref_lakefusion_id (UUID). For deterministic rule comparison (especially
+# fuzzy: levenshtein / jaro_winkler / soundex), comparing UUIDs is meaningless.
+# We LEFT-JOIN the ref view per REFERENCE_ENTITY attribute and overwrite the
+# column in place with the human-readable output value, so all downstream
+# rule expressions naturally operate on display values.
+def _resolve_reference_columns(df):
+    for attr, cfg in (reference_attribute_config or {}).items():
+        if attr not in df.columns:
+            continue
+        ref_table   = cfg.get("ref_table")
+        output_attr = cfg.get("output_attr")
+        if not ref_table or not output_attr:
+            continue
+        ref_view = (
+            spark.read.table(ref_table)
+            .select(
+                F.col("ref_lakefusion_id").alias(f"_ref_{attr}_id"),
+                F.col(output_attr).alias(f"_ref_{attr}_disp"),
+            )
+        )
+        df = (
+            df.join(
+                F.broadcast(ref_view),
+                df[attr] == F.col(f"_ref_{attr}_id"),
+                "left",
+            )
+            .withColumn(attr, F.coalesce(F.col(f"_ref_{attr}_disp"), F.col(attr)))
+            .drop(f"_ref_{attr}_id", f"_ref_{attr}_disp")
+        )
+    return df
 
 
-def build_dynamic_struct(x_col, attributes, entity_attributes_datatype, rule_attributes):
-    """Build a struct from a pipe-separated master attribute string.
-    Only creates _matches columns for attributes present in rule_attributes.
-    """
+df_unified = _resolve_reference_columns(df_unified)
+df_master  = _resolve_reference_columns(df_master)
+
+# COMMAND ----------
+
+
+# ── 1. JW UDF ──────────────────────────────────────────────────────────────────
+
+def _jw_similarity(s1, s2):
+    if s1 is None or s2 is None:
+        return None
+    return float(JaroWinkler.similarity(s1, s2))
+
+jaro_winkler_udf = F.udf(_jw_similarity, DoubleType())
+spark.udf.register("jaro_winkler_similarity", _jw_similarity, DoubleType())
+
+
+# ── 2. Dynamic struct builder ──────────────────────────────────────────────────
+
+def build_dynamic_struct(x_col, attributes, entity_attributes_datatype):
     struct_fields = []
-
     parts = F.split(x_col, "\\|")
-
     for idx, attr in enumerate(attributes):
         raw_value = F.trim(F.element_at(parts, idx + 1))
-
-       
         if idx == len(attributes) - 1:
             raw_value = F.trim(F.regexp_extract(raw_value, r"^([^,]+),", 1))
-
-        # Only add _matches for attributes that are part of rules_config
-        if attr not in rule_attributes:
-            continue
-
+        # Reverse Step 5's null→"null" coercion so allow_nulls comparisons see
+        # actual NULL on the candidate side instead of the literal string "null".
+        raw_value = F.when(
+            (raw_value == "null") | (raw_value == ""),
+            F.lit(None).cast("string"),
+        ).otherwise(raw_value)
         dtype = entity_attributes_datatype.get(attr)
-        if dtype:
+        # REFERENCE_ENTITY is a domain marker (not a SQL type); the value is
+        # already resolved to a ref_lakefusion_id string upstream, so skip cast.
+        if dtype and dtype != "REFERENCE_ENTITY":
             raw_value = raw_value.cast(dtype)
         struct_fields.append(raw_value.alias(f"{attr}_matches"))
-
-    # Extract only the UUID from the entire string
     lakefusion_id = F.trim(F.regexp_extract(x_col, r"([a-f0-9]{32})", 1))
     struct_fields.append(lakefusion_id.alias("lakefusion_id"))
-
     return F.struct(*struct_fields)
 
 
-# ─────────────────────────────────────────────────────────────
-# build_rule  — adapted for new schema keys
-#   old: rule_name, conditions[].column, fuzzy_type, logical_op
-#   new: name,      conditions[].attribute, function, logical_operator
-# ─────────────────────────────────────────────────────────────
-def build_rule(rule: dict):
-    """
-    Build a Spark filter expression for a single rule dict.
-    Supports match_type: 'exact' | 'fuzzy'
-    Supports function:   'levenshtein' | 'jaro_winkler' | 'soundex'
-    """
-    rule_name  = rule["name"]
-    conditions = rule["conditions"]
-    logical_op = rule.get("logical_operator", "AND")
+# ── 3. Operator helper ──────────────────────────────────────────────────────────
 
-    condition_parts = []
+def _apply_operator(col_expr: F.Column, operator: str, threshold) -> F.Column:
+    return {
+        ">=": col_expr >= threshold,
+        "<=": col_expr <= threshold,
+        ">":  col_expr >  threshold,
+        "<":  col_expr <  threshold,
+        "=":  col_expr == threshold,
+        "==": col_expr == threshold,
+        "!=": col_expr != threshold
+    }[operator]
 
-    for cond in conditions:
-        attr       = cond["attribute"]                  # ← was "column"
-        match_type = cond.get("match_type", "exact")
-        fuzzy_func = cond.get("function")               # ← was "fuzzy_type"
-        threshold  = cond.get("threshold")
-        operator = cond.get("operator",">=")
 
-        if match_type == "exact":
-            condition_parts.append(f"(lower({attr}) = lower(x.{attr}_matches))")
+# ── 4. Condition match Column (True/False) ─────────────────────────────────────
+def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
+    """Returns a boolean Column: does this condition pass on the current row?
+    Row must have flat columns: <attr> (source) and <attr>_matches (candidate)."""
+    attr        = cond["attribute"]
+    match_type  = cond.get("match_type", "exact")
+    fuzzy_func  = cond.get("function")
+    threshold   = cond.get("threshold")
+    operator    = cond.get("operator", ">=")
+    allow_nulls = cond.get("allow_nulls", rule_allow_nulls)
 
-        elif match_type == "fuzzy":
-            if fuzzy_func == "levenshtein_normalized":
-                # threshold is a similarity ratio (0–1); convert to distance-based check
-                condition_parts.append(
-            f"(1 - (levenshtein({attr}, x.{attr}_matches) / "
-            f"greatest(length({attr}), length(x.{attr}_matches)))) {operator} {threshold}"
-        )
-            elif fuzzy_func == "levenshtein_standard":
-                condition_parts.append(f"(levenshtein({attr}, x.{attr}_matches) {operator} {threshold})")
-            elif fuzzy_func == "jaro_winkler":
-                condition_parts.append(
-                    f"(jaro_winkler_similarity({attr}, x.{attr}_matches) >= {threshold})"
-                )
-            elif fuzzy_func == "soundex":
-                condition_parts.append(
-                    f"(soundex({attr}) = soundex(x.{attr}_matches))"
-                )
-            else:
-                raise ValueError(f"Unsupported fuzzy function: {fuzzy_func}")
+    # Normalize empty/whitespace strings to NULL on both sides. The candidate
+    # side already does this in build_dynamic_struct (empty/"null" -> NULL),
+    # but the source side comes straight from the DataFrame where empties
+    # remain "". Without this, source="" vs candidate=NULL never matches
+    # under either allow_nulls branch.
+    src_raw  = F.col(attr).cast("string")
+    cand_raw = F.col(f"{attr}_matches").cast("string")
+    src  = F.when(F.trim(src_raw)  == "", F.lit(None).cast("string")).otherwise(src_raw)
+    cand = F.when(F.trim(cand_raw) == "", F.lit(None).cast("string")).otherwise(cand_raw)
+
+    left  = F.lower(src)
+    right = F.lower(cand)
+
+    if match_type == "exact":
+        base = left == right
+    elif match_type == "fuzzy":
+        if fuzzy_func == "levenshtein_normalized":
+            score = F.lit(1.0) - (
+                F.levenshtein(left, right).cast("double") /
+                F.greatest(F.length(left), F.length(right)).cast("double")
+            )
+            base = _apply_operator(score, operator, threshold)
+        elif fuzzy_func == "levenshtein_standard":
+            base = _apply_operator(F.levenshtein(left, right), operator, threshold)
+        elif fuzzy_func == "jaro_winkler":
+            # Python UDF on flat columns — works because we're not inside a lambda.
+            base = _apply_operator(jaro_winkler_udf(left, right), operator, threshold)
+        elif fuzzy_func == "soundex":
+            base = F.soundex(src) == F.soundex(cand)
         else:
-            raise ValueError(f"Unsupported match_type: {match_type}")
+            raise ValueError(f"Unsupported fuzzy function: {fuzzy_func}")
+    else:
+        raise ValueError(f"Unsupported match_type: {match_type}")
 
-    combined = f" {logical_op} ".join(condition_parts)
-    expr_str  = f"filter(search_result_parsed, x -> ({combined}))"
+    null_match = src.isNull()    & cand.isNull()
+    not_null   = src.isNotNull() & cand.isNotNull()
+    return (null_match | base) if allow_nulls else (not_null & base)
 
-    return F.expr(expr_str).alias(rule_name)
+# ── 5. Actual score Column for a single condition ──────────────────────────────
+
+def build_score_column(cond: dict) -> F.Column:
+    attr       = cond["attribute"]
+    match_type = cond.get("match_type", "exact")
+    fuzzy_func = cond.get("function")
+
+    left  = F.lower(F.col(attr).cast("string"))
+    right = F.lower(F.col(f"{attr}_matches").cast("string"))
+
+    if match_type == "exact":
+        return F.when(left == right, F.lit(1.0)).otherwise(F.lit(0.0)).cast("double")
+
+    elif match_type == "fuzzy":
+        if fuzzy_func == "jaro_winkler":
+            return jaro_winkler_udf(left, right).cast("double")
+        elif fuzzy_func == "levenshtein_normalized":
+            return (
+                F.lit(1.0) - (
+                    F.levenshtein(left, right).cast("double") /
+                    F.greatest(F.length(left), F.length(right)).cast("double")
+                )
+            )
+        elif fuzzy_func == "levenshtein_standard":
+            lev  = F.levenshtein(left, right).cast("double")
+            mlen = F.greatest(F.length(left), F.length(right)).cast("double")
+            return F.lit(1.0) - (lev / F.when(mlen == 0, F.lit(1.0)).otherwise(mlen))
+        elif fuzzy_func == "soundex":
+            return F.when(
+                F.soundex(F.col(attr).cast("string")) ==
+                F.soundex(F.col(f"{attr}_matches").cast("string")),
+                F.lit(1.0)
+            ).otherwise(F.lit(0.0)).cast("double")
+
+    return F.lit(0.0).cast("double")
 
 
-# ─────────────────────────────────────────────────────────────
-# apply_rules — uses rule["name"] instead of rule["rule_name"]
-# ─────────────────────────────────────────────────────────────
+
 def apply_rules(df_parsed: DataFrame, rules_config: list) -> DataFrame:
-    df_out = df_parsed
+    """Per-rule, per-candidate match flags. Output: one `<rule_name>_results`
+    array column per rule containing only the candidates that satisfied the rule."""
+    non_array_cols = [c for c in df_parsed.columns if c != "search_result_parsed"]
+
+    # A. Explode: one row per candidate
+    df_exp = df_parsed.withColumn("_candidate", F.explode("search_result_parsed"))
+
+    # B. Flatten candidate struct fields to top-level columns
+    candidate_fields = [
+        f.name for f in
+        df_parsed.schema["search_result_parsed"].dataType.elementType.fields
+    ]
+    for field in candidate_fields:
+        df_exp = df_exp.withColumn(field, F.col(f"_candidate.{field}"))
+
+    # C. Per rule: evaluate match flag (UDF runs on flat cols, not in a lambda)
     for rule in rules_config:
-        df_out = df_out.withColumn(f"{rule['name']}_results", build_rule(rule))
-    return df_out
+        rule_name        = rule["name"]
+        logical_op       = rule.get("logical_operator", "AND").upper()
+        rule_allow_nulls = rule.get("allow_nulls", False)
+
+        cond_flags = [build_condition_column(c, rule_allow_nulls) for c in rule["conditions"]]
+        rule_flag  = cond_flags[0]
+        for flag in cond_flags[1:]:
+            rule_flag = (rule_flag & flag) if logical_op == "AND" else (rule_flag | flag)
+
+        df_exp = df_exp.withColumn(
+            f"_match_{rule_name}",
+            F.coalesce(rule_flag, F.lit(False)),
+        )
+
+    # D. Aggregate back: per rule, collect candidates where _match_{rule_name} is true
+    per_rule_aggs = []
+    for rule in rules_config:
+        rule_name = rule["name"]
+        per_rule_aggs.append(
+            F.collect_list(
+                F.when(F.col(f"_match_{rule_name}"), F.col("_candidate"))
+            ).alias(f"{rule_name}_results")
+        )
+
+    df_grouped = df_exp.groupBy(*[F.col(c) for c in non_array_cols]).agg(*per_rule_aggs)
+    return df_grouped
 
 
-# ─────────────────────────────────────────────────────────────
-# compute_deterministic_matches
-#   — skips rules with action_on_match == "not-a-match"
-#   — attaches action_on_match to result struct for downstream use
-# ─────────────────────────────────────────────────────────────
 def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) -> DataFrame:
+    """Pick first matching rule via coalesce (preserves rule priority order),
+    wrap matched candidates + rule metadata into deterministic_match_result."""
+    match_cols = [f"{r['name']}_results" for r in rules_config]
 
-    # Only consider rules that are actual matches
-    match_rules = [r for r in rules_config]
-    match_cols  = [f"{r['name']}_results" for r in match_rules]
-
-    # 1️⃣ Flag: is there any qualifying deterministic match?
     is_match_expr = F.lit(False)
     for c in match_cols:
         is_match_expr = is_match_expr | (F.size(F.col(c)) > 0)
     df_out = df_with_rules.withColumn("is_deterministic_match", is_match_expr)
 
-    # 2️⃣ Pick first matching rule via coalesce (preserves priority order)
     when_exprs = []
-    for rule in match_rules:
+    for rule in rules_config:
         c      = f"{rule['name']}_results"
         action = rule["action_on_match"]
         when_exprs.append(
@@ -227,156 +376,207 @@ def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) 
                 F.struct(
                     F.col(c).alias("rule_result"),
                     F.lit(rule["name"]).alias("rule_name"),
-                    F.lit(action).alias("action_on_match")   # ← new: carried forward
+                    F.lit(action).alias("action_on_match"),
                 )
             )
         )
 
     df_out = df_out.withColumn(
         "deterministic_match_result",
-        F.coalesce(*when_exprs) if when_exprs else F.lit(None)
+        F.coalesce(*when_exprs) if when_exprs else F.lit(None),
     )
-
     return df_out
 
-rule_attributes = set()
-for rule in rules_config:
-    for cond in rule["conditions"]:
-        rule_attributes.add(cond["attribute"])
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# PIPELINE  (Golden Dedup — single source: source IS its own master)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# --- Clean & parse
+# ── Step 1: Parse raw search_results
+# Inter-element separator can be `],[` (no space) or `], [`; \s* tolerates both.
 df_cleaned = df_unified.withColumn(
     "search_results_array",
-    F.split(F.regexp_replace(F.col("search_results"), r"^\[|\]$", ""), "\\], \\[")
+    F.split(F.regexp_replace(F.col("search_results"), r"^\[|\]$", ""), r"\],\s*\["),
 )
 
+# ── Step 2: Extract lakefusion_id from each search result item
 df_cleaned = df_cleaned.withColumn(
     "search_results_master_lakefusion_ids",
     F.transform(
         F.col("search_results_array"),
-        lambda x: F.trim(F.split(F.trim(F.element_at(F.split(x, r"\|"), -1)), ",")[1])
-    )
+        lambda x: F.regexp_extract(x, r"([a-f0-9]{32})", 1),
+    ),
 )
-df_exploded = df_cleaned.withColumn("search_results_master_lakefusion_ids", F.explode("search_results_master_lakefusion_ids"))
-# Alias both DataFrames
-df_exploded = df_exploded.alias("exp")
+
+# ── Step 3: Explode to one row per (source × candidate)
+df_exploded = df_cleaned.withColumn(
+    "search_results_master_lakefusion_ids",
+    F.explode("search_results_master_lakefusion_ids"),
+).alias("exp")
+
 df_master = df_master.alias("mst")
-# Perform the join using aliases
 
-
-df_joined = (
-    df_exploded
-    .join(
-        df_master,
-        F.col("exp.search_results_master_lakefusion_ids") == F.col("mst.lakefusion_id"),
-        "inner"
-    )
+# ── Step 4: Join with master table
+df_joined = df_exploded.join(
+    df_master,
+    F.col("exp.search_results_master_lakefusion_ids") == F.col("mst.lakefusion_id"),
+    "inner",
 )
 
-
+# ── Step 5: Build pipe-separated attribute string per master candidate
 df_joined = df_joined.withColumn(
     "attributes_combined_master",
     F.concat(
-        # Join attributes with " | "
         F.concat_ws(
             " | ",
             *[
-                F.when(F.trim(F.col(f"mst.{c}")) == "", "null")
-                 .otherwise(F.coalesce(F.col(f"mst.{c}").cast("string"), F.lit("null")))
+                F.coalesce(F.col(f"mst.{c}").cast("string"), F.lit(""))
                 for c in attributes
             ]
         ),
-        # Add comma + lakefusion_id
         F.lit(", "),
-        F.coalesce(F.col("mst.lakefusion_id").cast("string"), F.lit("null"))
+        F.coalesce(F.col("mst.lakefusion_id").cast("string"), F.lit(""))
     )
 )
-#group_cols = [f"exp.{c}" for c in df_exploded.columns if c != "search_results_master_lakefusion_ids"]
-group_cols = [f"exp.{c}" for c in df_exploded.columns ]
 
+
+# ── Step 6: Group back — one row per (source × candidate)
+group_cols = [f"exp.{c}" for c in df_exploded.columns]
 df_result = (
     df_joined
     .groupBy(*group_cols)
-    .agg(
-        F.collect_list("attributes_combined_master").alias("attributes_combined_master_array")
-    )
+    .agg(F.collect_set("attributes_combined_master").alias("attributes_combined_master_array"))
+    .select("exp.*", "attributes_combined_master_array", "search_results_master_lakefusion_ids")
 )
 
-# ---- Final select (optional) ----
-df_result = df_result.select("exp.*", "attributes_combined_master_array","search_results_master_lakefusion_ids")
-
+# ── Step 7: Parse candidate strings into typed structs
 df_parsed = df_result.withColumn(
     "search_result_parsed",
-    F.transform(F.col("attributes_combined_master_array"), lambda x: build_dynamic_struct(x, attributes, entity_attributes_datatype,rule_attributes))
+    F.transform(
+        F.col("attributes_combined_master_array"),
+        lambda x: build_dynamic_struct(x, attributes, entity_attributes_datatype),
+    ),
 )
 
-# --- Apply all rules
+# ── Step 8: Apply deterministic rules
 df_with_rules = apply_rules(df_parsed, rules_config)
 
-# --- Compute deterministic match
+# ── Step 9: Compute deterministic match struct
 df_final = compute_deterministic_matches(df_with_rules, rules_config)
 
-df_exploded = df_final.withColumn(
-    "rule", F.explode("deterministic_match_result.rule_result")
-)
+# ── Step 10: Explode rule_result so each matched candidate gets its own row
+df_exploded = df_final.withColumn("rule", F.explode("deterministic_match_result.rule_result"))
 
-# Extract the struct fields dynamically (all except lakefusion_id)
-selected_rule_fields = [f.name for f in df_exploded.schema["rule"].dataType.fields if f.name != "lakefusion_id"]
-rule_cols = [F.col(f"rule.{f}") for f in selected_rule_fields]
-
-# # Concatenate fields into a single string
-concat_col = F.concat_ws(" | ", *rule_cols)
-#Build final struct
+# ── Step 11: Build exploded_result struct (per matched candidate).
+# Score uses production thresholds so the downstream classifier sees rule-determined
+# entries in the right band (MATCH → merge_max, NO_MATCH → not_match_max).
+selected_rule_fields = [
+    f.name for f in df_exploded.schema["rule"].dataType.fields
+    if f.name != "lakefusion_id"
+]
+concat_col = F.concat_ws(" | ", *[F.col(f"rule.{f}") for f in selected_rule_fields])
 
 df_final = df_exploded.withColumn(
     "exploded_result",
     F.struct(
         concat_col.alias("id"),
         F.col("deterministic_match_result.action_on_match").alias("match"),
-        # ✅ Assign MAX threshold value based on match type
         F.when(
             F.col("deterministic_match_result.action_on_match") == "MATCH",
-            F.lit(merge_max)
+            F.lit(merge_max),
         ).when(
             F.col("deterministic_match_result.action_on_match") == "NO_MATCH",
-            F.lit(not_match_max)
-        ).otherwise(F.lit(not_match_max))
-        .cast("double")
-        .alias("score"),
-
-        F.concat(F.lit("Due to Match Rule: "), F.col("deterministic_match_result.rule_name")).alias("reason"),
-        F.col("rule.lakefusion_id").alias("lakefusion_id")  # directly from exploded struct
-    )
+            F.lit(not_match_max),
+        ).otherwise(F.lit(not_match_max)).cast("double").alias("score"),
+        F.concat(
+            F.lit("Due to Match Rule: "),
+            F.col("deterministic_match_result.rule_name"),
+        ).alias("reason"),
+        F.col("rule.lakefusion_id").alias("lakefusion_id"),
+    ),
 )
-# # # Optional: drop intermediate columns
-df_final= (df_final.drop("rule")
-.select("lakefusion_id","attributes_combined","search_results","deterministic_match_result","is_deterministic_match","exploded_result")).withColumn("deterministic_match_result",
-    to_json("deterministic_match_result"))
-window_spec = Window.partitionBy("lakefusion_id").orderBy(F.lit(1))
-df_final=df_final.withColumn("rank", F.row_number().over(window_spec))
-df_final = df_final.filter(F.col("rank") == 1).drop("rank")
 
 # COMMAND ----------
 
-unified_deteministic_table_exists = spark.catalog.tableExists(unified_deteministic_table)
+# ── Step 12: MATCH suppression — if any MATCH-action row exists for a source,
+# drop the NO_MATCH rows for that source. NO_MATCH-only sources keep all their rows.
+MATCH_ACTIONS = ["MATCH"]
+key_col = "lakefusion_id"   # single-source: the source's own lakefusion_id
 
+has_match_window = Window.partitionBy(key_col)
+df_final = df_final.withColumn(
+    "_key_has_match",
+    F.max(
+        F.when(F.col("exploded_result.match").isin(MATCH_ACTIONS), F.lit(1)).otherwise(F.lit(0))
+    ).over(has_match_window),
+)
+df_final = df_final.filter(
+    (F.col("_key_has_match") == 0)
+    | (F.col("exploded_result.match").isin(MATCH_ACTIONS))
+).drop("_key_has_match")
+
+# COMMAND ----------
+
+# ── Step 13: Keep only deterministic-match rows + dedup per (source × candidate).
+# Single-source: candidate id lives in exploded_result.lakefusion_id; the bare
+# `lakefusion_id` column on the row is the SOURCE id.
+df_final = (
+    df_final.filter(F.col("is_deterministic_match") == F.lit(True))
+    .drop("rule")
+    .select(
+        "lakefusion_id",
+        "attributes_combined",
+        "search_results",
+        "deterministic_match_result",
+        "is_deterministic_match",
+        "exploded_result",
+    )
+)
+
+window_spec = Window.partitionBy(
+    "lakefusion_id",
+    F.when(F.col("exploded_result.match").isin(MATCH_ACTIONS), F.lit(None))
+     .otherwise(F.col("exploded_result.lakefusion_id")),
+).orderBy(F.lit(1))
+
+df_final = df_final.withColumn("rank", F.row_number().over(window_spec))
+df_final = df_final.filter(F.col("rank") == 1).drop("rank")
+
+# Serialise the STRUCT to JSON so the column matches the table schema (STRING).
+# Required after the deterministic_rules migration: Spark cannot CAST STRING → STRUCT
+# in the MERGE condition below, so both sides must be STRING.
+df_final = df_final.withColumn(
+    "deterministic_match_result",
+    F.to_json(F.col("deterministic_match_result")),
+)
+
+# COMMAND ----------
+
+# ── Write to unified_deterministic. Each row = one (source × matched candidate).
+unified_deteministic_table_exists = spark.catalog.tableExists(unified_deteministic_table)
 values = {col: f"source.{col}" for col in df_final.columns}
 
-if not unified_deteministic_table_exists:
+# Composite merge key: source row id + candidate id (nested under exploded_result).
+# Delta can't ZORDER on nested struct fields, so ZORDER on source id only.
+merge_condition = (
+    "target.lakefusion_id = source.lakefusion_id "
+    "AND target.exploded_result.lakefusion_id = source.exploded_result.lakefusion_id"
+)
+zorder_cols = "lakefusion_id"
+
+if df_final.head(1) is None:
+    logger.info("No deterministic results to write")
+elif not unified_deteministic_table_exists:
     df_final.write.mode("overwrite").option("mergeSchema", "true").saveAsTable(unified_deteministic_table)
 else:
-    # Define the Delta table
     delta_table = DeltaTable.forName(spark, unified_deteministic_table)
 
-    # Get the nullable struct type string to use in CAST
     deterministic_match_result_type = df_final.schema["deterministic_match_result"].dataType.simpleString()
     exploded_result_type = df_final.schema["exploded_result"].dataType.simpleString()
 
-    # Perform merge operation
     delta_table.alias("target").merge(
         source=df_final.alias("source"),
-        condition=f"target.{id_key} = source.{id_key}"
+        condition=merge_condition,
     ).whenMatchedUpdate(
         condition=f"""
             target.is_deterministic_match <> source.is_deterministic_match
@@ -386,15 +586,15 @@ else:
         set={
             "is_deterministic_match": "source.is_deterministic_match",
             "deterministic_match_result": "source.deterministic_match_result",
-            "exploded_result": "source.exploded_result"
-        }
+            "exploded_result": "source.exploded_result",
+        },
     ).whenNotMatchedInsert(
         condition="source.is_deterministic_match = true",
-        values=values
+        values=values,
     ).execute()
 
-optimise_res = spark.sql(f"OPTIMIZE {unified_deteministic_table} ZORDER BY ({id_key})")
+optimise_res = spark.sql(f"OPTIMIZE {unified_deteministic_table} ZORDER BY ({zorder_cols})")
 
-# COMMAND ----------
-
-logger_instance.shutdown()
+match_count = df_final.filter(F.col("exploded_result.match").isin(MATCH_ACTIONS)).count()
+no_match_count = df_final.filter(~F.col("exploded_result.match").isin(MATCH_ACTIONS)).count()
+logger.info(f"Deterministic results: {match_count} MATCH, {no_match_count} NO_MATCH (per matched candidate)")

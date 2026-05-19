@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.utils.logging_utils import get_logger
-from lakefusion_utility.utils.databricks_util import SecretScopeService
+from lakefusion_utility.utils.databricks_util import SecretScopeService, get_app_sp_token
 from app.lakefusion_middlelayer_service.services.dnb_service import DnbService
 from app.lakefusion_middlelayer_service.utils.app_db import token_required_wrapper
 
@@ -85,14 +85,17 @@ async def save_dnb_credentials(
     Saves D&B OAuth2 consumer key and secret into Databricks Secret Scope using DAPI token.
     Grants READ access to all workspace users on the scope.
     """
-    dapi_token = os.environ.get("LAKEFUSION_DATABRICKS_DAPI")
-    if not dapi_token:
-        app_logger.error("[DNB_API] LAKEFUSION_DATABRICKS_DAPI environment variable not set")
-        raise HTTPException(status_code=500, detail="Server configuration error: DAPI token not available")
+    # Prefer the auto-provisioned App Service Principal (DATABRICKS_CLIENT_ID/
+    # DATABRICKS_CLIENT_SECRET injected by Databricks Apps). Falls back to
+    # LAKEFUSION_DATABRICKS_DAPI for local-dev / non-Apps runs.
+    token = get_app_sp_token()
+    if not token:
+        app_logger.error("[DNB_API] No App SP credentials and no fallback PAT available")
+        raise HTTPException(status_code=500, detail="Server configuration error: no Databricks credentials available")
 
     try:
         secret_service = SecretScopeService(
-            token=dapi_token,
+            token=token,
             scope_name=SCOPE_NAME
         )
 

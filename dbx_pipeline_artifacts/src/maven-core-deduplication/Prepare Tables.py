@@ -211,7 +211,7 @@ if not master_table_exists:
         
                 
         df_master = df_master.select([column for column in df_master.columns if column in entity_attributes])
-        df_master = df_master.withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+        df_master = df_master.withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
        
         if(experiment_id=='prod'):
             df_master.withColumn("lakefusion_id",when(col("lakefusion_id").isNull(), uuid_udf()).otherwise(col("lakefusion_id"))).write.format("delta").option("delta.enableChangeDataFeed", "true").saveAsTable(master_table)
@@ -417,7 +417,7 @@ joined_unified_df = (
 # COMMAND ----------
 
 # Generate merged decription
-joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[col(c) for c in attributes]))
+joined_unified_df = joined_unified_df.withColumn(merged_desc_column, concat_ws(" | ", *[coalesce(col(c).cast("string"), lit("")) for c in attributes]))
 
 # COMMAND ----------
 

@@ -25,7 +25,10 @@ from app.lakefusion_matchmaven_service.services.llm_response_parser import (
 app_logger = get_logger(__name__)
 
 # Default Configuration
-DATABRICKS_HOST = os.environ.get('DATABRICKS_HOST', 'https://databricks.com')
+# Shared helper guarantees the https:// prefix is present (Databricks Apps
+# inject the host bare); keep the historical placeholder as fallback default.
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+DATABRICKS_HOST = get_databricks_host() or "https://databricks.com"
 DEFAULT_LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 DEFAULT_MAX_TOKENS = 4000
 DEFAULT_TEMPERATURE = 0.0  # Nearly deterministic for consistent results
@@ -149,25 +152,23 @@ class LLMService:
                     detail="At least one of system_prompt or user_prompt must be non-empty"
                 )
 
-            # Determine max_tokens: use kwargs override if provided, else config default
-            # Gemini models with reasoning need higher limits (reasoning tokens count toward max_tokens)
-            max_tokens = kwargs.get("max_tokens", self.config.max_tokens)
-            if "gemini" in endpoint.lower() and max_tokens < 10000:
-                max_tokens = 10000  # Higher limit for Gemini models with reasoning
-
-            # Get temperature from kwargs if provided, else use config default
-            temperature = kwargs.get("temperature", self.config.temperature)
-
-            # Whether to enforce JSON schema on LLM response (default: True)
+            # Extract params from kwargs — None means "not passed / disabled by user"
+            # If a config param is not passed, omit it entirely (do not fall back to defaults)
+            max_tokens = kwargs.get("max_tokens", None)
+            temperature = kwargs.get("temperature", None)
             enforce_json_format = kwargs.get("enforce_json_format", True)
+            reasoning_effort = kwargs.get("reasoning_effort", None)
 
-            app_logger.info(f"LLM call params - endpoint: {endpoint}, temperature: {temperature}, max_tokens: {max_tokens}, enforce_json_format: {enforce_json_format}")
+            app_logger.info(f"LLM call params - endpoint: {endpoint}, temperature: {temperature}, max_tokens: {max_tokens}, enforce_json_format: {enforce_json_format}, reasoning_effort: {reasoning_effort}")
 
-            # Build inputs, excluding temperature for models that don't support it
+            # Build inputs — only add params that are not None (disabled params stay out)
             inputs = {
                 "messages": messages,
-                "max_tokens": max_tokens,
             }
+
+            # Only add max_tokens if enabled (not None)
+            if max_tokens is not None:
+                inputs["max_tokens"] = max_tokens
 
             # Conditionally include response_format based on enforce_json_format flag
             if enforce_json_format:
@@ -199,9 +200,14 @@ class LLMService:
                         "strict": True,
                     },
                 }
-            # Exclude temperature for GPT-5 models that only support default temperature
-            if "gpt-5" not in endpoint.lower():
+
+            # Only add temperature if enabled (not None)
+            if temperature is not None:
                 inputs["temperature"] = temperature
+
+            # Add reasoning_effort if provided — let the endpoint reject if unsupported
+            if reasoning_effort and reasoning_effort in ('low', 'medium', 'high'):
+                inputs["reasoning_effort"] = reasoning_effort
 
             # Try with current max_tokens, retry with lower value if it exceeds model limit
             try:
@@ -247,6 +253,12 @@ class LLMService:
             app_logger.info(f"LLM response usage: {usage}")
             app_logger.info(f"LLM response keys: {response.keys() if isinstance(response, dict) else 'not a dict'}")
 
+            # Build config_used from what was actually sent to the model
+            config_used = {
+                k: v for k, v in inputs.items()
+                if k in ("temperature", "max_tokens", "reasoning_effort")
+            }
+
             return {
                 "results": results,
                 "raw_text": text,
@@ -257,6 +269,7 @@ class LLMService:
                 "completion_tokens": usage.get("completion_tokens"),
                 "total_tokens": usage.get("total_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
+                "config_used": config_used,
             }
 
         except HTTPException:

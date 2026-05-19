@@ -205,6 +205,7 @@ class MatchMavenLLMService:
         match_threshold: Optional[float] = None,
         possible_match_threshold: Optional[float] = None,
         enforce_json_format: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -232,6 +233,8 @@ class MatchMavenLLMService:
             extra_params['max_tokens'] = max_tokens
         if enforce_json_format is not None:
             extra_params['enforce_json_format'] = enforce_json_format
+        if reasoning_effort is not None:
+            extra_params['reasoning_effort'] = reasoning_effort
 
         result = await cls._instance.execute(
             system_prompt=system_prompt,

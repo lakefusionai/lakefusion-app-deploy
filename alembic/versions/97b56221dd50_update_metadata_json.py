@@ -41,12 +41,9 @@ def upload_json_to_databricks_volume(catalog_name: str, databricks_host: str, da
     Path format: /Volumes/{catalog}/metadata/metadata_files/entity_{id}_prod_{filename}
     """
     try:
-        from databricks.sdk import WorkspaceClient
+        from lakefusion_utility.utils.databricks_util import _create_workspace_client
 
-        w = WorkspaceClient(
-            host=databricks_host,
-            token=databricks_token
-        )
+        w = _create_workspace_client(databricks_token)
 
         file_path = f"/Volumes/{catalog_name}/metadata/metadata_files/entity_{entity_id}_prod_{file_name}"
 

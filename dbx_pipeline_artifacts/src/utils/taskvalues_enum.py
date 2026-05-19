@@ -46,7 +46,8 @@ class TaskValueKey(str, Enum):
     EMBEDDING_MODEL = "embedding_model"
     EMBEDDING_MODEL_ENDPOINT = "embedding_model_endpoint"
     EMBEDDING_PROVISIONLESS = "embedding_provisionless"
-    
+    EMBEDDING_MODE = "embedding_mode"
+
     # Matching configuration
     MATCH_ATTRIBUTES = "match_attributes"
     CONFIG_THRESHOLDS = "config_thresholds"
@@ -75,3 +76,5 @@ class TaskValueKey(str, Enum):
 
     #Reference entity
     REFERENCE_CONFIG="entity_reference_config"
+    RDM_CONFIGS="rdm_configs"
+    REFERENCE_ATTRIBUTE_CONFIG="reference_attribute_config"

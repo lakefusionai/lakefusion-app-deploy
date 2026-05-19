@@ -39,7 +39,7 @@ def upgrade() -> None:
         [
             {
                 "name": "ENABLE_DETERMINISTIC_MATCHING_FEATURE",
-                "status": "INACTIVE",
+                "status": "ACTIVE",
                 "description": "Enables the Match Rules tab in the Add/Edit Model dialog for MatchMaven",
                 "owner_team": "LakeFusion",
                 "created_at": datetime.utcnow(),

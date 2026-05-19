@@ -88,6 +88,10 @@ for unified_dataset_id in unified_dataset_ids:
 
 # COMMAND ----------
 
+# MAGIC %run ../utils/concurrency_utils
+
+# COMMAND ----------
+
 unified_table = f"{catalog_name}.silver.{entity}_unified"
 master_table = f"{catalog_name}.gold.{entity}_master"
 processed_unified_table = f"{catalog_name}.silver.{entity}_processed_unified"
@@ -212,12 +216,14 @@ resultant_not_a_match_activities = (
 
 # Insert the NOT_A_MATCH records into merge activities table
 if not_a_match_df.count() > 0:
-    delta_table_merge_activities = DeltaTable.forName(spark, merge_activities_table)
-    
-    delta_table_merge_activities.alias("target").merge(
-        source=resultant_not_a_match_activities.alias("source"),
-        condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
-    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+    def _merge_not_a_match_activities():
+        delta_table_merge_activities = DeltaTable.forName(spark, merge_activities_table)
+        delta_table_merge_activities.alias("target").merge(
+            source=resultant_not_a_match_activities.alias("source"),
+            condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
+        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+    _retry_on_concurrent_append(_merge_not_a_match_activities, "merge_activities NOT_A_MATCH")
 
 # COMMAND ----------
 
@@ -629,14 +635,14 @@ resultant_merged_df = joined_df.select(
 
 # COMMAND ----------
 
-# Define the Delta table
-delta_table = DeltaTable.forName(spark, master_table)
+def _merge_master_table():
+    delta_table = DeltaTable.forName(spark, master_table)
+    delta_table.alias("target").merge(
+        source=resultant_merged_df.alias("source"),
+        condition=f"target.{id_key} = source.{id_key}"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-# Perform merge operation
-delta_table.alias("target").merge(
-    source=resultant_merged_df.alias("source"),
-    condition=f"target.{id_key} = source.{id_key}"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_master_table, "master_table")
 
 # COMMAND ----------
 
@@ -663,14 +669,14 @@ resultant_master_attribute_source_mapping_survivorship = (
 
 # COMMAND ----------
 
-# Define the Delta table
-delta_table = DeltaTable.forName(spark, master_attribute_version_sources_table)
+def _merge_attribute_version_sources():
+    delta_table = DeltaTable.forName(spark, master_attribute_version_sources_table)
+    delta_table.alias("target").merge(
+        source=resultant_master_attribute_source_mapping_survivorship.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-# Perform merge operation
-delta_table.alias("target").merge(
-    source=resultant_master_attribute_source_mapping_survivorship.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_attribute_version_sources, "master_attribute_version_sources_table")
 
 # COMMAND ----------
 
@@ -691,11 +697,11 @@ resultant_merge_activities_survivorship = (
 
 # COMMAND ----------
 
-# Define the Delta table
-delta_table = DeltaTable.forName(spark, merge_activities_table)
+def _merge_merge_activities():
+    delta_table = DeltaTable.forName(spark, merge_activities_table)
+    delta_table.alias("target").merge(
+        source=resultant_merge_activities_survivorship.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-# Perform merge operation
-delta_table.alias("target").merge(
-    source=resultant_merge_activities_survivorship.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type and target.source = source.source"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_merge_activities, "merge_activities MANUAL_MERGE")

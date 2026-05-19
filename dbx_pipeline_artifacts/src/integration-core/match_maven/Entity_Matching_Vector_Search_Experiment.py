@@ -9,6 +9,7 @@
 
 # DBTITLE 1,Import Libraries
 from uuid import uuid4
+import builtins
 import json
 from delta.tables import DeltaTable
 from pyspark.sql.functions import *
@@ -34,6 +35,8 @@ dbutils.widgets.text("max_potential_matches", "5", "Max Potential Matches")
 dbutils.widgets.text("is_single_source", "", "Is Single Source")
 dbutils.widgets.text("vs_max_workers", "1", "VS Max Workers (ThreadPool)")
 dbutils.widgets.text("vs_max_concurrency", "50", "VS Max Concurrent Calls (Partitions)")
+dbutils.widgets.text("vs_max_retries", "2", "VS Max Retries")
+dbutils.widgets.dropdown("vs_strict_match_count", "false", ["true", "false"], "Require exact match count from VS")
 
 # COMMAND ----------
 
@@ -43,6 +46,7 @@ attributes = dbutils.widgets.get("attributes")
 experiment_id = dbutils.widgets.get("experiment_id")
 entity = dbutils.widgets.get("entity")
 merged_desc_column = "attributes_combined"
+embedding_vector_column = "attributes_combined_embedding"
 embedding_model_source = dbutils.widgets.get("embedding_model_source")
 catalog_name = dbutils.widgets.get("catalog_name")
 vs_endpoint = dbutils.widgets.get("vs_endpoint")
@@ -50,6 +54,8 @@ max_potential_matches = dbutils.widgets.get("max_potential_matches")
 is_single_source = dbutils.widgets.get("is_single_source")
 vs_max_workers = int(dbutils.widgets.get("vs_max_workers") or "1")
 vs_max_concurrency = int(dbutils.widgets.get("vs_max_concurrency") or "50")
+vs_max_retries = int(dbutils.widgets.get("vs_max_retries") or "2")
+vs_strict_match_count = dbutils.widgets.get("vs_strict_match_count").lower() == "true"
 try:
     run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
 except Exception:
@@ -66,6 +72,7 @@ attributes = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key=
 max_potential_matches = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="max_potential_matches", debugValue=max_potential_matches)
 embedding_model_source = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="embedding_model_source", debugValue=embedding_model_source)
 is_single_source = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="is_single_source", debugValue=is_single_source)
+embedding_mode = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="embedding_mode", debugValue="managed")
 
 # COMMAND ----------
 
@@ -153,6 +160,13 @@ else:
     filter_by_status = True  # Filter by record_status = 'ACTIVE'
     exclude_self_matches = False  # No self-matches possible
 
+# Hoist vs_temp_table name so cleanup can reference it before Step 7
+vs_temp_table = (
+    f"{catalog_name}.silver.{entity}_vs_temp_{embedding_mode}_{experiment_id}"
+    if experiment_id
+    else f"{catalog_name}.silver.{entity}_vs_temp_{embedding_mode}"
+)
+
 # COMMAND ----------
 
 # DBTITLE 1,Print Configuration
@@ -174,6 +188,10 @@ logger.info(f"VS Endpoint: {vs_endpoint}")
 logger.info(f"Max Potential Matches: {max_potential_matches}")
 logger.info(f"Filter by Status: {filter_by_status}")
 logger.info(f"Exclude Self-Matches: {exclude_self_matches}")
+logger.info(f"VS Max Retries: {vs_max_retries}")
+logger.info(f"VS Strict Match Count: {vs_strict_match_count}")
+logger.info(f"VS Max Workers: {vs_max_workers}")
+logger.info(f"VS Max Concurrency: {vs_max_concurrency}")
 logger.info("=" * 70)
 
 # COMMAND ----------
@@ -221,6 +239,54 @@ else:
 # COMMAND ----------
 
 # MAGIC %run ../../utils/model_serving
+
+# COMMAND ----------
+
+# DBTITLE 1,Defensive Cleanup
+logger.info("\n" + "=" * 70)
+logger.info("DEFENSIVE CLEANUP: remove stale temp tables from prior runs")
+logger.info("=" * 70)
+
+skip_vs_step = False
+
+try:
+    spark.sql(f"DROP TABLE IF EXISTS {vs_temp_table}_retry")
+
+    if not spark.catalog.tableExists(vs_temp_table):
+        logger.info(f"  No existing {vs_temp_table}, will populate fresh")
+    else:
+        existing_count = spark.table(vs_temp_table).count()
+        logger.info(f"  Existing {vs_temp_table} has {existing_count:,} rows")
+
+        reuse = True
+        drop_reason = None
+
+        if existing_count == 0:
+            reuse = False
+            drop_reason = "empty"
+
+        if reuse:
+            if filter_by_status:
+                pending_count = spark.table(source_table).filter(
+                    (col("record_status") == "ACTIVE") & (col("search_results") == "")
+                ).count()
+            else:
+                pending_count = spark.table(source_table).filter(
+                    col("search_results") == ""
+                ).count()
+            if existing_count != pending_count:
+                reuse = False
+                drop_reason = f"row count mismatch (temp={existing_count:,}, pending={pending_count:,})"
+
+        if reuse:
+            logger.info(f"  Reusing existing VS results, skipping Step 7")
+            skip_vs_step = True
+        else:
+            logger.info(f"  Dropping stale temp: {drop_reason}")
+            spark.sql(f"DROP TABLE IF EXISTS {vs_temp_table}")
+
+except Exception as e:
+    logger.warning(f"  Defensive cleanup failed (non-fatal): {e}")
 
 # COMMAND ----------
 
@@ -297,7 +363,7 @@ logger.info("=" * 70)
 import time
 
 index = None
-index_name = f"{master_table}_index"
+index_name = f"{master_table}_index_v2" if embedding_mode == "precomputed" else f"{master_table}_index"
 
 # Configuration constants
 REGISTRATION_TIMEOUT = 1800   # 30 minutes for index registration
@@ -309,34 +375,56 @@ MAX_PIPELINE_FAILURES = 3
 # -------------------------------------------------
 # STEP 4.0: Warm up embedding endpoint before index creation
 # -------------------------------------------------
-logger.info("Warming up embedding endpoint before index creation...")
-try:
-    warm_up_embedding_endpoint(
-        embedding_endpoint=embedding_endpoint,
-        max_retries=10,
-        retry_interval_seconds=60,
-        timeout_minutes=10
-    )
-    logger.info(f"Embedding endpoint '{embedding_endpoint}' is warm and ready")
-except Exception as e:
-    logger.warning(f"Embedding warm-up failed: {e}. Proceeding with index creation anyway...")
+if embedding_mode == "managed":
+    logger.info("Warming up embedding endpoint before index creation...")
+    try:
+        warm_up_embedding_endpoint(
+            embedding_endpoint=embedding_endpoint,
+            max_retries=10,
+            retry_interval_seconds=60,
+            timeout_minutes=10
+        )
+        logger.info(f"Embedding endpoint '{embedding_endpoint}' is warm and ready")
+    except Exception as e:
+        logger.warning(f"Embedding warm-up failed: {e}. Proceeding with index creation anyway...")
+else:
+    logger.info("Skipping embedding warm-up (precomputed mode — index syncs pre-existing vectors)")
 
 # -------------------------------------------------
 # STEP 4.1: Create index (tolerant approach)
 # -------------------------------------------------
 try:
     logger.info(f"Attempting to create index: {index_name}")
-    index = client.create_delta_sync_index(
-        endpoint_name=vs_endpoint,
-        source_table_name=master_table,
-        index_name=index_name,
-        columns_to_sync=[master_id_key, merged_desc_column],
-        pipeline_type="TRIGGERED",
-        primary_key=master_id_key,
-        embedding_source_column=merged_desc_column,
-        embedding_model_endpoint_name=embedding_endpoint,
-        sync_computed_embeddings=True,
-    )
+    if embedding_mode == "precomputed":
+        embedding_dim_raw = dbutils.jobs.taskValues.get(
+            taskKey="Compute_Embeddings", key="embedding_dim", debugValue=None
+        )
+        if embedding_dim_raw is None:
+            raise RuntimeError(
+                "embedding_mode='precomputed' requires Compute_Embeddings task to set embedding_dim. "
+                "Check DAG ordering — Compute_Embeddings must run before this task."
+            )
+        embedding_dim = int(embedding_dim_raw)
+        index = client.create_delta_sync_index(
+            endpoint_name=vs_endpoint,
+            source_table_name=master_table,
+            index_name=index_name,
+            pipeline_type="TRIGGERED",
+            primary_key=master_id_key,
+            embedding_vector_column=embedding_vector_column,
+            embedding_dimension=embedding_dim,
+        )
+    else:
+        index = client.create_delta_sync_index(
+            endpoint_name=vs_endpoint,
+            source_table_name=master_table,
+            index_name=index_name,
+            pipeline_type="TRIGGERED",
+            primary_key=master_id_key,
+            embedding_source_column=merged_desc_column,
+            embedding_model_endpoint_name=embedding_endpoint,
+            sync_computed_embeddings=True,
+        )
     logger.info(f"Create request submitted for index: {index_name}")
 
 except Exception as e:
@@ -393,10 +481,90 @@ while index is None:
             raise RuntimeError(f"Unexpected error while locating index: {e}")
 
 # -------------------------------------------------
+# Helper: Log detailed sync progress metrics
+# -------------------------------------------------
+def log_sync_progress(idx, desc=None):
+    """Log detailed sync progress metrics from the index description."""
+    try:
+        if desc is None:
+            desc = idx.describe()
+        st = desc.get("status", {})
+        detailed_state = st.get("detailed_state", "UNKNOWN")
+        indexed_rows = st.get("indexed_row_count", 0)
+        ready = st.get("ready", False)
+
+        # Progress lives in different places depending on sync phase:
+        #   - Initial snapshot: status.provisioning_status.initial_pipeline_sync_progress
+        #   - Triggered update: status.triggered_update_status.triggered_update_progress
+        prov = (
+            st.get("triggered_update_status", {}).get("triggered_update_progress")
+            or st.get("provisioning_status", {}).get("initial_pipeline_sync_progress")
+            or {}
+        )
+        total_rows = prov.get("total_rows_to_sync", 0)
+        synced_rows = prov.get("num_synced_rows", 0)
+        pct = prov.get("sync_progress_completion", 0.0)
+        eta_sec = prov.get("estimated_completion_time_seconds", 0.0)
+        current_version = prov.get("latest_version_currently_processing")
+
+        metrics = prov.get("pipeline_metrics", {})
+        ms_per_row = metrics.get("total_sync_time_per_row_ms", 0)
+        ing = metrics.get("ingestion_metrics", {})
+        emb = metrics.get("embedding_metrics", {})
+
+        remaining = total_rows - synced_rows
+
+        logger.info("=" * 70)
+        logger.info(f"Index:         {desc.get('name')}")
+        logger.info(f"State:         {detailed_state}  (ready={ready})")
+        if current_version is not None:
+            logger.info(f"Version:       {current_version}")
+        logger.info("-" * 70)
+        logger.info(f"Progress:      {synced_rows:,} / {total_rows:,}  ({pct * 100:.2f}%)")
+        logger.info(f"Indexed rows:  {indexed_rows:,}   (queryable snapshot)")
+        logger.info(f"Remaining:     {remaining:,} rows")
+        if eta_sec > 0:
+            import time as _t
+            logger.info(f"ETA:           {eta_sec:.0f}s  (~{eta_sec / 60:.1f} min)")
+            logger.info(f"               Expected finish: {_t.strftime('%H:%M:%S', _t.localtime(_t.time() + eta_sec))}")
+        logger.info("-" * 70)
+        if ms_per_row > 0:
+            logger.info(f"Throughput:    {ms_per_row:.2f} ms/row  (~{1000 / ms_per_row:.0f} rows/sec)")
+            logger.info(f"  Ingestion:   {ing.get('ingestion_time_per_row_ms', 0):.2f} ms/row, "
+                         f"batch={ing.get('ingestion_batch_size')}")
+            logger.info(f"  Embedding:   {emb.get('embedding_generation_time_per_row_ms', 0):.2f} ms/row, "
+                         f"batch={emb.get('embedding_generation_batch_size')}")
+        # Commit lag for triggered updates
+        if detailed_state in ("ONLINE_TRIGGERED_UPDATE", "ONLINE_UPDATING_PIPELINE_RESOURCES"):
+            tus = st.get("triggered_update_status", {})
+            last_v = tus.get("last_processed_commit_version")
+            if last_v is not None and current_version is not None:
+                logger.info(f"Commit lag:    processed={last_v}, current={current_version} ({current_version - last_v} behind)")
+        logger.info("=" * 70)
+    except Exception as e:
+        logger.debug(f"log_sync_progress failed (non-fatal): {e}")
+
+# -------------------------------------------------
 # STEP 4.3: Wait for index to be ready before sync
 # -------------------------------------------------
 logger.info("Waiting for index to be ready before sync...")
-index.wait_until_ready()
+wait_start = time.time()
+
+while True:
+    if time.time() - wait_start > MAX_WAIT_SECONDS:
+        raise TimeoutError(
+            f"Index '{index_name}' did not reach a post-provisioning state within {MAX_WAIT_SECONDS}s"
+        )
+    log_sync_progress(index)
+    try:
+        desc = index.describe()
+        st = desc.get("status", {}).get("detailed_state", "UNKNOWN")
+        if st in ("ONLINE_NO_PENDING_UPDATE", "ONLINE_TRIGGERED_UPDATE",
+                   "ONLINE_UPDATING_PIPELINE_RESOURCES", "ONLINE_PIPELINE_FAILED"):
+            break
+    except Exception as e:
+        logger.warning(f"describe() failed during pre-sync wait (continuing): {e}")
+    time.sleep(POLL_INTERVAL)
 logger.info("Index is ready")
 
 # -------------------------------------------------
@@ -450,6 +618,7 @@ while True:
         message = status_info["status"].get("message", "")
 
         logger.info(f"  Index status: {status}")
+        log_sync_progress(index, desc=status_info)
         if message:
             logger.info(f"    Message: {message}")
 
@@ -514,31 +683,26 @@ logger.info("=" * 70)
 df_source = spark.table(source_table)
 
 # Apply appropriate filter based on source type
+select_cols = [source_id_key, merged_desc_column]
+if embedding_mode == "precomputed":
+    select_cols.append(embedding_vector_column)
+
 if filter_by_status:
     # Normal dedup: filter by ACTIVE status and empty search_results
     df_pending_search = df_source.filter(
-        (col("record_status") == "ACTIVE") & 
+        (col("record_status") == "ACTIVE") &
         (col("search_results") == "")
-    ).select(source_id_key, merged_desc_column)
-    
-    # total_count = df_source.count()
-    # active_count = df_source.filter(col('record_status') == 'ACTIVE').count()
-    # print(f"✓ Source table total records: {total_count}")
-    # print(f"✓ Records with ACTIVE status: {active_count}")
+    ).select(*select_cols)
 else:
     # Golden dedup: no record_status, just filter by empty search_results
     df_pending_search = df_source.filter(
         col("search_results") == ""
-    ).select(source_id_key, merged_desc_column)
-    
-    # total_count = df_source.count()
-    # print(f"✓ Source table total records: {total_count}")
+    ).select(*select_cols)
 
-pending_count = df_pending_search.isEmpty()
-#pending_count = df_pending_search.count()
-#print(f"✓ Records pending search (empty search_results): {pending_count}")
+is_empty = df_pending_search.isEmpty()
+logger.info(f"Records pending search: {'none' if is_empty else 'found'}")
 
-if pending_count:
+if is_empty:
     logger.info("\nNo records to process - all records already have search results")
     logger.info("\n" + "=" * 70)
     logger.info("EXITING - NO RECORDS TO SEARCH")
@@ -554,7 +718,7 @@ if pending_count:
         "records_searched": 0
     }))
 # Calculate optimal partitions
-# num_partitions = __builtins__.max(100, pending_count // 3000)
+# num_partitions = builtins.max(100, pending_count // 3000)
 # df_pending_search = df_pending_search.repartition(num_partitions, source_id_key)
 
 #print(f"✓ Repartitioned to {num_partitions} partitions for parallel processing")
@@ -564,14 +728,14 @@ if pending_count:
 def get_optimal_partitions(row_count: int, max_concurrent_vs_calls: int = 50) -> int:
     """Partition based on VS endpoint capacity. See normal_dedup notebook for details."""
     min_partitions = 1
-    calculated = __builtins__.max(min_partitions, row_count // 500)
-    return __builtins__.min(max_concurrent_vs_calls, calculated)
+    calculated = builtins.max(min_partitions, row_count // 500)
+    return builtins.min(max_concurrent_vs_calls, calculated)
 
 # COMMAND ----------
 
 row_count = df_pending_search.count()
 optimal_partitions = get_optimal_partitions(row_count, vs_max_concurrency)
-logger.info(f"Records: {row_count} | Partitions: {optimal_partitions} | ~{row_count // __builtins__.max(1, optimal_partitions)} rows/partition")
+logger.info(f"Records: {row_count} | Partitions: {optimal_partitions} | ~{row_count // builtins.max(1, optimal_partitions)} rows/partition")
 
 # COMMAND ----------
 
@@ -596,123 +760,159 @@ from pyspark.sql.types import ArrayType, StructType, StructField, StringType, Fl
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# UDF schema
+# UDF schema: array of struct with text, lakefusion_id, score, and optional error field
 result_schema = ArrayType(StructType([
     StructField("text", StringType()),
     StructField("lakefusion_id", StringType()),
-    StructField("score", FloatType())
+    StructField("score", FloatType()),
+    StructField("error", StringType(), nullable=True)
 ]))
 
-# Broadcast variables for UDF
 _master_table = master_table
 _merged_desc_column = merged_desc_column
 _master_id_key = master_id_key
 _max_potential_matches = max_potential_matches
-client = create_vs_client()
-index = client.get_index(index_name=f"{_master_table}_index")
-num_results_requested = int(_max_potential_matches) + 1
-if exclude_self_matches:
-    # GOLDEN DEDUP UDF - excludes self-matches
-    
-    @pandas_udf(result_schema)
-    def vector_search_results_udf(descriptions: pd.Series, query_ids: pd.Series) -> pd.Series:
-        """
-        Vector search for Golden Dedup - excludes self-matches.
-        Queries come from unified_dedup, searches against master_table index.
-        """
-        
-        
-        # Request extra results to account for self-match filtering
-        
+_vs_index_name = index_name
+_num_results_requested = int(_max_potential_matches) + 1
 
-        def get_results(text, query_id):
-            try:
-                results = index.similarity_search(
-                    query_text=text,
-                    columns=[_merged_desc_column, _master_id_key],
-                    num_results=num_results_requested
-                )
+if embedding_mode == "precomputed":
+    if exclude_self_matches:
+        @pandas_udf(result_schema)
+        def vector_search_results_udf(embeddings: pd.Series, query_ids: pd.Series) -> pd.Series:
+            _client = create_vs_client()
+            _index = _client.get_index(index_name=_vs_index_name)
 
-                data = results.get("result", {}).get("data_array", None)
-                if not data:
-                    raise ValueError(f"Empty VS response: {str(results)[:500]}")
+            def get_results(embedding, query_id):
+                try:
+                    query_vec = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+                    results = _index.similarity_search(
+                        query_vector=query_vec,
+                        columns=[_merged_desc_column, _master_id_key],
+                        num_results=_num_results_requested
+                    )
+                    data = results.get("result", {}).get("data_array", None)
+                    if not data:
+                        raise ValueError(f"Empty VS response: {str(results)[:500]}")
+                    formatted = []
+                    for r in data:
+                        result_id = r[1]
+                        if result_id == query_id:
+                            continue
+                        formatted.append({"text": r[0], "lakefusion_id": result_id, "score": float(r[2]), "error": None})
+                        if len(formatted) >= int(_max_potential_matches):
+                            break
+                    return formatted
+                except Exception as e:
+                    return [{"text": "", "lakefusion_id": "", "score": 0.0, "error": str(e)[:500]}]
 
-                formatted = []
-                for r in data:
-                    result_text = r[0]
-                    result_id = r[1]
-                    result_score = float(r[2])
+            if vs_max_workers > 1:
+                with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
+                    results = list(executor.map(get_results, embeddings, query_ids))
+            else:
+                results = [get_results(e, qid) for e, qid in zip(embeddings, query_ids)]
+            return pd.Series(results)
 
-                    # CRITICAL: Skip self-matches
-                    if result_id == query_id:
-                        continue
+        logger.info("Golden Dedup UDF defined (precomputed, with self-match filtering)")
+    else:
+        @pandas_udf(result_schema)
+        def vector_search_results_udf(embeddings: pd.Series) -> pd.Series:
+            _client = create_vs_client()
+            _index = _client.get_index(index_name=_vs_index_name)
 
-                    formatted.append({
-                        "text": result_text,
-                        "lakefusion_id": result_id,
-                        "score": result_score
-                    })
+            def get_results(embedding):
+                try:
+                    query_vec = embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
+                    results = _index.similarity_search(
+                        query_vector=query_vec,
+                        columns=[_merged_desc_column, _master_id_key],
+                        num_results=int(_max_potential_matches)
+                    )
+                    data = results.get("result", {}).get("data_array", None)
+                    if not data:
+                        raise ValueError(f"Empty VS response: {str(results)[:500]}")
+                    formatted = []
+                    for r in data:
+                        formatted.append({"text": r[0], "lakefusion_id": r[1], "score": float(r[2]), "error": None})
+                    return formatted
+                except Exception as e:
+                    return [{"text": "", "lakefusion_id": "", "score": 0.0, "error": str(e)[:500]}]
 
-                    if len(formatted) >= int(_max_potential_matches):
-                        break
+            if vs_max_workers > 1:
+                with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
+                    results = list(executor.map(get_results, embeddings))
+            else:
+                results = [get_results(e) for e in embeddings]
+            return pd.Series(results)
 
-                return formatted
-
-            except Exception as e:
-                error_str = str(e)[:500]
-                logger.error(f"Error during vector search for query_id {query_id}: {error_str}")
-                return [{"text": f'{{ERROR: "{error_str}"}}', "lakefusion_id": "", "score": 0.0}]
-
-        if vs_max_workers > 1:
-            with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
-                results = list(executor.map(get_results, descriptions, query_ids))
-        else:
-            results = [get_results(desc, qid) for desc, qid in zip(descriptions, query_ids)]
-        return pd.Series(results)
-
-    logger.info("Golden Dedup UDF defined (with self-match filtering)")
-    logger.info(f"  - Requests {int(max_potential_matches) + 1} results to filter self-matches")
-
+        logger.info("Normal Dedup UDF defined (precomputed)")
 else:
-    # NORMAL DEDUP UDF - no self-match filtering
-    @pandas_udf(result_schema)
-    def vector_search_results_udf(descriptions: pd.Series) -> pd.Series:
-        
+    if exclude_self_matches:
+        @pandas_udf(result_schema)
+        def vector_search_results_udf(descriptions: pd.Series, query_ids: pd.Series) -> pd.Series:
+            _client = create_vs_client()
+            _index = _client.get_index(index_name=_vs_index_name)
 
-        def get_results(text):
-            try:
-                results = index.similarity_search(
-                    query_text=text,
-                    columns=[_merged_desc_column, _master_id_key],
-                    num_results=int(_max_potential_matches)
-                )
+            def get_results(text, query_id):
+                try:
+                    results = _index.similarity_search(
+                        query_text=text,
+                        columns=[_merged_desc_column, _master_id_key],
+                        num_results=_num_results_requested
+                    )
+                    data = results.get("result", {}).get("data_array", None)
+                    if not data:
+                        raise ValueError(f"Empty VS response: {str(results)[:500]}")
+                    formatted = []
+                    for r in data:
+                        result_id = r[1]
+                        if result_id == query_id:
+                            continue
+                        formatted.append({"text": r[0], "lakefusion_id": result_id, "score": float(r[2]), "error": None})
+                        if len(formatted) >= int(_max_potential_matches):
+                            break
+                    return formatted
+                except Exception as e:
+                    return [{"text": "", "lakefusion_id": "", "score": 0.0, "error": str(e)[:500]}]
 
-                data = results.get("result", {}).get("data_array", None)
-                if not data:
-                    raise ValueError(f"Empty VS response: {str(results)[:500]}")
+            if vs_max_workers > 1:
+                with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
+                    results = list(executor.map(get_results, descriptions, query_ids))
+            else:
+                results = [get_results(desc, qid) for desc, qid in zip(descriptions, query_ids)]
+            return pd.Series(results)
 
-                formatted = []
-                for r in data:
-                    formatted.append({
-                        "text": r[0],
-                        "lakefusion_id": r[1],
-                        "score": float(r[2])
-                    })
-                return formatted
+        logger.info("Golden Dedup UDF defined (managed, with self-match filtering)")
+    else:
+        @pandas_udf(result_schema)
+        def vector_search_results_udf(descriptions: pd.Series) -> pd.Series:
+            _client = create_vs_client()
+            _index = _client.get_index(index_name=_vs_index_name)
 
-            except Exception as e:
-                error_str = str(e)[:500]
-                logger.error(f"Error during vector search: {error_str}")
-                return [{"text": f'{{ERROR: "{error_str}"}}', "lakefusion_id": "", "score": 0.0}]
+            def get_results(text):
+                try:
+                    results = _index.similarity_search(
+                        query_text=text,
+                        columns=[_merged_desc_column, _master_id_key],
+                        num_results=int(_max_potential_matches)
+                    )
+                    data = results.get("result", {}).get("data_array", None)
+                    if not data:
+                        raise ValueError(f"Empty VS response: {str(results)[:500]}")
+                    formatted = []
+                    for r in data:
+                        formatted.append({"text": r[0], "lakefusion_id": r[1], "score": float(r[2]), "error": None})
+                    return formatted
+                except Exception as e:
+                    return [{"text": "", "lakefusion_id": "", "score": 0.0, "error": str(e)[:500]}]
 
-        if vs_max_workers > 1:
-            with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
-                results = list(executor.map(get_results, descriptions))
-        else:
-            results = [get_results(desc) for desc in descriptions]
-        return pd.Series(results)
-    
-    logger.info("Normal Dedup UDF defined")
+            if vs_max_workers > 1:
+                with ThreadPoolExecutor(max_workers=vs_max_workers) as executor:
+                    results = list(executor.map(get_results, descriptions))
+            else:
+                results = [get_results(desc) for desc in descriptions]
+            return pd.Series(results)
+
+        logger.info("Normal Dedup UDF defined (managed)")
 
 logger.info(f"  - Searches against: {master_table} index")
 logger.info(f"  - Returns top {max_potential_matches} matches per record")
@@ -724,80 +924,204 @@ logger.info("\n" + "=" * 70)
 logger.info("STEP 7: EXECUTE VECTOR SEARCH")
 logger.info("=" * 70)
 
-logger.info(f"Running {mode_name} vector search...")
+# Guarantee the unified error table exists before scoring starts. Lazy creation
+# inside log_errors() left a gap: a VS run with zero errors created no table,
+# and the downstream LLM layer then had no table to append 429 failures to.
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
+UnifiedErrorHandler(spark, source_table).ensure_table()
 
-if exclude_self_matches:
-    # Golden dedup - pass both description and ID
-    df_with_results = df_pending_search.withColumn(
-        "search_results_array",
-        vector_search_results_udf(
-            df_pending_search[merged_desc_column],
-            df_pending_search[source_id_key]
+if skip_vs_step:
+    logger.info("Reusing VS results from prior run (skip_vs_step=True)")
+    df_with_results = spark.table(vs_temp_table)
+else:
+    logger.info(f"Running {mode_name} vector search...")
+
+    input_col = embedding_vector_column if embedding_mode == "precomputed" else merged_desc_column
+    if exclude_self_matches:
+        df_with_results = df_pending_search.withColumn(
+            "search_results_array",
+            vector_search_results_udf(
+                df_pending_search[input_col],
+                df_pending_search[source_id_key]
+            )
+        )
+    else:
+        df_with_results = df_pending_search.withColumn(
+            "search_results_array",
+            vector_search_results_udf(df_pending_search[input_col])
+        )
+
+    # Materialize VS results (array form) to temp table.
+    # String conversion happens AFTER validation+retries, right before the merge.
+    df_with_results.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable(vs_temp_table)
+    df_with_results = spark.table(vs_temp_table)
+    logger.info(f"VS results materialized to {vs_temp_table}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Step 7.5: Validate & Retry Bad VS Results
+logger.info("\n" + "=" * 70)
+logger.info("STEP 7.5: VALIDATE & RETRY BAD VS RESULTS")
+logger.info("=" * 70)
+
+from pyspark.sql.functions import expr, size as spark_size, try_element_at, coalesce, to_json, array, sum as spark_sum
+
+MAX_VS_RETRIES = vs_max_retries
+expected_result_count = int(max_potential_matches)
+
+def is_bad_vs_result():
+    """Native Spark expression to identify bad VS results. No Python UDF needed."""
+    first_error = try_element_at(col("search_results_array.error"), lit(1))
+    arr_size = spark_size(coalesce(col("search_results_array"), array()))
+    bad_expr = (
+        col("search_results_array").isNull() |
+        (arr_size == 0) |
+        first_error.isNotNull()
+    )
+    if vs_strict_match_count:
+        bad_expr = bad_expr | (arr_size < expected_result_count)
+    return bad_expr
+
+# Initial pass: compute is_bad once and persist to the temp table
+df_initial = spark.table(vs_temp_table).withColumn("is_bad", is_bad_vs_result())
+df_initial.write.format("delta").mode("overwrite").option("mergeSchema", "true").saveAsTable(vs_temp_table)
+
+for retry_attempt in range(1, MAX_VS_RETRIES + 1):
+    stats = spark.table(vs_temp_table).agg(
+        count("*").alias("total"),
+        spark_sum(col("is_bad").cast("int")).alias("bad")
+    ).collect()[0]
+    bad_count, total_rows = stats["bad"], stats["total"]
+
+    if bad_count == 0:
+        logger.info(f"Retry check {retry_attempt}: No bad results. Validation passed.")
+        break
+
+    bad_pct = (bad_count / total_rows * 100) if total_rows > 0 else 0
+    logger.warning(
+        f"Retry {retry_attempt}/{MAX_VS_RETRIES}: {bad_count:,} bad VS results "
+        f"({bad_pct:.1f}% of {total_rows:,} total)"
+    )
+
+    df_bad = spark.table(vs_temp_table).filter(col("is_bad"))
+    bad_select_cols = [source_id_key, merged_desc_column]
+    if embedding_mode == "precomputed":
+        bad_select_cols.append(embedding_vector_column)
+    df_bad_input = df_bad.select(*bad_select_cols)
+
+    retry_input_col = embedding_vector_column if embedding_mode == "precomputed" else merged_desc_column
+    if exclude_self_matches:
+        df_retried = df_bad_input.withColumn(
+            "search_results_array",
+            vector_search_results_udf(
+                df_bad_input[retry_input_col],
+                df_bad_input[source_id_key]
+            )
+        ).withColumn("is_bad", is_bad_vs_result())
+    else:
+        df_retried = df_bad_input.withColumn(
+            "search_results_array",
+            vector_search_results_udf(df_bad_input[retry_input_col])
+        ).withColumn("is_bad", is_bad_vs_result())
+
+    df_retried.write.format("delta").mode("overwrite").saveAsTable(f"{vs_temp_table}_retry")
+    df_retry_source = spark.table(f"{vs_temp_table}_retry")
+
+    temp_delta = DeltaTable.forName(spark, vs_temp_table)
+    temp_delta.alias("target").merge(
+        source=df_retry_source.alias("source"),
+        condition=f"target.{source_id_key} = source.{source_id_key}"
+    ).whenMatchedUpdate(
+        set={
+            "search_results_array": "source.search_results_array",
+            "is_bad": "source.is_bad"
+        }
+    ).execute()
+
+    logger.info(f"Retry {retry_attempt}: Re-evaluated {bad_count:,} records")
+
+# Final quality report — is_bad is already persisted, just aggregate
+final_stats = spark.table(vs_temp_table).agg(
+    count("*").alias("total"),
+    spark_sum(col("is_bad").cast("int")).alias("bad")
+).collect()[0]
+final_bad_count, final_total = final_stats["bad"], final_stats["total"]
+final_good = final_total - final_bad_count
+final_bad_pct = (final_bad_count / final_total * 100) if final_total > 0 else 0
+
+logger.info("\n" + "-" * 60)
+logger.info("VS RESULT QUALITY REPORT")
+logger.info("-" * 60)
+logger.info(f"  Total records:       {final_total:,}")
+logger.info(f"  Good results:        {final_good:,} ({100 - final_bad_pct:.1f}%)")
+logger.info(f"  Bad results (nulled): {final_bad_count:,} ({final_bad_pct:.1f}%)")
+logger.info("-" * 60)
+
+if final_bad_count > 0:
+    df_final_bad = spark.table(vs_temp_table).filter(col("is_bad"))
+
+    first_error = try_element_at(col("search_results_array.error"), lit(1))
+    arr_size = spark_size(coalesce(col("search_results_array"), array()))
+    df_vs_errors = df_final_bad.withColumn(
+        "error_message",
+        when(col("search_results_array").isNull(), lit("VS error: null result"))
+        .when(first_error.isNotNull(), concat(lit("VS error: "), first_error))
+        .otherwise(
+              concat(lit("VS incomplete: expected "), lit(expected_result_count),
+                     lit(" results, got "), arr_size.cast("string"))
         )
     )
-else:
-    # Normal dedup - just description
-    df_with_results = df_pending_search.withColumn(
-        "search_results_array",
-        vector_search_results_udf(df_pending_search[merged_desc_column])
+
+    from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
+    unified_error_handler = UnifiedErrorHandler(spark, source_table)
+    unified_error_handler.log_errors(
+        df_vs_errors.select(
+            col(source_id_key).alias("surrogate_key"),
+            col("error_message")
+        ),
+        stage="VECTOR_SEARCH",
+        run_id=run_id
     )
+    logger.info(f"Logged {final_bad_count:,} VS errors to unified error table")
 
-# Convert array-of-structs to formatted string for storage
-df_with_final_results = df_with_results.withColumn(
+    logger.warning(f"Nulling out {final_bad_count:,} bad VS results after {MAX_VS_RETRIES} retries")
+    temp_delta = DeltaTable.forName(spark, vs_temp_table)
+    temp_delta.alias("target").merge(
+        source=df_final_bad.select(source_id_key).alias("source"),
+        condition=f"target.{source_id_key} = source.{source_id_key}"
+    ).whenMatchedUpdate(
+        set={"search_results_array": lit(None)}
+    ).execute()
+
+# Retry table cleanup deferred to next run's defensive cleanup at notebook top
+
+# COMMAND ----------
+
+# DBTITLE 1,Step 8: Convert to String Format, Deduplicate & Merge
+logger.info("\n" + "=" * 70)
+logger.info("STEP 8: CONVERT TO STRING FORMAT, DEDUPLICATE & MERGE")
+logger.info("=" * 70)
+
+# Convert validated array results to JSON array-of-arrays: [[text, id, score], ...]
+df_valid_results = spark.table(vs_temp_table).filter(
+    col("search_results_array").isNotNull() &
+    (spark_size(col("search_results_array")) > 0)
+)
+
+df_with_final_results = df_valid_results.withColumn(
     "search_results",
-    expr("""
-      concat_ws('], [', transform(search_results_array, x -> 
-        concat(x.text, ', ', x.lakefusion_id, ', ', cast(x.score as string))
-      ))
-    """).alias("search_results")
+    to_json(expr("""
+        transform(search_results_array, x -> array(
+            coalesce(x.text, ''),
+            coalesce(x.lakefusion_id, ''),
+            cast(coalesce(x.score, 0.0) as string)
+        ))
+    """))
 )
 
-# Materialize VS results to temp table — avoids recomputing the UDF on serverless
-vs_temp_table = f"{catalog_name}.silver.{entity}_vs_temp_{experiment_id}"
-df_with_final_results.write.format("delta").mode("overwrite").saveAsTable(vs_temp_table)
-df_with_final_results = spark.table(vs_temp_table)
-logger.info(f"VS results materialized to {vs_temp_table}")
+logger.info(f"Converting {final_good:,} valid records to JSON string format")
 
-# COMMAND ----------
-
-# DBTITLE 1,Step 7.5: Split Valid vs Errored Records
-logger.info("\n" + "=" * 70)
-logger.info("STEP 7.5: SPLIT VALID VS ERRORED RECORDS")
-logger.info("=" * 70)
-
-from pyspark.sql.functions import col
-
-df_valid = df_with_final_results.filter(~col("search_results").startswith("{ERROR:"))
-df_errored = df_with_final_results.filter(col("search_results").startswith("{ERROR:"))
-
-from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
-unified_error_handler = UnifiedErrorHandler(spark, source_table)
-unified_error_handler.log_errors(
-    df_errored.select(
-        col(source_id_key).alias("surrogate_key"),
-        col("search_results").alias("error_message")
-    ),
-    stage="VECTOR_SEARCH",
-    run_id=run_id
-)
-
-df_with_final_results = df_valid
-logger.info("Errored records (if any) routed to unified_error table; continuing with valid records only")
-
-# COMMAND ----------
-
-# DBTITLE 1,Step 8: Deduplicate Results
-logger.info("\n" + "=" * 70)
-logger.info("STEP 8: DEDUPLICATE RESULTS")
-logger.info("=" * 70)
-
-df_deduplicated = df_with_final_results.dropDuplicates([source_id_key])
-
-# dedup_count = df_deduplicated.count()
-# print(f"✓ Deduplicated results: {dedup_count} unique records")
-
-# if dedup_count != search_results_count:
-#     print(f"  ⚠️  Removed {search_results_count - dedup_count} duplicate records")
+df_deduplicated = df_with_final_results.drop("is_bad", "search_results_array").dropDuplicates([source_id_key])
 
 # COMMAND ----------
 
@@ -808,8 +1132,6 @@ logger.info("=" * 70)
 
 delta_table = DeltaTable.forName(spark, source_table)
 
-#before_merge_empty = spark.table(source_table).filter(col("search_results") == "").count()
-
 delta_table.alias("target").merge(
     source=df_deduplicated.alias("source"),
     condition=f"target.{source_id_key} = source.{source_id_key}"
@@ -817,12 +1139,7 @@ delta_table.alias("target").merge(
     set={"search_results": "source.search_results"}
 ).execute()
 
-#after_merge_empty = spark.table(source_table).filter(col("search_results") == "").count()
-
 logger.info(f"Merge completed to {source_table}")
-# print(f"  Records with empty search_results before: {before_merge_empty}")
-# print(f"  Records with empty search_results after: {after_merge_empty}")
-# print(f"  Records updated: {before_merge_empty - after_merge_empty}")
 
 # COMMAND ----------
 
@@ -844,14 +1161,12 @@ logger.info(f"Cleaned up temp table {vs_temp_table}")
 
 # DBTITLE 1,Set Task Values and Exit
 dbutils.jobs.taskValues.set("vector_search_complete", True)
-#dbutils.jobs.taskValues.set("records_searched", search_results_count)
 
 logger.info("\n" + "=" * 70)
 logger.info(f"{mode_name} VECTOR SEARCH COMPLETED SUCCESSFULLY")
 logger.info("=" * 70)
 logger.info(f"Mode: {mode_name}")
 logger.info(f"Source table: {source_table}")
-#print(f"Total records searched: {search_results_count}")
 if exclude_self_matches:
     logger.info("Self-matches were automatically excluded")
 logger.info("=" * 70)

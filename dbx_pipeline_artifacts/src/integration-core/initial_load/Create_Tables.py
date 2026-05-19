@@ -186,12 +186,19 @@ def create_schema_fields(attributes_list, attributes_datatype_dict, include_lake
 
 def enable_cdf_on_table(table_name):
     """
-    Enable Change Data Feed on a table.
-    
+    Enable Change Data Feed on a table (idempotent).
+
+    Skips the ALTER when CDF is already enabled — every ALTER bumps the
+    Delta table version and pollutes history with no-op commits.
+
     Args:
         table_name: Fully qualified table name
     """
     try:
+        props = {r["key"]: r["value"] for r in spark.sql(f"SHOW TBLPROPERTIES {table_name}").collect()}
+        if str(props.get("delta.enableChangeDataFeed", "false")).lower() == "true":
+            logger.info(f"  CDF already enabled on {table_name} (skipping)")
+            return True
         spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES (delta.enableChangeDataFeed = true)")
         logger.info(f"  CDF enabled on {table_name}")
         return True
@@ -214,7 +221,8 @@ master_fields = create_schema_fields(entity_attributes, entity_attributes_dataty
 
 # Add system columns
 master_fields.extend([
-    StructField("attributes_combined", StringType(), True)
+    StructField("attributes_combined", StringType(), True),
+    StructField("attributes_combined_embedding", ArrayType(FloatType()), True),
 ])
 
 master_schema = StructType(master_fields)
@@ -252,7 +260,13 @@ unified_fields = [
     StructField("record_status", StringType(), True),
     StructField("attributes_combined", StringType(), True),
     StructField("search_results", StringType(), True),
-    StructField("scoring_results", StringType(), True)
+    StructField("scoring_results", StringType(), True),
+    # Reserved system audit columns. Double-underscore prefix avoids
+    # collision with user-defined entity attributes named `created_at` /
+    # `modified_at`. Used by the survivorship engine as a deterministic
+    # tie-breaker (latest record wins).
+    StructField("__lf_created_at", TimestampType(), True),
+    StructField("__lf_modified_at", TimestampType(), True),
 ]
 
 # Add all entity attributes (NO lakefusion_id in unified)

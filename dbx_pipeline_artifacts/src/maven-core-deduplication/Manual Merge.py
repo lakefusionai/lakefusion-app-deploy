@@ -83,6 +83,10 @@ if 'logger' not in dir():
 
 # COMMAND ----------
 
+# MAGIC %run ../utils/concurrency_utils
+
+# COMMAND ----------
+
 unified_table = f"{catalog_name}.silver.{entity}_unified_deduplicate"
 master_table = f"{catalog_name}.gold.{entity}_master"
 processed_unified_table = f"{catalog_name}.silver.{entity}_processed_unified_deduplicate"
@@ -621,12 +625,14 @@ resultant_merged_df = joined_df.select(
 
 # COMMAND ----------
 
-delta_table = DeltaTable.forName(spark, master_table)
+def _merge_master_table():
+    delta_table = DeltaTable.forName(spark, master_table)
+    delta_table.alias("target").merge(
+        source=resultant_merged_df.alias("source"),
+        condition=f"target.{id_key} = source.{id_key}"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-delta_table.alias("target").merge(
-    source=resultant_merged_df.alias("source"),
-    condition=f"target.{id_key} = source.{id_key}"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_master_table, "master_table")
 
 # COMMAND ----------
 
@@ -646,12 +652,14 @@ resultant_master_attribute_source_mapping_survivorship = (
 
 # COMMAND ----------
 
-delta_table_attr = DeltaTable.forName(spark, master_attribute_version_sources_table)
+def _merge_attribute_version_sources():
+    delta_table_attr = DeltaTable.forName(spark, master_attribute_version_sources_table)
+    delta_table_attr.alias("target").merge(
+        source=resultant_master_attribute_source_mapping_survivorship.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-delta_table_attr.alias("target").merge(
-    source=resultant_master_attribute_source_mapping_survivorship.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+_retry_on_concurrent_append(_merge_attribute_version_sources, "master_attribute_version_sources_table")
 
 # COMMAND ----------
 
@@ -666,27 +674,35 @@ merge_activities_df = spark.createDataFrame([{
 # COMMAND ----------
 
 # Update merge activities table
-delta_table_merge = DeltaTable.forName(spark, merge_activities_table)
+def _merge_merge_activities():
+    delta_table_merge = DeltaTable.forName(spark, merge_activities_table)
+    delta_table_merge.alias("target").merge(
+        source=merge_activities_df.alias("source"),
+        condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
-delta_table_merge.alias("target").merge(
-    source=merge_activities_df.alias("source"),
-    condition=f"target.{id_key} = source.{id_key} and target.version = source.version and target.master_{id_key} = source.master_{id_key} and target.action_type = source.action_type"
-).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-
-# COMMAND ----------
-
-delta_table_master = DeltaTable.forName(spark, master_table)
-delta_table_master.delete(condition=expr(f"{id_key} = '{match_record_id}'"))
+_retry_on_concurrent_append(_merge_merge_activities, "merge_activities MANUAL_MERGE")
 
 # COMMAND ----------
 
-delta_table_processed_unified = DeltaTable.forName(spark, processed_unified_table)
+def _delete_match_record_from_master():
+    delta_table_master = DeltaTable.forName(spark, master_table)
+    delta_table_master.delete(condition=expr(f"{id_key} = '{match_record_id}'"))
+
+_retry_on_concurrent_append(_delete_match_record_from_master, "master_table DELETE match_record")
+
+# COMMAND ----------
+
 processed_unified_condition = f"""
-    master_{id_key} = '{match_record_id}' 
+    master_{id_key} = '{match_record_id}'
     OR ({id_key} = '{match_record_id}' AND master_{id_key} != '{master_id}')
 """
 
-delta_table_processed_unified.delete(condition=expr(processed_unified_condition))
+def _delete_from_processed_unified():
+    delta_table_processed_unified = DeltaTable.forName(spark, processed_unified_table)
+    delta_table_processed_unified.delete(condition=expr(processed_unified_condition))
+
+_retry_on_concurrent_append(_delete_from_processed_unified, "processed_unified DELETE match_record")
 
 # COMMAND ----------
 

@@ -8,7 +8,10 @@ sql_server = os.environ.get('SQL_SERVER', 'localhost:3306')
 
 sql_db_name = os.environ.get('SQL_DBNAME', 'lakefusion_transactional_db')
 deployment_env = os.environ.get('DEPLOYMENT_ENV', 'prod')
-databricks_host = os.environ.get('DATABRICKS_HOST', '')
+# Use the shared helper so the https:// prefix is always present (Databricks
+# Apps inject DATABRICKS_HOST as a bare host).
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+databricks_host = get_databricks_host()
 
 
 db_type = os.environ.get("DB_TYPE", "mysql").lower()

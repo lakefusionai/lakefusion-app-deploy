@@ -1,7 +1,7 @@
 """Seed RBAC roles and permissions_definition
 
 Revision ID: d3e4f5a6b7c8
-Revises: q2r3s4t5u6v7
+Revises: r3s4t5u6v7w8
 Create Date: 2026-02-14 10:00:00.000000
 
 Creates the three default RBAC roles (if they don't exist) and populates
@@ -22,7 +22,7 @@ import sqlalchemy as sa
 
 
 revision: str = "d3e4f5a6b7c8"
-down_revision: Union[str, None] = "q2r3s4t5u6v7"
+down_revision: Union[str, None] = "r3s4t5u6v7w8"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

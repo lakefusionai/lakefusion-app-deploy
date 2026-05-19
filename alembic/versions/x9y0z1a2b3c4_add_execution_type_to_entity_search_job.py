@@ -1,7 +1,7 @@
 """add execution_type column, ENABLE_SQL_STEWARDSHIP flag, and standardize job statuses
 
 Revision ID: x9y0z1a2b3c4
-Revises: k7l8m9n0o1p2
+Revises: w8x9y0z1a2b3
 Create Date: 2026-04-16
 
 NOTE: Originally created with revision id 'p1q2r3s4t5u6' which collided with
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = 'x9y0z1a2b3c4'
-down_revision: Union[str, None] = 'k7l8m9n0o1p2'
+down_revision: Union[str, None] = 'w8x9y0z1a2b3'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1,7 +1,7 @@
 """merge four heads after duplicate-revision fix (with self-healing backfill)
 
 Revision ID: z1a2b3c4d5e6
-Revises: e8f9a0b1c2d3, w8x9y0z1a2b3, x9y0z1a2b3c4, y0z1a2b3c4d5
+Revises: e8f9a0b1c2d3
 Create Date: 2026-05-18 00:00:00.000000
 
 After renaming the two duplicate-id orphan migrations (p1q2r3s4t5u6 →
@@ -44,12 +44,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "z1a2b3c4d5e6"
-down_revision: Union[str, Sequence[str], None] = (
-    "e8f9a0b1c2d3",
-    "w8x9y0z1a2b3",
-    "x9y0z1a2b3c4",
-    "y0z1a2b3c4d5",
-)
+down_revision: Union[str, None] = "e8f9a0b1c2d3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

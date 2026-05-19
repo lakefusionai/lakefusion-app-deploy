@@ -1,7 +1,7 @@
 """add embedding_mode column to model_experiments
 
 Revision ID: y0z1a2b3c4d5
-Revises: p1q2r3s4t5u6
+Revises: x9y0z1a2b3c4
 Create Date: 2026-04-24 12:00:00.000000
 
 Adds embedding_mode column to model_experiments table.
@@ -23,7 +23,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'y0z1a2b3c4d5'
-down_revision: Union[str, None] = 'p1q2r3s4t5u6'
+down_revision: Union[str, None] = 'x9y0z1a2b3c4'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

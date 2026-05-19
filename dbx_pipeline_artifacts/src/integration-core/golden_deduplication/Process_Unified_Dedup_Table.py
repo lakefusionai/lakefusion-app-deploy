@@ -2,7 +2,7 @@
 import json
 from datetime import datetime
 from pyspark.sql.functions import (
-    col, lit, current_timestamp, regexp_extract_all, explode, 
+    col, lit, current_timestamp, regexp_extract_all, explode,
     array_distinct, concat_ws, when, coalesce
 )
 from pyspark.sql.types import StringType
@@ -105,15 +105,13 @@ if not dedup_table_exists:
     # Write to unified_dedup table
     unified_dedup_df.write.format("delta").mode("overwrite").saveAsTable(unified_dedup_table)
     
-    record_count = unified_dedup_df.count()
-    logger.info(f"Created unified_dedup table with {record_count} records")
+    logger.info(f"Created unified_dedup table (cloned from master)")
     logger.info(f"  Added columns: search_results, scoring_results")
     
     logger.info("\n" + "="*80)
     logger.info("INITIAL LOAD COMPLETE")
     logger.info("="*80)
-    logger.info(f"All {record_count} records cloned from master")
-    logger.info(f"All records have empty search_results and scoring_results")
+    logger.info(f"Records cloned from master with empty search_results and scoring_results")
     logger.info(f"Ready for vector search processing")
     logger.info(f"Note: Metadata will be updated at end of pipeline")
     logger.info("="*80)
@@ -122,7 +120,6 @@ if not dedup_table_exists:
     dbutils.notebook.exit(json.dumps({
         "status": "success",
         "mode": "initial_load",
-        "records_processed": record_count,
         "master_version": int(master_version)
     }))
 
@@ -189,58 +186,37 @@ WHERE version > {last_processed_version}
 
 master_ids_df = spark.sql(master_ids_query)
 
-#Commenting as not used in logic elsewhere
-# master_ids_count = master_ids_df.count()
-
-# logger.info(f"Found {master_ids_count} master_ids with changes")
-
 # Query 2: Get changed match_ids for golden dedup merges
 # These are also lakefusion_ids that participated in master-to-master merges
 match_ids_query = f"""
 SELECT DISTINCT match_id as {id_key}
 FROM {merge_activities_table}
-WHERE version > {last_processed_version} 
+WHERE version > {last_processed_version}
   AND version <= {current_master_version}
   AND action_type IN ('MASTER_MANUAL_MERGE', 'MASTER_JOB_MERGE','MASTER_FORCE_MERGE')
 """
 
 match_ids_df = spark.sql(match_ids_query)
 
-# Commenting as not used in logic elsewhere
-# match_ids_count = match_ids_df.count()
-
-# logger.info(f"Found {match_ids_count} match_ids from golden dedup merges")
-
 # Combine both master_ids and match_ids, then get distinct
 changed_ids_df = master_ids_df.union(match_ids_df).distinct()
-changed_count = changed_ids_df.count()
 
-logger.info(f"Total unique changed lakefusion_ids: {changed_count}")
-
-# Commenting as not used in logic elsewhere
-# logger.info(f"  - From master_id: {master_ids_count}")
-# logger.info(f"  - From match_id (golden dedup): {match_ids_count}")
-
-if changed_count == 0:
+# Empty-check without full count (head(1) short-circuits with LIMIT 1).
+# Reuse the result for an observability boolean log line — keeps a signal
+# in logs without triggering a second action or a full count.
+_changed_first_row = changed_ids_df.head(1)
+logger.info(f"  changed_ids non-empty: {bool(_changed_first_row)}")
+if not _changed_first_row:
     logger.info("\nNo changed records found in merge_activities")
     logger.info("  This might indicate no merge activities occurred")
     logger.info("  Exiting without processing...")
-    
-    # Display summary before exit
-    summary_msg = "No changes detected in merge activities"
-    displayHTML(f"<pre>{summary_msg}</pre>")
-    
+
     dbutils.notebook.exit(json.dumps({
         "status": "success",
         "mode": "incremental",
         "message": "No changed records in merge activities",
-        "records_processed": 0,
         "master_version": int(current_master_version)
     }))
-
-# Collect changed IDs for later use
-changed_ids_list = [row[id_key] for row in changed_ids_df.collect()]
-logger.info(f"  Sample changed IDs: {changed_ids_list[:5]}")
 
 # COMMAND ----------
 
@@ -248,40 +224,22 @@ logger.info("\n" + "="*80)
 logger.info("STEP 3: IDENTIFY RECORDS THAT REFERENCE CHANGED IDS")
 logger.info("="*80)
 
-# Simple approach: Find records whose search_results contain any of the changed lakefusion_ids
-# We'll use SQL LIKE for pattern matching - much simpler than regex parsing
 
 logger.info("  Finding records that reference changed masters in their search_results...")
 
-# Get list of changed IDs
-changed_ids_list = [row[id_key] for row in changed_ids_df.collect()]
-
-# Build a condition to check if search_results contains any changed ID
-# For each changed ID, check if it appears in search_results
-conditions = " OR ".join([f"search_results LIKE '%{changed_id}%'" for changed_id in changed_ids_list])
-
-# Query to find records that reference any changed ID
-indirect_update_query = f"""
-SELECT DISTINCT {id_key}
-FROM {unified_dedup_table}
-WHERE search_results != ''
-  AND ({conditions})
-"""
-
-indirect_update_df = spark.sql(indirect_update_query)
-indirect_count = indirect_update_df.count()
-
-logger.info(f"Found {indirect_count} records that reference changed masters")
-
-# Combine direct and indirect updates
-all_ids_to_clear = changed_ids_df.union(indirect_update_df).distinct()
-
-# Commenting as not used in logic elsewhere
-# total_to_clear = all_ids_to_clear.count()
-# logger.info(f"Total records to clear search/scoring results: {total_to_clear}")
-
-logger.info(f"  Direct updates: {changed_count}")
-logger.info(f"  Indirect (references): {indirect_count}")
+indirect_update_df = (
+    spark.table(unified_dedup_table)
+        .where("search_results IS NOT NULL AND search_results != ''")
+        .select(
+            col(id_key).alias("__referrer_id"),
+            explode(
+                regexp_extract_all(col("search_results"), lit(r'"([0-9a-f]{32})"'), lit(1))
+            ).alias(id_key)
+        )
+        .join(changed_ids_df, on=id_key, how="inner")
+        .select(col("__referrer_id").alias(id_key))
+        .distinct()
+)
 
 # COMMAND ----------
 
@@ -299,17 +257,24 @@ target_cols = {f.name.strip().lower() for f in spark.table(unified_dedup_table).
 # Select only master columns that exist in the target unified_dedup table
 master_cols_for_sync = [c for c in current_master_df.columns if c.strip().lower() in target_cols]
 
-# Prepare master data with empty search/scoring results for changed records only
-# For unchanged records, we'll preserve existing search_results
+# Prepare master data with empty search/scoring results for changed records only.
+# For unchanged records, leave search_results as NULL → MERGE preserves existing.
+
+_changed_flag_df = changed_ids_df.withColumn("__changed", lit(True))
+
 master_with_results_df = (
     current_master_df
     .select(*master_cols_for_sync)
-    .withColumn("search_results",
-                when(col(id_key).isin(changed_ids_list), lit(""))
-                .otherwise(lit(None)))  # NULL means don't update for unchanged records
-    .withColumn("scoring_results",
-                when(col(id_key).isin(changed_ids_list), lit(""))
-                .otherwise(lit(None)))
+    .join(_changed_flag_df, on=id_key, how="left")
+    .withColumn(
+        "search_results",
+        when(col("__changed").isNotNull(), lit("")).otherwise(lit(None))
+    )
+    .withColumn(
+        "scoring_results",
+        when(col("__changed").isNotNull(), lit("")).otherwise(lit(None))
+    )
+    .drop("__changed")
 )
 
 logger.info(f"  Prepared master data with conditional result clearing")
@@ -340,15 +305,8 @@ logger.info("    - DELETE: Records not in master anymore")
 )
 
 logger.info(f"Delta MERGE completed successfully")
-
-# Get statistics
-total_records = spark.table(unified_dedup_table).count()
-records_with_empty_results = spark.table(unified_dedup_table).filter(
-    col("search_results") == ""
-).count()
-
-logger.info(f"  Total records in unified_dedup: {total_records}")
-logger.info(f"  Records with empty search_results: {records_with_empty_results}")
+# Removed log-only full-table .count() calls on unified_dedup table —
+# triggered redundant scans on large tables without affecting logic.
 
 # COMMAND ----------
 
@@ -361,65 +319,41 @@ logger.info("="*80)
 # This is separate from the main merge because these are records that exist
 # in both source and target but need special handling based on their references
 
-if indirect_count > 0:
-    # Get only the indirect updates (exclude direct updates which were already handled)
-    indirect_only_df = (
-        indirect_update_df
-        .join(changed_ids_df, on=id_key, how="left_anti")  # Exclude direct updates
-    )
-    
-    indirect_only_count = indirect_only_df.count()
-    
-    if indirect_only_count > 0:
-        logger.info(f"  Clearing search results for {indirect_only_count} records that reference changed masters...")
-        
-        # Prepare update with cleared results
-        indirect_clear_df = (
-            indirect_only_df
-            .select(col(id_key))
-            .withColumn("search_results", lit("").cast(StringType()))
-            .withColumn("scoring_results", lit("").cast(StringType()))
-        )
-        
-        # Apply update
-        unified_dedup_delta.alias("target").merge(
-            indirect_clear_df.alias("source"),
-            f"target.{id_key} = source.{id_key}"
-        ).whenMatchedUpdate(set={
-            "search_results": "source.search_results",
-            "scoring_results": "source.scoring_results"
-        }).execute()
-        
-        logger.info(f"Cleared search/scoring results for {indirect_only_count} indirect updates")
-    else:
-        logger.info(f"No indirect-only updates (all indirect updates were also direct updates)")
-else:
-    logger.info(f"No indirect updates to process")
+# Indirect-only = referrers minus direct-updates.
+# Issue the MERGE unconditionally — Delta MERGE on an empty source is a no-op.
+# A prior head(1) guard would have re-executed the upstream chain
+# (unified_dedup scan + regexp_extract_all + explode + join + anti-join) a
+# second time when the MERGE ran. Caching the DataFrame would avoid the
+# re-execution, but cache/persist are not used (serverless constraint), so
+# instead we just skip the gate.
+logger.info("  Clearing search results for records that reference changed masters (MERGE; no-op if no rows)...")
+
+indirect_only_df = indirect_update_df.join(changed_ids_df, on=id_key, how="left_anti")
+
+indirect_clear_df = (
+    indirect_only_df
+    .select(col(id_key))
+    .withColumn("search_results", lit("").cast(StringType()))
+    .withColumn("scoring_results", lit("").cast(StringType()))
+)
+
+unified_dedup_delta.alias("target").merge(
+    indirect_clear_df.alias("source"),
+    f"target.{id_key} = source.{id_key}"
+).whenMatchedUpdate(set={
+    "search_results": "source.search_results",
+    "scoring_results": "source.scoring_results"
+}).execute()
+
+logger.info("  Indirect-update MERGE complete")
 
 # COMMAND ----------
 
 logger.info("\n" + "="*80)
-logger.info("STEP 6: CALCULATE FINAL STATISTICS")
+logger.info("STEP 6: FINAL STATISTICS")
 logger.info("="*80)
-
-# Calculate what actually changed
-final_records_with_empty_results = spark.table(unified_dedup_table).filter(
-    col("search_results") == ""
-).count()
-
-records_needing_processing = final_records_with_empty_results
-
-logger.info(f"Final statistics:")
-logger.info(f"  Total records in unified_dedup: {total_records}")
-logger.info(f"  Records needing vector search: {records_needing_processing}")
-
-# Estimate change breakdown (these are estimates since MERGE doesn't return detailed stats)
-total_records_processed = changed_count + indirect_count
-
-logger.info(f"\nEstimated changes:")
-logger.info(f"  Direct updates (master changes): {changed_count}")
-logger.info(f"  Indirect updates (reference clears): {indirect_count}")
-logger.info(f"  Total records processed: {total_records_processed}")
+# Removed log-only full-table .count() calls (filter().count() on
+# unified_dedup) — they scanned the entire table each run for log lines only.
 
 # COMMAND ----------
 
@@ -431,27 +365,16 @@ summary = {
     "status": "success",
     "mode": "incremental",
     "master_version": int(current_master_version),
-    "changes_detected": {
-        "direct_updates": changed_count,
-        "indirect_updates": indirect_count
-    },
-    "total_records_processed": total_records_processed,
-    "records_needing_vector_search": records_needing_processing,
     "timestamp": datetime.now().isoformat()
 }
 
 logger.info(f"\nSummary:")
-logger.info(f"Direct updates (master changes): {changed_count}")
-logger.info(f"Indirect updates (reference clears): {indirect_count}")
-logger.info(f"Total records processed: {total_records_processed}")
-logger.info(f"Records needing vector search: {records_needing_processing}")
 logger.info(f"Master version: {current_master_version}")
 logger.info(f"Note: Metadata will be updated at end of pipeline")
 logger.info("="*80)
 
 # Set task values
 dbutils.jobs.taskValues.set("unified_dedup_sync_complete", True)
-dbutils.jobs.taskValues.set("records_processed", total_records_processed)
 dbutils.jobs.taskValues.set("master_version", int(current_master_version))
 
 # COMMAND ----------

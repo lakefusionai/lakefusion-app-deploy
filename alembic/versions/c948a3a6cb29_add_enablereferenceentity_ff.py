@@ -1,6 +1,6 @@
 """add_enableReferenceDataManagement_ff
 Revision ID: c948a3a6cb29
-Revises: k7l8m9n0o1p2
+Revises: y0z1a2b3c4d5
 Create Date: 2026-01-15 16:39:30.122933
 """
 from typing import Sequence, Union
@@ -13,7 +13,7 @@ from datetime import datetime
 
 # revision identifiers, used by Alembic.
 revision: str = 'c948a3a6cb29'
-down_revision: Union[str, None] = 'k7l8m9n0o1p2'
+down_revision: Union[str, None] = 'y0z1a2b3c4d5'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

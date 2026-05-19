@@ -17,7 +17,7 @@ so this migration is purely a data-cleanup pass — there is no runtime
 behavioural change for entities that haven't been touched in the UI.
 
 Revision ID: s4t5u6v7w8x9
-Revises: r3s4t5u6v7w8
+Revises: k7l8m9n0o1p2
 Create Date: 2026-05-11 00:00:00.000000
 
 """
@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 revision: str = 's4t5u6v7w8x9'
-down_revision: Union[str, None] = 'r3s4t5u6v7w8'
+down_revision: Union[str, None] = 'k7l8m9n0o1p2'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

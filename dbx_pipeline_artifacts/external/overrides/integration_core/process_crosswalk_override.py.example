@@ -1,0 +1,151 @@
+"""
+Example Override for Process Crosswalk Task.
+
+This file shows how to customize the pre and post execution phases
+of the Process Crosswalk task without modifying core LakeFusion code.
+
+To enable:
+1. Rename this file to: process_crosswalk_override.py
+2. Implement pre_execute() and/or post_execute() methods
+3. The executor will automatically detect and use these overrides
+
+Override Modes:
+    - Replace (default): Your methods run INSTEAD of default task methods
+    - Extend (opt-in): Default methods run FIRST, then your methods run
+
+    To enable extend mode, add class attributes:
+        extend_pre_execute = True   # Default pre_execute runs first, then yours
+        extend_post_execute = True  # Default post_execute runs first, then yours
+
+Note: The execute() phase (core business logic) cannot be overridden.
+"""
+
+from lakefusion_core_engine.executors import TaskContext, TaskResult
+
+
+class ProcessCrosswalkExtended:
+    """
+    Extended class to override Process Crosswalk pre/post execution.
+
+    Override Modes:
+        - Replace (default): Methods run INSTEAD of default (no attributes needed)
+        - Extend (opt-in): Set extend_pre_execute=True and/or extend_post_execute=True
+
+    Methods:
+        pre_execute(context) - Called BEFORE core crosswalk logic
+        post_execute(context, result) - Called AFTER core crosswalk logic
+    """
+
+    # ============================================================
+    # OVERRIDE MODE CONFIGURATION
+    # ============================================================
+    # Uncomment the following to enable EXTEND mode:
+    # When True, default task method runs FIRST, then your method runs
+    # When False or omitted (default), your method REPLACES the default
+    #
+    # extend_pre_execute = True
+    # extend_post_execute = True
+    # ============================================================
+
+    def pre_execute(self, context: TaskContext) -> TaskContext:
+        """
+        Custom PRE phase.
+
+        Mode behavior:
+            - Replace (default): Runs INSTEAD of default pre_execute()
+            - Extend: Runs AFTER default pre_execute()
+
+        Use cases:
+        - Add custom validation rules
+        - Enrich context with additional data
+        - Log to external systems
+        - Apply customer-specific business rules
+
+        Args:
+            context: TaskContext with inputs
+
+        Returns:
+            Modified TaskContext (can add to context.parameters)
+        """
+        # Example: Add custom validation
+        print("Running custom pre-execute validation...")
+
+        # Example: Validate required datasets
+        if not context.dataset_objects:
+            raise ValueError("No dataset objects configured")
+
+        # Example: Add custom state via parameters
+        context.parameters['custom_validated'] = True
+        context.parameters['customer_prefix'] = "ACME_"
+
+        # Example: Log to external system (pseudo-code)
+        # audit_logger.log("Crosswalk task starting", entity=context.entity)
+
+        print(f"Custom pre-execute complete for entity: {context.entity}")
+
+        # Must return context
+        return context
+
+    def post_execute(self, context: TaskContext, result: TaskResult) -> TaskResult:
+        """
+        Custom POST phase.
+
+        Mode behavior:
+            - Replace (default): Runs INSTEAD of default post_execute()
+            - Extend: Runs AFTER default post_execute()
+
+        Use cases:
+        - Send notifications (email, Slack, etc.)
+        - Write to external audit systems
+        - Transform results for downstream systems
+        - Add custom metadata
+
+        Args:
+            context: TaskContext with state
+            result: TaskResult from execute phase
+
+        Returns:
+            Modified TaskResult
+        """
+        # Example: Add custom metadata to result
+        result.metrics['customer_id'] = context.parameters.get('customer_id', 'unknown')
+        result.metrics['processed_by'] = 'ACME_OVERRIDE'
+
+        # Example: Send notification (pseudo-code)
+        # if result.is_success:
+        #     send_slack_notification(
+        #         f"Crosswalk complete: {result.metrics.get('unique_masters', 0)} masters"
+        #     )
+
+        # Example: Log to external audit system
+        print(f"Custom post-execute: Crosswalk created with {result.metrics.get('unique_masters', 0)} masters")
+
+        # Example: Add custom artifact
+        result.artifacts['audit_timestamp'] = str(context.parameters.get('start_time', ''))
+
+        # Must return result
+        return result
+
+
+# ============================================================
+# EXAMPLE: EXTEND MODE
+# ============================================================
+# If you want your methods to run IN ADDITION to the default
+# (not replace them), use extend mode like this:
+#
+# class ProcessCrosswalkExtended:
+#     extend_pre_execute = True   # Default runs first, then this
+#     extend_post_execute = True  # Default runs first, then this
+#
+#     def pre_execute(self, context: TaskContext) -> TaskContext:
+#         # This runs AFTER the default pre_execute
+#         print("Additional enrichment after default pre_execute")
+#         context.parameters['enriched_by'] = 'customer_override'
+#         return context
+#
+#     def post_execute(self, context: TaskContext, result: TaskResult) -> TaskResult:
+#         # This runs AFTER the default post_execute
+#         print("Additional processing after default post_execute")
+#         result.metrics['custom_flag'] = True
+#         return result
+# ============================================================

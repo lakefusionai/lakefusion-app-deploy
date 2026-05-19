@@ -1,0 +1,54 @@
+name: lakefusion-app
+
+# Allow Authorization header to pass through for API routes
+auth:
+  unauthenticated_paths:
+    - /api/*
+
+command:
+  - "uvicorn"
+  - "app.main:app"
+  - "--host"
+  - "0.0.0.0"
+  - "--port"
+  - "8000"
+
+resources:
+  - name: lakefusion-db
+    type: database
+    database: lakefusion_transactional_db
+    permission: CAN_CONNECT_AND_CREATE
+
+env:
+  - name: SERVICE_NAME
+    value: LakeFusionApp
+  - name: DB_TYPE
+    value: "lakebase"
+  - name: DEPLOYMENT_ENV
+    value: "production"
+  - name: DATABRICKS_DATABASE_INSTANCE
+    value: lakefusion-db
+  - name: DATABRICKS_DATABASE_NAME
+    value: lakefusion_transactional_db
+  - name: DATABRICKS_DATABASE_PORT
+    value: "5432"
+  - name: PGPORT
+    value: "5432"
+  - name: PGDATABASE
+    value: lakefusion_transactional_db
+  - name: DB_POOL_SIZE
+    value: "10"
+  - name: DB_MAX_OVERFLOW
+    value: "20"
+  - name: DB_POOL_TIMEOUT
+    value: "60"
+  - name: DB_POOL_RECYCLE
+    value: "1200"
+  - name: RUN_DBX_PIPELINE_ARTIFACTS_IMPORT
+    value: "True"
+  - name: DATABRICKS_OIDC_CLIENT_ID
+    valueFrom: DATABRICKS_OIDC_CLIENT_ID
+  - name: DATABRICKS_OIDC_CLIENT_SECRET
+    valueFrom: DATABRICKS_OIDC_CLIENT_SECRET
+  - name: LAKEFUSION_DATABRICKS_DAPI
+    valueFrom: LAKEFUSION_DATABRICKS_DAPI

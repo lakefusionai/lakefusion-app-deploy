@@ -1,0 +1,272 @@
+# Alembic Database Migrations Usage Guide
+
+This document explains how Alembic is integrated with the LakeFusion Cron Service, how migrations are created, tested, and safely deployed across DEV, QA, UAT and PROD.
+
+---
+
+## 1) Overview
+
+This project uses **Alembic** for database schema migrations, integrated with **FastAPI’s lifespan** so **PROD always boots with the latest schema**.
+
+### Key Enhancements
+- Safe startup via FastAPI lifespan hook.
+- Idempotent Alembic ops (skip if already satisfied).
+- Retry-safe in DEV / ITG / QA / UAT / PROD.
+- Manual DML (DELETE/INSERT/UPDATE) inside revision files when needed.
+- Predictable, repeatable migrations without breaking production data.
+
+---
+
+## 2) Project Setup  
+*(Step 2 and 3 are for contextual understanding only)*
+
+### 2.1 Alembic Setup
+Alembic is already bootstrapped in the lakefusion-cron-service, so no need to set it up again.
+
+Developers do **not** need to run step 2.2 (already done in service repo).
+
+If you want to explore Alembic locally for learning:
+
+```bash
+pip install alembic
+```
+
+### 2.2 Initialise & Configure (already done in repo)
+
+```bash
+alembic init alembic
+```
+
+- Configure alembic.ini (DB URL may be injected in env.py).
+- Import your `Base.metadata` in `env.py`.
+- Patch Alembic ops for idempotency.
+
+---
+
+## 3) Key Files
+
+### 3.1 `env.py` – Idempotent Environment
+- Configures Alembic context.
+- Patches ops like `create_table`, `add_column`, `create_foreign_key`.
+- Prevents duplicate errors on retries or restarts.
+
+### 3.2 `run_migrations.py` – Executor
+- Runs `alembic upgrade head`.
+- Provides a dev downgrade helper for local testing.
+- No auto-rollback (MySQL DDL is autocommit).
+
+### 3.3 `main.py` – FastAPI Integration
+- Runs migrations at app startup (lifespan).
+- Ensures PROD starts with latest schema.
+- Safe to restart repeatedly.
+
+### 3.4 Revision Files
+- Located in `alembic/versions/`.
+- May contain manual DML and schema changes.
+- Downgrade is best-effort only (DEV/QA mainly).
+
+---
+
+## 4) Developer Workflow
+
+### 4.0 Sync Before Creating a Migration
+Always sync and rebase on develop:
+
+```bash
+git checkout develop
+git pull origin develop
+git checkout feature/my-change
+git rebase develop
+```
+
+This ensures migrations are generated on top of the latest DB state.
+
+### 4.2 What if Target Database is NOT Up to Date?
+Check current version:
+
+```bash
+alembic current
+```
+
+Upgrade to latest head:
+
+```bash
+alembic upgrade head
+```
+
+**Rule of Thumb:**  
+Never create a new migration until your local DB is fully upgraded to the latest repo state.
+
+---
+
+### 4.3 Creating a Migration
+
+1. Make schema changes in `lakefusion_utility/models`.
+2. Run:
+
+For schema changes:
+```bash
+alembic revision --autogenerate -m "ddl_changes"
+```
+
+For manual DML:
+```bash
+alembic revision -m "dml_changes"
+```
+
+- Use `--autogenerate` for schema changes (tables, columns, indexes).
+- Use manual revision for data migrations (inserts, updates, backfills).
+- Always review generated migrations before committing.
+- Keep revisions small and focused.
+- Ensure **no accidental drop_table or unsafe alters**.
+
+---
+
+### 4.4 Before Pushing to Git
+Verify locally:
+
+```bash
+alembic upgrade head
+alembic current
+```
+
+`alembic current` must show the latest revision.
+
+---
+
+### 4.5 Handling Multiple Heads and Migration Failure
+
+Check heads:
+
+```bash
+alembic heads
+```
+
+If more than one:
+
+```bash
+alembic merge <revA> <revB> ... -m "Merge heads"
+```
+
+If migration fails:
+- Retry (safe due to idempotent ops).
+- If destructive → restore from backup (see production playbook).
+
+---
+
+### 4.6 Code Review Process
+- Review migrations like any other code.
+- No destructive schema changes unless approved.
+- Only push finalized migrations.
+- Explicitly name constraints/FKs.
+
+---
+
+### 4.7 CI/CD & Environments
+
+| Environment | How to Run | Notes |
+|-------------|------------|-------|
+| DEV | run `run_migrations.py` or app lifespan | can test rollback |
+| ITG / QA | CI/CD → `alembic upgrade head` | ensure idempotency |
+| UAT | same as ITG/QA | validates production rollout |
+| PROD | auto-run via app startup | fail-fast, safe retries |
+
+---
+
+### 4.8 Golden Rules
+- Always rebase before migration creation.
+- Ensure only **one head** (merge if needed).
+- If migrations overlap on same table/objects → manual merge required.
+- Keep migrations small & frequent.
+- Destructive ops require approval.
+- Never push untested migrations.
+
+---
+
+## 5) Production Playbook
+
+### 5.1 Pre-Migration Checklist
+- Review upgrade/downgrade functions.
+- No destructive operations unless approved.
+- Test in staging with prod-like data.
+- Confirm app & DB schema compatibility.
+- Backup DB:
+
+```bash
+mysqldump -u <user> -p <db_name> > backup_<timestamp>.sql
+```
+
+### 5.2 Running in PROD
+- Migrations run automatically at startup.
+- Monitor logs.
+- On success, revision recorded in `alembic_version`.
+
+### 5.3 Rollback / Failure Recovery
+
+**Case A: Retry (safe with idempotent ops)**  
+Just re-run.
+
+**Case B: Safe rollback**
+```bash
+alembic downgrade -1
+```
+
+**Case C: Destructive migration**
+1. Stop bad deployment.
+2. Restore DB from snapshot:
+
+```bash
+mysql -u <user> -p <db_name> < backup_<timestamp>.sql
+```
+
+3. Apply fixed migrations.
+
+### 5.4 Post-Migration Checks
+- `alembic current` matches repo head.
+- Verify schema with models.
+- Run smoke tests on key queries.
+- Monitor logs and performance.
+
+---
+
+## 6) Design Principles
+- No auto-downgrade on failure → manual correction only.
+- Idempotent ops enable safe retries.
+- Manual DML allowed in revisions.
+- Expand & Contract strategy for schema evolution.
+
+---
+
+## 7) Quick Commands
+
+```bash
+# New revision
+alembic revision --autogenerate -m "Describe change"
+
+# Upgrade DB
+alembic upgrade head
+
+# Show current version
+alembic current
+
+# Show heads
+alembic heads
+
+# Merge multiple heads
+alembic merge <revA> <revB> -m "Merge heads"
+
+# Dev-only downgrade
+python -m app.utils.run_migrations dev_downgrade -1
+```
+
+---
+
+## 8) Summary
+- FastAPI lifespan + Alembic keeps PROD in sync automatically.
+- Idempotent ops make retries safe.
+- Developers must upgrade their DB before generating migrations.
+- Revisions combine schema + manual DML.
+- Downgrade is best-effort only (use in lower envs).
+- PROD rollbacks rely on backups, not Alembic.
+- Single-head workflow ensures CI/CD always upgrades safely.
+

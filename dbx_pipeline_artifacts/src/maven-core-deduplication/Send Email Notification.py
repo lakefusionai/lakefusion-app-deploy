@@ -161,7 +161,7 @@ class SendGridEmail:
 
     def __init__(self, api_key):
         self.sg = SendGridAPIClient(api_key)
-        self.sendgrid_from_email = dbutils.secrets.get(scope="lakefusion", key="sendgrid_from_email")
+        self.sendgrid_from_email = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="sendgrid_from_email")
 
     def send_email(self, to_emails, subject, content, content_type):
         # Create a list of To objects for multiple recipients
@@ -240,7 +240,7 @@ html_body = f"""
 
 email_sender = None
 if smtp_type == 'SendGrid':
-    api_key = dbutils.secrets.get(scope="lakefusion", key="sendgrid_api_key")
+    api_key = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="sendgrid_api_key")
     email_sender = SendGridEmail(api_key=api_key)
 
     subject = "Attention Needed: Resolve Critical Entities"

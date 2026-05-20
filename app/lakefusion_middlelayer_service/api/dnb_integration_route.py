@@ -1,15 +1,23 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import SecretScopeService, get_app_sp_token
+from lakefusion_utility.utils.db_config_utility import DBConfigPropertiesService
 from app.lakefusion_middlelayer_service.services.dnb_service import DnbService
-from app.lakefusion_middlelayer_service.utils.app_db import token_required_wrapper
+from app.lakefusion_middlelayer_service.utils.app_db import token_required_wrapper, get_db
 
 app_logger = get_logger(__name__)
 
-SCOPE_NAME = "lakefusion"
+
+def _get_scope_name(db) -> str:
+    """Read secret_scope_name from db_config_properties, default to 'lakefusion'."""
+    try:
+        return DBConfigPropertiesService(db=db).getDBConfigProperties('secret_scope_name', required=False) or 'lakefusion'
+    except Exception:
+        return 'lakefusion'
 
 dnb_router = APIRouter(
     tags=["DNB API"],
@@ -31,7 +39,8 @@ class DnbCredentialsRequest(BaseModel):
 @dnb_router.post("/")
 async def save_dnb_api_key(
     payload: SecretRequest,
-    check: dict = Depends(token_required_wrapper)
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db)
 ):
     """
     Upserts a Dun & Bradstreet (DnB) API key into Databricks Secret Scope.
@@ -48,7 +57,7 @@ async def save_dnb_api_key(
     try:
         secret_service = SecretScopeService(
             token=token,
-            scope_name=SCOPE_NAME
+            scope_name=_get_scope_name(db)
         )
 
         result = secret_service.upsert_secret(
@@ -59,7 +68,7 @@ async def save_dnb_api_key(
         return HttpResponse(
             message=result.get("message", "Secret upserted successfully"),
             data={
-                "scope": SCOPE_NAME,
+                "scope": _get_scope_name(db),
                 "key": payload.config_key
             }
         )
@@ -79,24 +88,19 @@ async def save_dnb_api_key(
 @dnb_router.post("/credentials")
 async def save_dnb_credentials(
     payload: DnbCredentialsRequest,
-    check: dict = Depends(token_required_wrapper)
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db)
 ):
     """
     Saves D&B OAuth2 consumer key and secret into Databricks Secret Scope using DAPI token.
     Grants READ access to all workspace users on the scope.
     """
-    # Prefer the auto-provisioned App Service Principal (DATABRICKS_CLIENT_ID/
-    # DATABRICKS_CLIENT_SECRET injected by Databricks Apps). Falls back to
-    # LAKEFUSION_DATABRICKS_DAPI for local-dev / non-Apps runs.
     token = get_app_sp_token()
-    if not token:
-        app_logger.error("[DNB_API] No App SP credentials and no fallback PAT available")
-        raise HTTPException(status_code=500, detail="Server configuration error: no Databricks credentials available")
 
     try:
         secret_service = SecretScopeService(
             token=token,
-            scope_name=SCOPE_NAME
+            scope_name=_get_scope_name(db)
         )
 
         secret_service.upsert_secret(key="dnb_consumer_key", value=payload.consumer_key)
@@ -106,7 +110,7 @@ async def save_dnb_credentials(
         return HttpResponse(
             message="D&B credentials saved successfully",
             data={
-                "scope": SCOPE_NAME,
+                "scope": _get_scope_name(db),
                 "keys": ["dnb_consumer_key", "dnb_consumer_secret"]
             }
         )

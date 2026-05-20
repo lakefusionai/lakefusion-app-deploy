@@ -10,6 +10,7 @@ differs.
 """
 
 from typing import Sequence, Union
+from datetime import datetime, timezone
 
 from alembic import op
 import sqlalchemy as sa
@@ -112,7 +113,9 @@ def upgrade() -> None:
                         config_label,
                         config_desc,
                         config_category,
-                        config_show
+                        config_show,
+                        updated_by,
+                        updated_at
                     )
                     VALUES
                     (
@@ -122,7 +125,9 @@ def upgrade() -> None:
                         :config_label,
                         :config_desc,
                         :config_category,
-                        :config_show
+                        :config_show,
+                        :updated_by,
+                        :updated_at
                     )
                     """
                 ),
@@ -136,7 +141,9 @@ def upgrade() -> None:
                         "matching and similarity scoring."
                     ),
                     "config_category": "GENERAL",
-                    "config_show": True,
+                    "config_show": 1,
+                    "updated_by": "system",
+                    "updated_at": datetime.now(timezone.utc),
                 }
             )
 
@@ -146,8 +153,15 @@ def upgrade() -> None:
 
         except Exception as e:
 
+            logger.error(
+                f"default_prompt INSERT failed: {type(e).__name__}: {e}"
+            )
             # PostgreSQL requires rollback after failed query
-            conn.rollback()
+            try:
+                conn.rollback()
+                logger.info("conn.rollback() succeeded")
+            except Exception as rb_err:
+                logger.error(f"conn.rollback() failed: {type(rb_err).__name__}: {rb_err}")
 
             logger.info(
                 f"Skipping default_prompt insert "

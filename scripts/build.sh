@@ -342,6 +342,56 @@ async def lifespan(app):
                 db.commit()
                 logger.info("Default config values inserted successfully")
 
+                # Step 3b: Auto-provision secret_scope_name and lakefusion_spn (Databricks Apps)
+                from lakefusion_utility.utils.db_config_utility import DBConfigPropertiesService
+                try:
+                    db_config_service = DBConfigPropertiesService(db=db)
+
+                    # Set secret_scope_name from DATABRICKS_APP_NAME
+                    app_name = os.environ.get('DATABRICKS_APP_NAME', '')
+                    if app_name:
+                        current_scope = db_config_service.getDBConfigProperties('secret_scope_name', required=False) or 'lakefusion'
+                        if current_scope == 'lakefusion' or not current_scope.strip():
+                            db_config_service.update_db_config_property(
+                                config_key="secret_scope_name",
+                                config_value=app_name,
+                                updated_by="system",
+                            )
+                            logger.info(f"Set secret_scope_name to: {app_name}")
+                        else:
+                            logger.info(f"secret_scope_name already set: {current_scope}")
+
+                    # Auto-provision SPN from App SP credentials
+                    app_sp_client_id = os.environ.get('DATABRICKS_CLIENT_ID', '')
+                    app_sp_client_secret = os.environ.get('DATABRICKS_CLIENT_SECRET', '')
+                    if app_sp_client_id and app_sp_client_secret:
+                        existing_spn = db_config_service.getDBConfigProperties('lakefusion_spn', required=False) or ''
+                        if not existing_spn.strip():
+                            import json as _json
+                            db_config_service.update_db_config_property(
+                                config_key="lakefusion_spn",
+                                config_value=app_sp_client_id,
+                                updated_by="system",
+                            )
+                            db_config_service.update_db_config_property(
+                                config_key="lakefusion_spn_secret",
+                                config_value="*" * len(app_sp_client_secret),
+                                extended_values=_json.dumps({"spn_client_secret_length": str(len(app_sp_client_secret))}),
+                                updated_by="system",
+                            )
+                            # Save to Databricks Secret Scope (generate_pat() called inside SecretScopeService)
+                            from lakefusion_utility.utils.databricks_util import SecretScopeService
+                            scope_name = db_config_service.getDBConfigProperties('secret_scope_name', required=False) or 'lakefusion'
+                            secret_service = SecretScopeService(token="", scope_name=scope_name)
+                            secret_service.upsert_secret(key="lakefusion_spn", value=app_sp_client_id)
+                            secret_service.upsert_secret(key="lakefusion_spn_secret", value=app_sp_client_secret)
+                            secret_service.grant_read_acl(principal="users")
+                            logger.info(f"Auto-provisioned SPN to DB + Secret Scope ({scope_name}): {app_sp_client_id}")
+                        else:
+                            logger.info(f"lakefusion_spn already set: {existing_spn}")
+                except Exception as e:
+                    logger.error(f"Error auto-provisioning SPN/scope: {e}")
+
                 # Step 4: Sync Databricks Jobs Versions
                 try:
                     service = Integration_HubService(db=db)
@@ -370,7 +420,7 @@ async def lifespan(app):
                         pt_service.sync_to_volume(token)
                         logger.info("PT config synced to Volume on startup")
                     else:
-                        logger.warning("LAKEFUSION_DATABRICKS_DAPI not set, skipping PT config startup sync")
+                        logger.info("Skipping PT config startup sync (no DAPI token — App SP mode)")
                 except Exception as e:
                     logger.error(f"Error during PT config startup sync: {e}")
 
@@ -511,13 +561,22 @@ if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
     logger.info(f"Static files mounted from {static_dir}")
 
-    # Serve config.js and importmap.json from root (index.html references them as /config.js)
+    # Serve config.js dynamically — populates DATABRICKS_HOST from env at runtime
     @app.get("/config.js", include_in_schema=False)
     async def serve_config():
-        config_file = static_dir / "config.js"
-        if config_file.is_file():
-            return FileResponse(config_file, media_type="application/javascript")
-        return HTMLResponse("// config.js not found", status_code=404)
+        from lakefusion_utility.utils.databricks_host import get_databricks_host
+        databricks_host = get_databricks_host()
+        auth_provider = os.environ.get("AUTH_PROVIDER", "databricks")
+        config_js = f"""window.env = {{
+  DATABRICKS_SERVICE_URL: "/api/databricks/",
+  MIDDLELAYER_SERVICE_URL: "/api/middle-layer/",
+  AUTH_SERVICE_URL: "/api/auth/",
+  AIML_SERVICE_URL: "/api/match-maven/",
+  CRON_SERVICE_URL: "/api/cron/",
+  DATABRICKS_HOST: "{databricks_host}",
+  AUTH_PROVIDER: "{auth_provider}"
+}};"""
+        return HTMLResponse(config_js, media_type="application/javascript")
 
     @app.get("/importmap.json", include_in_schema=False)
     async def serve_importmap():
@@ -802,8 +861,6 @@ env:
     valueFrom: DATABRICKS_OIDC_CLIENT_ID
   - name: DATABRICKS_OIDC_CLIENT_SECRET
     valueFrom: DATABRICKS_OIDC_CLIENT_SECRET
-  - name: LAKEFUSION_DATABRICKS_DAPI
-    valueFrom: LAKEFUSION_DATABRICKS_DAPI
 YAMLEOF
 
 # ── Step 11: Build and assemble UI portals ──────────────────────────────────

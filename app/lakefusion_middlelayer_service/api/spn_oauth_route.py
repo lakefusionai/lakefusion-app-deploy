@@ -1,14 +1,21 @@
 import os
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import SecretScopeService, get_app_sp_token
-from app.lakefusion_middlelayer_service.utils.app_db import token_required_wrapper
+from lakefusion_utility.utils.db_config_utility import DBConfigPropertiesService
+from app.lakefusion_middlelayer_service.utils.app_db import token_required_wrapper, get_db
 
 app_logger = get_logger(__name__)
 
-SCOPE_NAME = "lakefusion"
+def _get_scope_name(db) -> str:
+    """Read secret_scope_name from db_config_properties, default to 'lakefusion'."""
+    try:
+        return DBConfigPropertiesService(db=db).getDBConfigProperties('secret_scope_name', required=False) or 'lakefusion'
+    except Exception:
+        return 'lakefusion'
 # Use the shared helper so the https:// prefix is always present.
 from lakefusion_utility.utils.databricks_host import get_databricks_host
 DATABRICKS_HOST = get_databricks_host() or "https://databricks.com"
@@ -26,25 +33,21 @@ class SpnCredentialsRequest(BaseModel):
 @spn_router.post("/credentials")
 async def save_spn_credentials(
     payload: SpnCredentialsRequest,
-    check: dict = Depends(token_required_wrapper)
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db)
 ):
     """
-    Saves Service Principal OAuth credentials into Databricks Secret Scope using DAPI token.
+    Saves Service Principal OAuth credentials into Databricks Secret Scope.
     These credentials are used for all workflow OAuth flows including Vector Search optimized route.
     Grants READ access to all workspace users on the scope.
     """
-    # Prefer the auto-provisioned App Service Principal (DATABRICKS_CLIENT_ID/
-    # DATABRICKS_CLIENT_SECRET injected by Databricks Apps). Falls back to
-    # LAKEFUSION_DATABRICKS_DAPI for local-dev / non-Apps runs.
     token = get_app_sp_token()
-    if not token:
-        app_logger.error("[SPN_API] No App SP credentials and no fallback PAT available")
-        raise HTTPException(status_code=500, detail="Server configuration error: no Databricks credentials available")
 
     try:
+        scope_name = _get_scope_name(db)
         secret_service = SecretScopeService(
             token=token,
-            scope_name=SCOPE_NAME
+            scope_name=scope_name
         )
 
         secret_service.upsert_secret(key="lakefusion_spn", value=payload.client_id)

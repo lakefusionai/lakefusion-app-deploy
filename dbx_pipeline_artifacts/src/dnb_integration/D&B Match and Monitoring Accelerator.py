@@ -189,8 +189,8 @@ df_master = df_master_new.select(*columns_expr)
 # COMMAND ----------
 
 # DBTITLE 1,Load D&B API credentials from Databricks secrets
-API_KEY = dbutils.secrets.get(scope="lakefusion", key="dnb_consumer_key")
-API_SECRET = dbutils.secrets.get(scope="lakefusion", key="dnb_consumer_secret")
+API_KEY = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="dnb_consumer_key")
+API_SECRET = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="dnb_consumer_secret")
 
 # COMMAND ----------
 

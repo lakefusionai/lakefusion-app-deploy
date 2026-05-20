@@ -15,8 +15,8 @@ if 'logger' not in dir():
 _spn_client_id = None
 _spn_client_secret = None
 try:
-    _spn_client_id = dbutils.secrets.get(scope="lakefusion", key="lakefusion_spn")
-    _spn_client_secret = dbutils.secrets.get(scope="lakefusion", key="lakefusion_spn_secret")
+    _spn_client_id = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="lakefusion_spn")
+    _spn_client_secret = dbutils.secrets.get(scope=SECRET_SCOPE_NAME, key="lakefusion_spn_secret")
     if _spn_client_id and _spn_client_secret:
         logger.info("Service Principal credentials loaded -- using network-optimized route")
     else:

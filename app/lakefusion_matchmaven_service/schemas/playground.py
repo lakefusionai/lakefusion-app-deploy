@@ -1,7 +1,7 @@
 """Pydantic schemas for Match Maven Playground API."""
 
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -140,3 +140,48 @@ class ExecuteCompareResponse(BaseModel):
     total_tokens: Optional[int] = Field(None, description="Total tokens used")
     reasoning_tokens: Optional[int] = Field(None, description="Number of reasoning/thinking tokens (for models like Gemini)")
     config_used: Optional[dict] = Field(None, description="Actual config params sent to the LLM endpoint (temperature, max_tokens, reasoning_effort)")
+
+
+# =============================================================================
+# Rules Compare — Request / Response Models
+# =============================================================================
+
+class ConditionEvaluation(BaseModel):
+    attribute: str
+    match_type: str
+    function: Optional[str] = None
+    operator: Optional[str] = None
+    threshold: Optional[float] = None
+    allow_nulls: bool = False
+    query_value: Optional[Any] = None
+    master_value: Optional[Any] = None
+    score: Optional[float] = None
+    passed: bool
+
+
+class RuleEvaluation(BaseModel):
+    name: str
+    matched: bool
+    applied: bool
+    action_on_match: str
+    logical_operator: str = "AND"
+    conditions_evaluation: List[ConditionEvaluation]
+
+
+class RecordComparison(BaseModel):
+    id: str
+    overall_result: str
+    applied_rule: Optional[str] = None
+    rules_evaluation: List[RuleEvaluation]
+
+
+class ExecuteRulesCompareRequest(BaseModel):
+    query_record: Dict[str, Any] = Field(..., description="Query/source record attributes")
+    master_records: List[Dict[str, Any]] = Field(..., description="Master/candidate records to compare against")
+    rules: List[Dict[str, Any]] = Field(..., description="Deterministic rule configurations")
+    warehouse_id: Optional[str] = Field(None, description="Unused — kept for backwards compatibility")
+
+
+class ExecuteRulesCompareResponse(BaseModel):
+    comparisons: List[RecordComparison]
+    elapsed_ms: float

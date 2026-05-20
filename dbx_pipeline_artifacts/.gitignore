@@ -169,3 +169,7 @@ cython_debug/
 # Local models
 */tinyroberta
 .databricks
+
+# Include core engine wheel
+!wheel/
+!wheel/*.whl

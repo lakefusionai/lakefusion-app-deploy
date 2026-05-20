@@ -118,6 +118,25 @@ cp -R "$REPO_ROOT/dbx_pipeline_artifacts" "$OUT/dbx_pipeline_artifacts"
 find "$OUT/dbx_pipeline_artifacts" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
 find "$OUT/dbx_pipeline_artifacts" -name "*.pyc" -delete 2>/dev/null || true
 
+# ── Step 3c-ii: Build lakefusion_core_engine wheel for notebook pipelines ──
+info "Building lakefusion_core_engine wheel"
+CORE_ENGINE_DIR="$REPO_ROOT/lakefusion_core_engine"
+if [[ -d "$CORE_ENGINE_DIR" ]]; then
+    mkdir -p "$OUT/dbx_pipeline_artifacts/wheel"
+    (
+        cd "$CORE_ENGINE_DIR"
+        python3 -m pip wheel --no-deps --wheel-dir "$OUT/dbx_pipeline_artifacts/wheel" . 2>&1 | tail -3
+    )
+    CE_WHEEL=$(ls "$OUT/dbx_pipeline_artifacts/wheel"/lakefusion_core_engine-*.whl 2>/dev/null | head -1)
+    if [[ -n "$CE_WHEEL" ]]; then
+        info "Built core engine wheel: $(basename "$CE_WHEEL")"
+    else
+        warn "Failed to build lakefusion_core_engine wheel"
+    fi
+else
+    warn "lakefusion_core_engine directory not found — skipping wheel build"
+fi
+
 # ── Step 3d: Copy deployment utilities ───────────────────────────────────────
 if [[ -d "$REPO_ROOT/utilities" ]]; then
     info "Copying utilities → deployments/"

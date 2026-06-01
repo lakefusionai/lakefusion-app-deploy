@@ -55,10 +55,14 @@ if experiment_id:
 # Related tables
 merge_activities_table = f"{master_table}_merge_activities"
 attribute_version_sources_table = f"{master_table}_attribute_version_sources"
+unified_table = f"{catalog_name}.silver.{entity}_unified"
+if experiment_id:
+    unified_table += f"_{experiment_id}"
 
 # COMMAND ----------
 
 id_key = 'lakefusion_id'
+unified_id_key = 'surrogate_key'
 
 # COMMAND ----------
 
@@ -185,8 +189,86 @@ for merged_id, (immediate_survivor, action_type, created_at) in merge_info.items
             'immediate_survivor': immediate_survivor,
             'action_type': action_type,
             'is_transitive': is_transitive,
-            'merge_depth': len(path) - 1
+            'merge_depth': len(path) - 1,
+            'merge_remaining': -1,
+            'merge_total': -1,
         })
+
+# --- Merge Health Check ---
+# For each merged master, check how many of its source records are still
+# assigned to the survivor in the unified table.
+if merged_records_data:
+    logger.info("\n" + "="*80)
+    logger.info("STEP 3.5: MERGE HEALTH CHECK")
+    logger.info("="*80)
+
+    pre_health_schema = StructType([
+        StructField('ultimate_survivor', StringType(), True),
+        StructField('merged_record', StringType(), True),
+    ])
+    pre_health_data = [
+        {'ultimate_survivor': r['ultimate_survivor'], 'merged_record': r['merged_record']}
+        for r in merged_records_data
+    ]
+    df_pre_health = spark.createDataFrame(pre_health_data, pre_health_schema)
+    df_pre_health.createOrReplaceTempView("merged_health_temp")
+
+    health_query = f"""
+    WITH source_records AS (
+        SELECT
+            ma.master_id AS merged_master,
+            ma.match_id  AS source_sk,
+            mh.ultimate_survivor
+        FROM {merge_activities_table} ma
+        INNER JOIN merged_health_temp mh
+            ON ma.master_id = mh.merged_record
+        WHERE ma.action_type IN ('JOB_INSERT','JOB_MERGE','MANUAL_MERGE','INITIAL_LOAD')
+          AND ma.match_id LIKE 'sk_%'
+    )
+    SELECT
+        sr.merged_master,
+        sr.ultimate_survivor,
+        COUNT(DISTINCT sr.source_sk) AS total_source_records,
+        COUNT(DISTINCT CASE
+            WHEN u.master_{id_key} = sr.ultimate_survivor
+             AND u.record_status != 'DELETED'
+            THEN sr.source_sk
+        END) AS remaining_count
+    FROM source_records sr
+    LEFT JOIN {unified_table} u
+        ON u.{unified_id_key} = sr.source_sk
+    GROUP BY sr.merged_master, sr.ultimate_survivor
+    """
+
+    health_results = spark.sql(health_query).collect()
+    health_map = {
+        row['merged_master']: (row['remaining_count'], row['total_source_records'])
+        for row in health_results
+    }
+
+    filtered_data = []
+    removed_count = 0
+    partial_count = 0
+    for record in merged_records_data:
+        merged_id = record['merged_record']
+        remaining, total = health_map.get(merged_id, (None, None))
+
+        if remaining is not None and remaining == 0 and total > 0:
+            removed_count += 1
+            continue
+        elif remaining is not None and total is not None and 0 < remaining < total:
+            record['action_type'] = 'MASTER_PARTIAL_MERGE'
+            record['merge_remaining'] = remaining
+            record['merge_total'] = total
+            partial_count += 1
+        else:
+            record['merge_remaining'] = remaining if remaining is not None else -1
+            record['merge_total'] = total if total is not None else -1
+
+        filtered_data.append(record)
+
+    merged_records_data = filtered_data
+    logger.info(f"  Health check complete: {removed_count} fully unmerged (removed), {partial_count} partially merged")
 
 schema = StructType([
     StructField('ultimate_survivor', StringType(), True),
@@ -194,7 +276,9 @@ schema = StructType([
     StructField('immediate_survivor', StringType(), True),
     StructField('action_type', StringType(), True),
     StructField('is_transitive', BooleanType(), True),
-    StructField('merge_depth', IntegerType(), True)
+    StructField('merge_depth', IntegerType(), True),
+    StructField('merge_remaining', IntegerType(), True),
+    StructField('merge_total', IntegerType(), True),
 ])
 
 df_merged_records = spark.createDataFrame(merged_records_data, schema)
@@ -319,6 +403,8 @@ WITH merged_with_scores AS (
         mr.action_type,
         mr.is_transitive,
         mr.merge_depth,
+        mr.merge_remaining,
+        mr.merge_total,
         bms.best_match_score,
         bms.best_match_reason,
         bms.matched_with,
@@ -362,7 +448,9 @@ SELECT
         WHEN action_type = 'MASTER_JOB_MERGE' THEN
             'Masters merged automatically (high confidence match)'
         ELSE 'Merged'
-    END as display_reason
+    END as display_reason,
+    merge_remaining,
+    merge_total
 FROM merged_with_scores
 """
 
@@ -409,7 +497,9 @@ SELECT DISTINCT
     pu.match_{id_key} as master2_{id_key},
     pu.exploded_result.score as score,
     pu.exploded_result.reason as reason,
-    'PENDING' as merge_status
+    'PENDING' as merge_status,
+    CAST(NULL AS STRING) as merge_remaining,
+    CAST(NULL AS STRING) as merge_total
 FROM {processed_unified_dedup_table} pu
 -- Both query and match must be active masters
 INNER JOIN active_masters am1 ON pu.query_{id_key} = am1.{id_key}
@@ -432,7 +522,9 @@ SELECT
     CASE
         WHEN action_type IS NOT NULL THEN action_type
         ELSE 'MERGED'
-    END as merge_status
+    END as merge_status,
+    CAST(merge_remaining AS STRING) as merge_remaining,
+    CAST(merge_total AS STRING) as merge_total
     FROM final_merged_temp
 """
 
@@ -548,6 +640,8 @@ SELECT
     r.score,
     r.reason,
     r.merge_status,
+    r.merge_remaining,
+    r.merge_total,
     md2.{id_key},
     {', '.join([f'md2.{attr}' for attr in entity_attributes])},
     COALESCE(md2.attributes_combined, '') as attributes_combined
@@ -575,6 +669,8 @@ named_struct_parts.extend([
     "'__reason__', reason",
     f"'{id_key}', {id_key}",
     "'__mergestatus__', merge_status",
+    "'__merge_remaining__', merge_remaining",
+    "'__merge_total__', merge_total",
     "'__attributes_combined__', attributes_combined"
 ])
 

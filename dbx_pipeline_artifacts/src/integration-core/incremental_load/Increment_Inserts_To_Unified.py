@@ -517,8 +517,24 @@ for source_table in tables_with_inserts:
         df_transformed = df_transformed.withColumn(col_name, lit(None).cast(spark_dtype))
     
     # Select columns in entity_attributes order (excluding lakefusion_id for now)
+    # AND re-cast every attribute to its entity-declared dtype. This is the
+    # belt-and-suspenders fix for the unionByName cast bug: unionByName takes
+    # the schema of the FIRST DataFrame in the union and silently tries to
+    # cast every subsequent frame's columns to those types. If source A has
+    # SourceID as INT (e.g. Factorsoft) and source B has it as STRING, the
+    # implicit STRING -> INT cast on B will fail for any non-numeric value.
+    # Pinning every per-source frame to entity_attributes_datatype here
+    # makes all frames structurally identical so unionByName has nothing
+    # to coerce. We pass the SQL dtype string directly to .cast() (same
+    # pattern as the missing-columns block above), which avoids depending
+    # on a helper that may not be in scope.
     final_columns = [col_name for col_name in entity_attributes if col_name != "lakefusion_id"]
-    df_transformed = df_transformed.select(*final_columns, "_source_pk_value")
+    final_select_exprs = []
+    for col_name in final_columns:
+        target_dtype_str = entity_attributes_datatype.get(col_name, "string").lower().strip()
+        final_select_exprs.append(col(col_name).cast(target_dtype_str).alias(col_name))
+    final_select_exprs.append(col("_source_pk_value"))
+    df_transformed = df_transformed.select(*final_select_exprs)
     
     logger.info(f" Transformed to unified schema with {len(final_columns)} columns")
     

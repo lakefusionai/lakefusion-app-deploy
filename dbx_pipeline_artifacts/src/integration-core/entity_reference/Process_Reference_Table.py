@@ -1,4 +1,9 @@
 # Databricks notebook source
+# MAGIC %pip install --upgrade "databricks-sdk>=0.89.0" psycopg2-binary
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 # MAGIC %run ../../utils/execute_utils
 
 # COMMAND ----------
@@ -16,6 +21,9 @@ dbutils.widgets.text("entity_reference_config", "", "entity_reference_config")
 dbutils.widgets.text("primary_key", "", "merge key")
 dbutils.widgets.text("attributes_mapping", "", "attributes_mapping")
 dbutils.widgets.text("write_mode", "delta", "Write Mode (delta/lakebase)")
+dbutils.widgets.text("lakebase_instance_id", "", "lakebase_instance_id")
+dbutils.widgets.text("lakebase_branch_id", "", "lakebase_branch_id")
+dbutils.widgets.text("lakebase_endpoint_id", "", "lakebase_endpoint_id")
 
 # COMMAND ----------
 
@@ -28,6 +36,9 @@ entity_reference_config = dbutils.widgets.get("entity_reference_config")
 attributes_mapping = dbutils.widgets.get("attributes_mapping")
 primary_key = dbutils.widgets.get("primary_key")
 write_mode = dbutils.widgets.get("write_mode")
+lakebase_instance_id = dbutils.widgets.get("lakebase_instance_id")
+lakebase_branch_id = dbutils.widgets.get("lakebase_branch_id")
+lakebase_endpoint_id = dbutils.widgets.get("lakebase_endpoint_id")
 
 # COMMAND ----------
 
@@ -38,19 +49,23 @@ entity_reference_config = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Mode
 merge_key = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="primary_key", debugValue=primary_key)
 attributes_mapping = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="attributes_mapping", debugValue=attributes_mapping)
 
+
+# COMMAND ----------
+
+from lakefusion_core_engine.write_ops import create_write_ops,WriteMode
+lakebase_params = {                                # becomes PG schema name
+    "lakebase_instance_id": lakebase_instance_id,  # project display_name
+    "lakebase_branch_id": lakebase_branch_id,        # default
+    "lakebase_endpoint_id": lakebase_endpoint_id,         # default
+    "lakebase_database": entity,
+}
+ 
+write_ops = create_write_ops(mode=write_mode, spark=spark, params=lakebase_params)
+
 # COMMAND ----------
 
 entity_attributes_datatype = json.loads(entity_attributes_datatype)
 attributes_mapping = json.loads(attributes_mapping)
-from lakefusion_core_engine.write_ops import create_write_ops
-
-write_ops = create_write_ops(mode=write_mode, spark=spark, params={
-    "entity": entity,
-    "lakebase_instance_id": dbutils.widgets.get("lakebase_instance_id") if write_mode == "lakebase" else "",
-    "lakebase_branch_id": dbutils.widgets.get("lakebase_branch_id") if write_mode == "lakebase" else "",
-    "lakebase_database": dbutils.widgets.get("lakebase_database_name") if write_mode == "lakebase" else "",
-})
-logger.info(f"WriteOperations initialized: mode={write_mode}")
 
 # COMMAND ----------
 
@@ -60,6 +75,7 @@ generate_ref_key_udf = udf(
     lambda source_path, source_id: generate_ref_key(source_path, str(source_id)), 
     StringType()
 )
+
 # COMMAND ----------
 
 from pyspark.sql import functions as F
@@ -77,22 +93,11 @@ RUN_ID=RUN_ID.replace('-','_')
 NOW=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ── MASTER + AUDIT HELPERS ───────────────────────────────────────────────────
-# All reference-table writes go through these helpers. Each call moves master
-# and audit in lockstep:
-#   - master ({entity}_reference_prod) holds business columns only — current
-#     state, one row per ref_lakefusion_id.
-#   - audit  ({entity}_reference_audit_prod) is append-only SCD-2 history with
-#     valid_from / valid_to / is_current / version / source plus full
-#     steward/provenance fields.
-# Readers wanting "current state" hit master directly; readers wanting history
-# or any provenance hit audit (joined on ref_lakefusion_id).
-
 def _audit_steward_lock_lookup(delta_audit, ref_ids_df):
     """Read steward_locked from the current audit row per ref so job-created
     versions inherit it. Returns DF: (ref_lakefusion_id, _locked_carry)."""
     return (
-        delta_audit.toDF()
+        delta_audit
         .filter(F.col("is_current") == F.lit(True))
         .join(ref_ids_df.select("ref_lakefusion_id").distinct(), on="ref_lakefusion_id", how="inner")
         .select(
@@ -108,48 +113,39 @@ def _audit_next_version_lookup(delta_audit, ref_ids_df):
     a burned number. Refs not yet in audit are absent from the result —
     callers coalesce to 1 for brand-new ids."""
     return (
-        delta_audit.toDF()
+        delta_audit
         .join(ref_ids_df.select("ref_lakefusion_id").distinct(), on="ref_lakefusion_id", how="inner")
         .groupBy("ref_lakefusion_id")
         .agg((F.max("version") + F.lit(1)).alias("_next_version"))
     )
 
 
-def _master_upsert(delta_master, src_df, biz_cols):
-    """UPSERT (ref_lakefusion_id + biz_cols) into the master table via Delta
-    MERGE keyed on ref_lakefusion_id."""
-    set_clause = {c: f"src.{c}" for c in (["ref_lakefusion_id"] + biz_cols)}
-    (
-        delta_master.alias("tgt")
-        .merge(
-            src_df.select("ref_lakefusion_id", *biz_cols).alias("src"),
-            "tgt.ref_lakefusion_id = src.ref_lakefusion_id",
-        )
-        .whenMatchedUpdate(set=set_clause)
-        .whenNotMatchedInsert(values=set_clause)
-        .execute()
+def _master_upsert(src_df, biz_cols):
+    """UPSERT (ref_lakefusion_id + biz_cols) into master keyed on ref_lakefusion_id."""
+    write_ops.merge(
+        src_df.select("ref_lakefusion_id", *biz_cols),
+        MASTER_TABLE,
+        merge_keys=["ref_lakefusion_id"],
     )
 
 
-def _audit_expire_current(delta_audit, ref_ids_df):
+def _audit_expire_current(ref_ids_df):
     """Flip the current audit row(s) for these ref_ids → is_current=FALSE,
     valid_to=now. action_type stays as-is so the row preserves its original
     creation reason."""
-    (
-        delta_audit.alias("tgt")
-        .merge(
-            ref_ids_df.select("ref_lakefusion_id").distinct().alias("src"),
-            "tgt.ref_lakefusion_id = src.ref_lakefusion_id AND tgt.is_current = TRUE",
-        )
-        .whenMatchedUpdate(set={
-            "is_current": F.lit(False),
-            "valid_to":   F.current_timestamp(),
-        })
-        .execute()
+    write_ops.update_by_keys(
+        ref_ids_df,
+        AUDIT_TABLE,
+        key_columns=["ref_lakefusion_id"],
+        set_expressions={
+            "is_current": "FALSE",
+            "valid_to":   "CURRENT_TIMESTAMP",
+        },
+        extra_predicate="is_current = TRUE",
     )
 
 
-def _scd2_expire_and_insert(delta_master, delta_audit, src_df, biz_cols, action_type):
+def _scd2_expire_and_insert(delta_audit, src_df, biz_cols, action_type):
     """Job-driven update path. For each ref_id in src_df:
       1. Flip the prior current audit row → is_current=FALSE.
       2. Compute next version + carry steward_locked from prior audit row.
@@ -157,7 +153,7 @@ def _scd2_expire_and_insert(delta_master, delta_audit, src_df, biz_cols, action_
       4. Append a new audit row (is_current=TRUE) with full provenance.
     """
     # Step 1 — flip prior current audit row(s)
-    _audit_expire_current(delta_audit, src_df)
+    _audit_expire_current(src_df)
 
     # Step 2 — carry steward_locked + next version from audit
     locked_carry  = _audit_steward_lock_lookup(delta_audit, src_df)
@@ -172,7 +168,7 @@ def _scd2_expire_and_insert(delta_master, delta_audit, src_df, biz_cols, action_
     )
 
     # Step 3 — UPSERT master with the new biz values
-    _master_upsert(delta_master, enriched, biz_cols)
+    _master_upsert(enriched, biz_cols)
 
     # Step 4 — append the new audit version with provenance
     new_versions = (
@@ -184,16 +180,16 @@ def _scd2_expire_and_insert(delta_master, delta_audit, src_df, biz_cols, action_
         .withColumn("steward_edited_cols", F.lit(None).cast("array<string>"))
         .withColumn("steward_edited_by",   F.lit(None).cast("string"))
     )
-    new_versions.write.format("delta").mode("append").saveAsTable(AUDIT_TABLE)
+    write_ops.append(new_versions, AUDIT_TABLE)
 
 
-def _scd2_insert_new(delta_master, src_df, biz_cols, action_type):
+def _scd2_insert_new(src_df, biz_cols, action_type):
     """Brand-new ref_lakefusion_ids — INSERT into master + append v1 to audit.
     No prior audit version, so steward_locked defaults to FALSE."""
     enriched = src_df.select("ref_lakefusion_id", "source", *biz_cols)
 
     # Master insert — using UPSERT for safety in case of rare re-runs.
-    _master_upsert(delta_master, enriched, biz_cols)
+    _master_upsert(enriched, biz_cols)
 
     # Audit v1 row
     new_rows = (
@@ -207,10 +203,10 @@ def _scd2_insert_new(delta_master, src_df, biz_cols, action_type):
         .withColumn("steward_edited_cols", F.lit(None).cast("array<string>"))
         .withColumn("steward_edited_by",   F.lit(None).cast("string"))
     )
-    new_rows.write.format("delta").mode("append").saveAsTable(AUDIT_TABLE)
+    write_ops.append(new_rows, AUDIT_TABLE)
 
 
-def _scd2_expire(delta_master, delta_audit, keys_df, action_type="DELETE_EXPIRED"):
+def _scd2_expire(delta_audit, keys_df, action_type="DELETE_EXPIRED"):
     """Deletion path. For each ref_id in keys_df:
       1. Snapshot the prior current audit row (we'll mirror its biz values
          onto the tombstone so audit shows what the row looked like).
@@ -222,24 +218,19 @@ def _scd2_expire(delta_master, delta_audit, keys_df, action_type="DELETE_EXPIRED
     keys_only = keys_df.select("ref_lakefusion_id").distinct()
 
     # Step 1 — snapshot current audit rows BEFORE the expire flips them.
-    audit_cols = spark.table(AUDIT_TABLE).columns
+    audit_cols =spark.read.table(AUDIT_TABLE).columns
     current_snapshot = (
-        delta_audit.toDF()
+        delta_audit
         .filter(F.col("is_current") == F.lit(True))
         .join(keys_only, on="ref_lakefusion_id", how="inner")
     ).cache()
-    current_snapshot.count()  # force materialisation before MERGE
+    current_snapshot.count()  # force materialisation before mutating audit
 
     # Step 2 — flip prior current
-    _audit_expire_current(delta_audit, keys_only)
+    _audit_expire_current(keys_only)
 
     # Step 3 — DELETE from master
-    (
-        delta_master.alias("tgt")
-        .merge(keys_only.alias("src"), "tgt.ref_lakefusion_id = src.ref_lakefusion_id")
-        .whenMatchedDelete()
-        .execute()
-    )
+    write_ops.delete_by_keys(keys_only, MASTER_TABLE, key_columns=["ref_lakefusion_id"])
 
     # Step 4 — tombstone audit row, biz cols carried from prior current.
     tombstone = (
@@ -253,7 +244,7 @@ def _scd2_expire(delta_master, delta_audit, keys_df, action_type="DELETE_EXPIRED
         .withColumn("steward_edited_by",   F.lit(None).cast("string"))
         .select(*audit_cols)
     )
-    tombstone.write.format("delta").mode("append").saveAsTable(AUDIT_TABLE)
+    write_ops.append(tombstone, AUDIT_TABLE)
     current_snapshot.unpersist()
 
 
@@ -309,8 +300,8 @@ MASTER_TABLE = f"{catalog_name}.gold.{entity}_reference_prod"
 AUDIT_TABLE  = f"{catalog_name}.gold.{entity}_reference_audit_prod"
 QUEUE_TABLE  = f"{catalog_name}.gold.{entity}_reference_conflict_queue_prod"
 
-target_master = spark.table(MASTER_TABLE)
-target_audit  = spark.table(AUDIT_TABLE)
+target_master = spark.read.table(MASTER_TABLE)
+target_audit  = spark.read.table(AUDIT_TABLE)
 
 # COMMAND ----------
 
@@ -323,8 +314,8 @@ matched = source.join(target_master.select("ref_lakefusion_id"), on="ref_lakefus
 
 def handle_match(config, matched_df, target_master_df, run_id, now):
     strategy = config["on_match"]
-    delta_master = DeltaTable.forName(spark, MASTER_TABLE)
-    delta_audit  = DeltaTable.forName(spark, AUDIT_TABLE)
+    # delta_audit only used for READS in the lookup helpers; writes go through write_ops.
+    delta_audit = spark.read.table(AUDIT_TABLE)
     # Business cols = everything that isn't the surrogate or the business PK
     biz_cols = [c for c in entity_attributes]
 
@@ -354,7 +345,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
 
     # steward_locked / steward_edited_by live on audit (current rows only).
     audit_current_meta = (
-        spark.table(AUDIT_TABLE)
+        spark.read.table(AUDIT_TABLE)
         .filter(F.col("is_current") == F.lit(True))
         .select("ref_lakefusion_id", "steward_locked", "steward_edited_by")
     )
@@ -380,7 +371,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
             # Job update: UPSERT master + flip-current+append in audit. Each
             # new audit row gets action_type='JOB_MERGE' and inherits the
             # prior version's steward_locked value.
-            _scd2_expire_and_insert(delta_master, delta_audit, matched_snap, biz_cols, action_type="JOB_MERGE")
+            _scd2_expire_and_insert(delta_audit, matched_snap, biz_cols, action_type="JOB_MERGE")
             print(
                 f"[on_match=source_wins] Versioned {matched_count} rows "
                 f"(UPSERT master + new audit versions)"
@@ -391,7 +382,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
             unlocked_count = unlocked.count()
             # Apply only to unlocked refs — locked rows keep their current
             # version untouched on both master and audit.
-            _scd2_expire_and_insert(delta_master, delta_audit, unlocked, biz_cols, action_type="JOB_MERGE")
+            _scd2_expire_and_insert(delta_audit, unlocked, biz_cols, action_type="JOB_MERGE")
             skipped = matched_count - unlocked_count
             print(
                 f"[on_match=steward_wins] Versioned {unlocked_count} rows "
@@ -401,7 +392,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
         elif strategy == "flag_for_review":
             # ── Already-pending conflicts (dedup by ref_lakefusion_id + field) ──
             already_queued_df = (
-                spark.table(QUEUE_TABLE)
+                spark.read.table(QUEUE_TABLE)
                 .filter(
                     (F.col("conflict_type") == "UPDATE_CONFLICT")
                     & (F.col("status").isin("PENDING", "KEEP_RDM"))
@@ -470,16 +461,10 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
                 )
 
                 if net_new_count > 0:
-                    delta_queue = DeltaTable.forName(spark, QUEUE_TABLE)
-                    (
-                        delta_queue.alias("tgt")
-                        .merge(
-                            net_new_df.alias("src"),
-                            "tgt.conflict_id = src.conflict_id",
-                        )
-                        .whenNotMatchedInsertAll()
-                        .execute()
-                    )
+                    # conflict_id is a freshly minted UUID, so there is never a
+                    # match — the original .whenNotMatchedInsertAll() is
+                    # equivalent to a plain append here.
+                    write_ops.append(net_new_df, QUEUE_TABLE)
                     print(f"[on_match=flag_for_review] {net_new_count} conflicts written to queue")
                 else:
                     print("[on_match=flag_for_review] All conflicts already queued, nothing written")
@@ -502,7 +487,7 @@ handle_match(entity_reference_config, matched, target_master, RUN_ID, NOW)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Skip any ref_lakefusion_ids already in the pending queue.
 pending_keys = (
-    spark.table(QUEUE_TABLE)
+    spark.read.table(QUEUE_TABLE)
     .filter(F.col("status") == "PENDING")
     .select("ref_lakefusion_id")
     .distinct()
@@ -518,7 +503,6 @@ new_rows = (
 
 def handle_insert(config, new_rows_df, run_id, now):
     strategy = config["on_new_record"]
-    delta_master = DeltaTable.forName(spark, MASTER_TABLE)
 
     # ✅ Materialize into a temp Delta table BEFORE any MERGE touches the master
     #    (prevents lazy re-evaluation of the UDF)
@@ -544,7 +528,6 @@ def handle_insert(config, new_rows_df, run_id, now):
             # Brand-new ref_lakefusion_ids — INSERT into master + audit v1.
             # Provenance/steward fields baked in by _scd2_insert_new.
             _scd2_insert_new(
-                delta_master,
                 materialized_df,
                 list(entity_attributes),
                 action_type="JOB_MERGE",
@@ -576,16 +559,9 @@ def handle_insert(config, new_rows_df, run_id, now):
                     "resolved_by", "resolved_at", "created_at",
                 )
             )
-            delta_queue = DeltaTable.forName(spark, QUEUE_TABLE)
-            (
-                delta_queue.alias("tgt")
-                .merge(
-                    pending_df.alias("src"),
-                    "tgt.conflict_id = src.conflict_id",
-                )
-                .whenNotMatchedInsertAll()
-                .execute()
-            )
+            # conflict_id is a freshly minted UUID, so there is never a match —
+            # the original .whenNotMatchedInsertAll() is equivalent to append.
+            write_ops.append(pending_df, QUEUE_TABLE)
             print(
                 f"[on_new_record=flag_for_review] {row_count} new rows queued, "
                 f"nothing inserted to data/meta"
@@ -638,18 +614,18 @@ def handle_delete(config, rdm_only_df, run_id, now):
         return
 
     try:
-        delta_master = DeltaTable.forName(spark, MASTER_TABLE)
-        delta_audit  = DeltaTable.forName(spark, AUDIT_TABLE)
+        # delta_audit only used for READS in _scd2_expire; writes go through write_ops.
+        delta_audit = DeltaTable.forName(spark, AUDIT_TABLE)
 
         if strategy == "delete":
-            _scd2_expire(delta_master, delta_audit, delete_keys_df, action_type="DELETE_EXPIRED")
+            _scd2_expire(delta_audit, delete_keys_df, action_type="DELETE_EXPIRED")
             print(
                 f"[on_no_match=delete] Deleted {delete_count} master rows "
                 f"(audit history preserved + tombstone appended)"
             )
 
         elif strategy == "soft_delete":
-            _scd2_expire(delta_master, delta_audit, delete_keys_df, action_type="SOFT_DELETE")
+            _scd2_expire(delta_audit, delete_keys_df, action_type="SOFT_DELETE")
             print(
                 f"[on_no_match=soft_delete] Deleted {delete_count} master rows "
                 f"as SOFT_DELETE (audit history preserved)"

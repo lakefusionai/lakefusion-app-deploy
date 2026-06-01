@@ -78,3 +78,7 @@ class TaskValueKey(str, Enum):
     REFERENCE_CONFIG="entity_reference_config"
     RDM_CONFIGS="rdm_configs"
     REFERENCE_ATTRIBUTE_CONFIG="reference_attribute_config"
+
+
+    #Lakebase
+    

@@ -242,22 +242,27 @@ def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
     threshold   = cond.get("threshold")
     operator    = cond.get("operator", ">=")
     allow_nulls = cond.get("allow_nulls", rule_allow_nulls)
+    case_insensitive = cond.get("case_insensitive", False)
 
-    # Normalize empty/whitespace strings to NULL on both sides. The candidate
-    # side already does this in build_dynamic_struct (empty/"null" -> NULL),
-    # but the source side comes straight from the DataFrame where empties
-    # remain "". Without this, source="" vs candidate=NULL never matches
-    # under either allow_nulls branch.
     src_raw  = F.col(attr).cast("string")
     cand_raw = F.col(f"{attr}_matches").cast("string")
     src  = F.when(F.trim(src_raw)  == "", F.lit(None).cast("string")).otherwise(src_raw)
     cand = F.when(F.trim(cand_raw) == "", F.lit(None).cast("string")).otherwise(cand_raw)
 
-    left  = F.lower(src)
-    right = F.lower(cand)
+    if case_insensitive:
+        left  = F.lower(src)
+        right = F.lower(cand)
+    else:
+        left  = src
+        right = cand
 
     if match_type == "exact":
-        base = left == right
+        # Exact match honors operator: "=" (default) or "!=".
+        # Other operators are not valid for exact match — fall back to "=".
+        if operator == "!=":
+            base = left != right
+        else:
+            base = left == right
     elif match_type == "fuzzy":
         if fuzzy_func == "levenshtein_normalized":
             score = F.lit(1.0) - (
@@ -268,7 +273,6 @@ def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
         elif fuzzy_func == "levenshtein_standard":
             base = _apply_operator(F.levenshtein(left, right), operator, threshold)
         elif fuzzy_func == "jaro_winkler":
-            # Python UDF on flat columns — works because we're not inside a lambda.
             base = _apply_operator(jaro_winkler_udf(left, right), operator, threshold)
         elif fuzzy_func == "soundex":
             base = F.soundex(src) == F.soundex(cand)
@@ -288,12 +292,15 @@ def build_score_column(cond: dict) -> F.Column:
     attr       = cond["attribute"]
     match_type = cond.get("match_type", "exact")
     fuzzy_func = cond.get("function")
+    operator   = cond.get("operator", "=")
 
     left  = F.lower(F.col(attr).cast("string"))
     right = F.lower(F.col(f"{attr}_matches").cast("string"))
 
     if match_type == "exact":
-        return F.when(left == right, F.lit(1.0)).otherwise(F.lit(0.0)).cast("double")
+        # Score is 1.0 iff the exact condition is satisfied.
+        match_expr = (left != right) if operator == "!=" else (left == right)
+        return F.when(match_expr, F.lit(1.0)).otherwise(F.lit(0.0)).cast("double")
 
     elif match_type == "fuzzy":
         if fuzzy_func == "jaro_winkler":

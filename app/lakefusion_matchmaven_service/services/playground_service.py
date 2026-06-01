@@ -274,17 +274,37 @@ class DeterministicRulesService:
     """
     Evaluates deterministic match rules against master records using pandas.
 
-    Rules are evaluated in order; the first matching rule is applied.
-    Supports:
-      - match_type "exact": equality comparison (case-insensitive)
-      - match_type "fuzzy": levenshtein_standard, levenshtein_normalized, jaro_winkler
+    Mirrors the Spark/Databricks notebook rules engine — same operator
+    semantics, same fuzzy functions, same null handling — so a rule that
+    matches in the notebook matches the same way here:
+
+      - match_type "exact":  equality (case-insensitive, trimmed, with
+                              empty/whitespace normalized to NULL on both sides)
+      - match_type "fuzzy":  levenshtein_standard, levenshtein_normalized,
+                              jaro_winkler, soundex
+      - operator:            ">=", "<=", ">", "<", "=", "==", "!="
+                              (used to compare a fuzzy score against threshold;
+                              defaults to ">=" when not supplied)
+      - allow_nulls:         True  -> NULL-NULL counts as a match (null_match | base)
+                              False -> both sides must be non-NULL (not_null & base)
+
+    Rules are evaluated in order; the first matching rule per record wins
+    (`applied_rule`). All other rules are still recorded in
+    `rules_evaluation` for explainability.
+
+    The helpers below are deliberately structured to mirror the Spark side
+    one-for-one — same names (`_apply_operator`, `_build_condition_mask`),
+    same behavior. Notebooks build a Spark Column; the middlelayer builds
+    a pandas Series / mask. The shapes match so the JSON shape returned to
+    the UI is identical between playground (here) and a live job.
     """
 
-    # ── String distance helpers ──────────────────────────────────────────
+    # ── String distance helpers (pure-Python; no Spark / rapidfuzz dep) ──
 
     @staticmethod
     def _levenshtein_distance(s1: str, s2: str) -> int:
-        """Compute Levenshtein edit distance between two strings."""
+        """Compute Levenshtein edit distance between two strings.
+        Mirrors `F.levenshtein(left, right)` on the Spark side."""
         if len(s1) < len(s2):
             return DeterministicRulesService._levenshtein_distance(s2, s1)
         if len(s2) == 0:
@@ -300,7 +320,7 @@ class DeterministicRulesService:
 
     @staticmethod
     def _jaro_similarity(s1: str, s2: str) -> float:
-        """Compute Jaro similarity between two strings (0.0 to 1.0)."""
+        """Jaro similarity (0.0–1.0). Building block for Jaro-Winkler below."""
         if s1 == s2:
             return 1.0
         len1, len2 = len(s1), len(s2)
@@ -338,7 +358,9 @@ class DeterministicRulesService:
 
     @staticmethod
     def _jaro_winkler_similarity(s1: str, s2: str, p: float = 0.1) -> float:
-        """Compute Jaro-Winkler similarity (0.0 to 1.0). p = scaling factor (default 0.1)."""
+        """Jaro-Winkler similarity (0.0–1.0). Mirrors the rapidfuzz-backed
+        `jaro_winkler_udf` on the Spark side; pure-Python here to avoid
+        adding rapidfuzz as a middlelayer dependency."""
         jaro = DeterministicRulesService._jaro_similarity(s1, s2)
         prefix_len = 0
         for i in range(min(len(s1), len(s2), 4)):
@@ -348,56 +370,218 @@ class DeterministicRulesService:
                 break
         return jaro + prefix_len * p * (1 - jaro)
 
-    # ── Evaluation methods ───────────────────────────────────────────────
-
     @staticmethod
-    def _eval_exact(col: pd.Series, query_val: Any, allow_nulls: bool) -> tuple:
-        """Exact equality match (case-insensitive, trimmed). Score: 1.0 or 0.0."""
-        n = len(col)
-        if query_val is None:
-            mask = pd.Series([allow_nulls] * n, dtype=bool)
-            return mask, mask.astype(float)
-        q_str = str(query_val).strip().lower()
-        match_mask = col.fillna("").astype(str).str.strip().str.lower() == q_str
-        if allow_nulls:
-            match_mask = match_mask | col.isna()
-        return match_mask, match_mask.astype(float)
+    def _soundex(s: str) -> str:
+        """Standard English Soundex (4 chars, e.g. 'Robert' -> 'R163').
+        Mirrors Spark SQL's `F.soundex(...)`."""
+        if not s:
+            return ""
+        # Discard non-alpha and uppercase
+        s = "".join(c for c in s.upper() if c.isalpha())
+        if not s:
+            return ""
 
-    @staticmethod
-    def _eval_fuzzy(col: pd.Series, query_val: Any, function: str, threshold: float,
-                    allow_nulls: bool) -> tuple:
-        """Fuzzy match using the specified function. Returns (mask, scores)."""
-        n = len(col)
-        if query_val is None:
-            return pd.Series([allow_nulls] * n, dtype=bool), pd.Series([0.0] * n)
+        codes = {
+            "B": "1", "F": "1", "P": "1", "V": "1",
+            "C": "2", "G": "2", "J": "2", "K": "2", "Q": "2", "S": "2", "X": "2", "Z": "2",
+            "D": "3", "T": "3",
+            "L": "4",
+            "M": "5", "N": "5",
+            "R": "6",
+        }
 
-        q_str = str(query_val).strip().lower()
-        scores = []
-        for val in col:
-            if pd.isna(val) or val is None:
-                scores.append(0.0 if not allow_nulls else 1.0)
+        first = s[0]
+        # `prev` tracks the previously emitted code so consecutive duplicates
+        # collapse — seeded with the first letter's own code so e.g. 'Pf'
+        # doesn't emit '11'.
+        prev = codes.get(first, "0")
+        encoded = []
+        for ch in s[1:]:
+            if ch in ("H", "W"):
+                continue  # ignored; doesn't break runs
+            code = codes.get(ch, "0")  # vowels and other non-coded chars
+            if code == "0":
+                # Vowel-class — emits nothing but DOES break consonant runs.
+                prev = "0"
                 continue
-            m_str = str(val).strip().lower()
+            if code != prev:
+                encoded.append(code)
+            prev = code
 
-            if function == "jaro_winkler":
-                scores.append(round(DeterministicRulesService._jaro_winkler_similarity(q_str, m_str), 4))
-            elif function == "levenshtein_standard":
-                dist = DeterministicRulesService._levenshtein_distance(q_str, m_str)
-                scores.append(round(1.0 - dist / max(len(q_str), len(m_str), 1), 4))
+        return (first + "".join(encoded) + "000")[:4]
+
+    # ── Operator dispatcher (mirrors `_apply_operator` on the Spark side) ──
+
+    @staticmethod
+    def _apply_operator(value, operator: str, threshold):
+        """Compare a value (or pandas Series) against `threshold` using the
+        given operator. Same operator set as the Spark version so a rule
+        config that targets ">=" / "!=" / etc. behaves identically here."""
+        ops = {
+            ">=": lambda a, b: a >= b,
+            "<=": lambda a, b: a <= b,
+            ">":  lambda a, b: a >  b,
+            "<":  lambda a, b: a <  b,
+            "=":  lambda a, b: a == b,
+            "==": lambda a, b: a == b,
+            "!=": lambda a, b: a != b,
+        }
+        if operator not in ops:
+            raise ValueError(f"Unsupported operator: {operator!r}")
+        return ops[operator](value, threshold)
+
+    # ── Condition evaluator (mirrors `build_condition_column`) ───────────
+
+    def _build_condition_mask(
+        self,
+        cond: Dict[str, Any],
+        query_val: Any,
+        col: pd.Series,
+        rule_allow_nulls: bool = False,
+    ) -> tuple:
+        """Pandas mirror of the Spark-side `build_condition_column`.
+
+        For each row of `col` (master/candidate side), decide whether the
+        condition passes against `query_val` (source side). Returns
+        `(mask, scores)` — both pandas Series of length len(col).
+
+        Semantics matched to Spark:
+          - empty/whitespace -> NULL on both source and candidate sides
+          - case_insensitive (default True): lowercases both sides before
+                              comparison. Soundex ignores this flag since
+                              the algorithm uppercases internally.
+          - exact: equality (after optional lowering)
+          - fuzzy: compute score, then `_apply_operator(score, operator, threshold)`
+                   (operator defaults to ">=" when missing)
+          - soundex: equality of the 4-char Soundex codes (no threshold)
+          - allow_nulls: True  -> `null_match | base`
+                          False -> `not_null   & base`
+        """
+        match_type       = cond.get("match_type", "exact")
+        fuzzy_func       = cond.get("function")
+        threshold        = cond.get("threshold")
+        operator         = cond.get("operator") or ">="
+        allow_nulls      = cond.get("allow_nulls", rule_allow_nulls)
+        case_insensitive = cond.get("case_insensitive", False)
+
+        n = len(col)
+
+        # ── Normalize source (single value) ──────────────────────────────
+        # Empty/whitespace -> None; case is preserved here so case-sensitive
+        # comparisons (case_insensitive=False) see the original string.
+        if query_val is None:
+            src = None
+        else:
+            s = str(query_val).strip()
+            src = s if s else None
+
+        # ── Normalize candidate column (per row) ─────────────────────────
+        # Mirrors the Spark `F.when(F.trim(...) == "", null).otherwise(...)`
+        # block but uses `.apply` for explicit per-cell handling — avoids
+        # subtle pandas dtype/NA-propagation differences across versions.
+        # Case is preserved here, then optionally folded below.
+        def _normalize_cell(v):
+            if v is None:
+                return None
+            try:
+                if pd.isna(v):
+                    return None
+            except (TypeError, ValueError):
+                pass  # non-scalar (rare) — fall through to str()
+            s = str(v).strip()
+            return s if s else None
+
+        cand_clean = col.apply(_normalize_cell)
+        cand_is_null = cand_clean.isna()
+
+        # ── Apply case-folding for the comparison view ────────────────────
+        # `src` / `cand_clean` keep original case (used by soundex, which
+        # is inherently case-insensitive). `src_cmp` / `cand_cmp` are
+        # lower-cased iff case_insensitive=True and are used for every
+        # other comparison (exact, levenshtein, jaro_winkler).
+        if case_insensitive:
+            src_cmp = src.lower() if src is not None else None
+            cand_cmp = cand_clean.apply(
+                lambda v: v.lower() if v is not None else None
+            )
+        else:
+            src_cmp = src
+            cand_cmp = cand_clean
+
+        # ── Base mask + scores per match_type ────────────────────────────
+        if match_type == "exact":
+            if src_cmp is None:
+                base = pd.Series([False] * n, dtype=bool)
+                scores = pd.Series([0.0] * n)
             else:
-                # Default: levenshtein_normalized
-                max_len = max(len(q_str), len(m_str))
-                if max_len == 0:
-                    scores.append(1.0)
+                # Exact match honors operator: "=" (default) or "!=".
+                if operator == "!=":
+                    # Mirror Spark: `NULL != x` evaluates to NULL (no-match),
+                    # so a null candidate must NOT satisfy "!=". Only non-null
+                    # candidates that differ from the source pass.
+                    base = ((cand_cmp != src_cmp) & (~cand_is_null)).fillna(False).astype(bool)
                 else:
-                    dist = DeterministicRulesService._levenshtein_distance(q_str, m_str)
-                    scores.append(round(1.0 - dist / max_len, 4))
+                    base = (cand_cmp == src_cmp).fillna(False).astype(bool)
+                scores = base.astype(float)
 
-        scores_series = pd.Series(scores)
-        mask = scores_series >= threshold
+        elif match_type == "fuzzy":
+            scores_list = []
+            for v in cand_cmp:
+                if src_cmp is None or pd.isna(v):
+                    scores_list.append(0.0)
+                    continue
+                if fuzzy_func == "levenshtein_normalized":
+                    max_len = max(len(src_cmp), len(v))
+                    score = 1.0 if max_len == 0 else 1.0 - self._levenshtein_distance(src_cmp, v) / max_len
+                elif fuzzy_func == "levenshtein_standard":
+                    score = float(self._levenshtein_distance(src_cmp, v))
+                elif fuzzy_func == "jaro_winkler":
+                    score = self._jaro_winkler_similarity(src_cmp, v)
+                elif fuzzy_func == "soundex":
+                    # Soundex is case-insensitive by construction —
+                    # call against the case-preserving values (no need
+                    # to look at the folded view).
+                    cand_orig = cand_clean.iloc[len(scores_list)]
+                    score = 1.0 if self._soundex(src) == self._soundex(cand_orig) else 0.0
+                else:
+                    raise ValueError(f"Unsupported fuzzy function: {fuzzy_func!r}")
+                scores_list.append(round(score, 4))
+            scores = pd.Series(scores_list)
+
+            if fuzzy_func == "soundex":
+                # Soundex is binary; operator/threshold are ignored.
+                base = (scores == 1.0)
+            elif threshold is None:
+                base = pd.Series([False] * n, dtype=bool)
+            else:
+                base = self._apply_operator(scores, operator, float(threshold))
+                base = base.fillna(False).astype(bool)
+        else:
+            raise ValueError(f"Unsupported match_type: {match_type!r}")
+
+        # ── Null handling (identical logic to Spark side) ────────────────
+        src_is_null = src is None
         if allow_nulls:
-            mask = mask | col.isna()
-        return mask, scores_series
+            # null_match | base   — NULL on both sides counts as a match
+            null_match = cand_is_null & src_is_null
+            mask = (null_match | base).fillna(False).astype(bool)
+            # If a row passed only via null_match (both sides NULL), the
+            # similarity comparison never ran — but reporting score=0.0
+            # alongside passed=True is misleading in the UI. Surface
+            # score=1.0 on those rows so the response is internally
+            # consistent ("matched -> high score").
+            scores = scores.mask(null_match, 1.0)
+        else:
+            # not_null & base    — both sides must be non-NULL
+            not_null = (~cand_is_null) & (not src_is_null)
+            mask = (not_null & base).fillna(False).astype(bool)
+            # Conversely: a row where one side is NULL can never pass
+            # under allow_nulls=False, so its score is moot. Zero it for
+            # consistency (some fuzzy paths leave a stray score from a
+            # previous code path).
+            scores = scores.mask(~not_null, 0.0)
+
+        return mask, scores
 
     def execute_rules_compare(
         self,
@@ -425,26 +609,31 @@ class DeterministicRulesService:
             cond_scores: List[pd.Series] = []
             cond_meta: List[tuple] = []
 
+            # `rule.allow_nulls` is a rule-level default; per-condition
+            # `cond.allow_nulls` overrides it (mirroring the Spark side
+            # where `build_condition_column` takes `rule_allow_nulls` as a
+            # fallback).
+            rule_allow_nulls = rule.get("allow_nulls", False)
+
             for cond in conditions:
-                attr = cond.get("attribute", "")
-                allow_nulls = cond.get("allow_nulls", False)
+                attr       = cond.get("attribute", "")
                 match_type = cond.get("match_type", "exact")
-                threshold = cond.get("threshold")
-                query_val = query_record.get(attr)
+                threshold  = cond.get("threshold")
+                query_val  = query_record.get(attr)
+                # cond.allow_nulls effective value (defaults to rule's, then False)
+                eff_allow_nulls = cond.get("allow_nulls", rule_allow_nulls)
 
                 col = df[attr] if attr in df.columns else pd.Series([None] * n)
-                function = cond.get("function", "")
-                if match_type == "exact":
-                    mask, scores = self._eval_exact(col, query_val, allow_nulls)
-                elif match_type == "fuzzy":
-                    t = float(threshold) if threshold is not None else 0.8
-                    mask, scores = self._eval_fuzzy(col, query_val, function or "levenshtein_normalized", t, allow_nulls)
-                else:
-                    raise NotImplementedError(f"match_type '{match_type}' is not yet supported")
+                mask, scores = self._build_condition_mask(
+                    cond, query_val, col, rule_allow_nulls=rule_allow_nulls,
+                )
 
                 cond_masks.append(mask)
                 cond_scores.append(scores)
-                cond_meta.append((attr, match_type, cond.get("function"), cond.get("operator"), threshold, allow_nulls, query_val))
+                cond_meta.append((
+                    attr, match_type, cond.get("function"),
+                    cond.get("operator"), threshold, eff_allow_nulls, query_val,
+                ))
 
             if not cond_masks:
                 rule_mask = pd.Series([False] * n, dtype=bool)
@@ -472,11 +661,6 @@ class DeterministicRulesService:
                     master_val = raw.item() if hasattr(raw, "item") else raw
                     cond_evals.append({
                         "attribute": attr,
-                        "match_type": match_type,
-                        "function": function,
-                        "operator": operator,
-                        "threshold": threshold,
-                        "allow_nulls": allow_nulls,
                         "query_value": query_val,
                         "master_value": master_val,
                         "score": float(cond_scores[j].iloc[i]),
@@ -487,17 +671,18 @@ class DeterministicRulesService:
                     "name": rule_name,
                     "matched": rule_matched,
                     "applied": is_applied,
-                    "action_on_match": action,
-                    "logical_operator": logical_op,
                     "conditions_evaluation": cond_evals,
                 })
 
         results = []
         for i in range(n):
             record_id = str(df["id"].iloc[i]) if "id" in df.columns else str(i)
+            reason = f"Due to Match Rule: {applied_rule[i]}" if applied_rule[i] else "No rule matched"
             results.append({
                 "id": record_id,
-                "overall_result": overall_result[i],
+                "match": overall_result[i],
+                "score": 1.0 if overall_result[i] == "MATCH" else 0.0,
+                "reason": reason,
                 "applied_rule": applied_rule[i],
                 "rules_evaluation": rules_eval_per_record[i],
             })

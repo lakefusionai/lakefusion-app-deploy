@@ -1,4 +1,9 @@
 # Databricks notebook source
+# MAGIC %pip install --upgrade "databricks-sdk>=0.61.0" psycopg2-binary
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 import json
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, LongType,
@@ -7,6 +12,10 @@ from pyspark.sql.types import (
 )
 from pyspark.sql.functions import col, lit, current_timestamp
 from delta.tables import DeltaTable
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/execute_utils
 
 # COMMAND ----------
 
@@ -19,6 +28,11 @@ dbutils.widgets.text("entity_attributes", "", "Entity Attributes")
 dbutils.widgets.text("dataset_tables", "", "Dataset Tables")
 dbutils.widgets.text("entity_reference_config", "", "entity_reference_config")
 dbutils.widgets.text("entity_attributes_datatype", "", "entity_attributes_datatype")
+dbutils.widgets.text("lakebase_instance_id", "", "lakebase_instance_id")
+dbutils.widgets.text("lakebase_branch_id", "", "lakebase_branch_id")
+dbutils.widgets.text("lakebase_endpoint_id", "", "lakebase_endpoint_id")
+dbutils.widgets.text("lakebase_database", "", "lakebase_database")
+dbutils.widgets.text("write_mode", "delta", "Write Mode (delta/lakebase)")
 
 # COMMAND ----------
 
@@ -55,10 +69,11 @@ entity_attributes_datatype = dbutils.jobs.taskValues.get(
     debugValue=dbutils.widgets.get("entity_attributes_datatype")
 )
 experiment_id = dbutils.widgets.get("experiment_id")
-
-# COMMAND ----------
-
-# MAGIC %run ../../utils/execute_utils
+lakebase_instance_id = dbutils.widgets.get("lakebase_instance_id")
+lakebase_branch_id = dbutils.widgets.get("lakebase_branch_id")
+lakebase_endpoint_id = dbutils.widgets.get("lakebase_endpoint_id")
+lakebase_database = dbutils.widgets.get("lakebase_database")
+write_mode = dbutils.widgets.get("write_mode")
 
 # COMMAND ----------
 
@@ -68,236 +83,247 @@ entity_attributes_datatype = json.loads(entity_attributes_datatype)
 
 # COMMAND ----------
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# TABLE 1 — DATA TABLE  (business columns only)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-from typing import Optional
-from delta.tables import DeltaTable
-from pyspark.sql.types import ArrayType, StringType
+from lakefusion_core_engine.write_ops import create_write_ops,WriteMode
+lakebase_params = {                                # becomes PG schema name
+    "lakebase_instance_id": lakebase_instance_id,  # project display_name
+    "lakebase_branch_id": lakebase_branch_id,        # default
+    "lakebase_endpoint_id": lakebase_endpoint_id,         # default
+    "lakebase_database": entity,
+}
+ 
+ops = create_write_ops(mode=write_mode, spark=spark, params=lakebase_params)
 
+# COMMAND ----------
 
-def create_rdm_master_table(
-    catalog: str,
-    schema: str,
-    entity_name: str,
-    primary_key: str,
-    entity_datatype: dict[str, str],
-    pk_comment: Optional[str] = None,
-) -> str:
-    """Create the reference MASTER table — current state, business only.
+from pyspark.sql.types import (
+    StructType, StructField, StringType, BooleanType,
+    TimestampType, IntegerType, ArrayType, _parse_datatype_string,
+)
 
-    One row per ref_lakefusion_id. Always reflects the latest known values.
-    History / provenance / SCD-2 control all live on the separate audit
-    table (<entity>_reference_audit_prod). Readers querying "current state"
-    hit this table directly — no is_current filter needed, no joins.
+# =========================
+# MASTER TABLE
+# =========================
+entity_datatype=entity_attributes_datatype
+table_fqn = f"{catalog_name}.gold.{entity}_reference_prod"
 
-    Schema = ref_lakefusion_id (PK) + business columns. Period.
-    """
-    table_fqn = f"{catalog}.{schema}.{entity_name}_reference_prod"
+master_fields = [
+    StructField("ref_lakefusion_id", StringType(), nullable=False)
+]
 
-    builder = (
-        DeltaTable.createIfNotExists(spark)
-        .tableName(table_fqn)
-        .comment(
-            f"RDM master table for {entity_name} — current state, business columns only. "
-            f"History + provenance live on {entity_name}_reference_audit_prod."
-        )
-        .property("delta.enableChangeDataFeed", "true")
-        .property("delta.feature.allowColumnDefaults", "supported")
-        .addColumn(
-            "ref_lakefusion_id",
-            "STRING",
-            nullable=False,
-            comment="Surrogate key. Unique per row (one row per ref_lakefusion_id).",
+for name, dtype in entity_datatype.items():
+    is_pk = name.lower() == primary_key.lower()
+
+    master_fields.append(
+        StructField(
+            name,
+            _parse_datatype_string(dtype),
+            nullable=not is_pk
         )
     )
 
-    for col_name, col_type in entity_datatype.items():
-        if col_name.lower() == primary_key.lower():
-            comment = f"Business PK ({pk_comment})" if pk_comment else "Business PK"
-            builder = builder.addColumn(
-                col_name, col_type, nullable=False, comment=comment
-            )
-        else:
-            builder = builder.addColumn(col_name, col_type)
+master_schema = StructType(master_fields)
 
-    builder.execute()
+empty_master = spark.createDataFrame([], master_schema)
 
-    logger.info(f"  Created MASTER {table_fqn}")
-    logger.info(f"  Business columns: {len(entity_datatype)} (+ ref_lakefusion_id)")
-    logger.info(f"  CDF: Enabled")
-    return table_fqn
+if ops is not None:
 
+    ops.create_table(
+        empty_master,
+        table_fqn,
+        enable_cdf=True,
+        primary_key=["ref_lakefusion_id"],
+    )
 
-def create_rdm_audit_table(
-    catalog: str,
-    schema: str,
-    entity_name: str,
-    primary_key: str,
-    entity_datatype: dict[str, str],
-    pk_comment: Optional[str] = None,
-) -> str:
-    """Create the reference AUDIT table — append-only history + provenance.
+    logger.info(f"Created MASTER {table_fqn} (via ops)")
 
-    One row per (ref_lakefusion_id, version). Captures every state change
-    the master table goes through, plus who/how/from-where it happened.
+else:
 
-    Schema = ref_lakefusion_id + business columns (snapshot at this version)
-    + 4 SCD-2 control columns (valid_from, valid_to, is_current, version)
-    + source + 4 steward/provenance columns.
-    """
-    table_fqn = f"{catalog}.{schema}.{entity_name}_reference_audit_prod"
+    if not spark.catalog.tableExists(table_fqn):
 
-    builder = (
-        DeltaTable.createIfNotExists(spark)
-        .tableName(table_fqn)
-        .comment(
-            f"RDM audit/history table for {entity_name} — append-only SCD-2 log of every "
-            f"version change to the master table. (ref_lakefusion_id, version) is unique."
+        (
+            empty_master.write
+            .format("delta")
+            .option("delta.enableChangeDataFeed", "true")
+            .option("delta.feature.allowColumnDefaults", "supported")
+            .saveAsTable(table_fqn)
         )
-        .property("delta.enableChangeDataFeed", "true")
-        .property("delta.feature.allowColumnDefaults", "supported")
-        .addColumn(
-            "ref_lakefusion_id",
-            "STRING",
-            nullable=False,
-            comment="FK to master. Multiple rows per id (one per version).",
+
+    logger.info(f"Created MASTER {table_fqn} (delta)")
+    logger.info(f"Business columns: {len(entity_datatype)} (+ ref_lakefusion_id)")
+    logger.info("CDF: Enabled")
+
+
+# =========================
+# AUDIT TABLE
+# =========================
+
+audit_table_fqn = f"{catalog_name}.gold.{entity}_reference_audit_prod"
+
+audit_fields = [
+    StructField("ref_lakefusion_id", StringType(), nullable=False)
+]
+
+for name, dtype in entity_datatype.items():
+
+    audit_fields.append(
+        StructField(
+            name,
+            _parse_datatype_string(dtype),
+            nullable=True
         )
     )
 
-    # Business columns — snapshot of the row's values at this version
-    for col_name, col_type in entity_datatype.items():
-        if col_name.lower() == primary_key.lower():
-            comment = f"Business PK at this version ({pk_comment})" if pk_comment else "Business PK at this version"
-            builder = builder.addColumn(col_name, col_type, comment=comment)
-        else:
-            builder = builder.addColumn(col_name, col_type)
+audit_fields += [
+    StructField("valid_from", TimestampType(), nullable=False),
+    StructField("valid_to", TimestampType(), nullable=True),
+    StructField("is_current", BooleanType(), nullable=False),
+    StructField("version", IntegerType(), nullable=False),
+    StructField("source", StringType(), nullable=True),
+    StructField("action_type", StringType(), nullable=True),
+    StructField("steward_locked", BooleanType(), nullable=False),
+    StructField("steward_edited_cols", ArrayType(StringType()), nullable=True),
+    StructField("steward_edited_by", StringType(), nullable=True),
+]
 
-    # SCD-2 control
-    builder = (
-        builder
-        .addColumn(
-            "valid_from",
-            "TIMESTAMP",
-            nullable=False,
-            comment="SCD-2: when this version became active",
-        )
-        .addColumn(
-            "valid_to",
-            "TIMESTAMP",
-            comment="SCD-2: when this version was superseded; NULL for current",
-        )
-        .addColumn(
-            "is_current",
-            "BOOLEAN",
-            nullable=False,
-            comment="SCD-2: TRUE for the latest version of a ref_lakefusion_id",
-        )
-        .addColumn(
-            "version",
-            "INT",
-            nullable=False,
-            comment="Per-ref_lakefusion_id sequence (1 for first row, +1 per new version).",
-        )
-        .addColumn(
-            "source",
-            "STRING",
-            comment=(
-                "Source table that produced this version (e.g. 'catalog.schema.country_master'). "
-                "NULL for steward-driven versions. Join to <entity>_reference_mappings_prod on "
-                "(source, ref_lakefusion_id) for source_id / source_attr / source_value."
-            ),
-        )
-        .addColumn(
-            "action_type",
-            "STRING",
-            comment=(
-                "How this version was produced: JOB_MERGE | MANUAL_INSERT | MANUAL_UPSERT | "
-                "STEWARD_EDIT | DELETE_EXPIRED | SOFT_DELETE | CONFLICT_RESOLVED | KEEP_RDM"
-            ),
-        )
-        .addColumn(
-            "steward_locked",
-            "BOOLEAN",
-            nullable=False,
-            comment=(
-                "Carried forward across versions. When TRUE, jobs skip this row "
-                "in match strategies (steward_wins). Toggled by steward edits / "
-                "conflict resolution."
-            ),
-        )
-        .addColumn(
-            "steward_edited_cols",
-            ArrayType(StringType()),
-            comment="Columns changed in THIS version (NULL for job-created versions).",
-        )
-        .addColumn(
-            "steward_edited_by",
-            "STRING",
-            comment="Steward / user who created this version (NULL for job-created versions).",
-        )
+audit_schema = StructType(audit_fields)
+
+empty_audit = spark.createDataFrame([], audit_schema)
+
+if ops is not None:
+
+    ops.create_table(
+        empty_audit,
+        audit_table_fqn,
+        enable_cdf=True,
+        primary_key=["ref_lakefusion_id", "version"],
     )
 
-    builder.execute()
+    logger.info(f"Created AUDIT {audit_table_fqn} (via ops)")
 
-    spark.sql(f"ALTER TABLE {table_fqn} ALTER COLUMN valid_from SET DEFAULT current_timestamp()")
-    spark.sql(f"ALTER TABLE {table_fqn} ALTER COLUMN is_current SET DEFAULT TRUE")
-    spark.sql(f"ALTER TABLE {table_fqn} ALTER COLUMN steward_locked SET DEFAULT FALSE")
+else:
 
-    logger.info(f"  Created AUDIT {table_fqn}")
+    if not spark.catalog.tableExists(audit_table_fqn):
+
+        (
+            empty_audit.write
+            .format("delta")
+            .option("delta.enableChangeDataFeed", "true")
+            .option("delta.feature.allowColumnDefaults", "supported")
+            .saveAsTable(audit_table_fqn)
+        )
+
+        spark.sql(
+            f"""
+            ALTER TABLE {audit_table_fqn}
+            ALTER COLUMN valid_from
+            SET DEFAULT current_timestamp()
+            """
+        )
+
+        spark.sql(
+            f"""
+            ALTER TABLE {audit_table_fqn}
+            ALTER COLUMN is_current
+            SET DEFAULT TRUE
+            """
+        )
+
+        spark.sql(
+            f"""
+            ALTER TABLE {audit_table_fqn}
+            ALTER COLUMN steward_locked
+            SET DEFAULT FALSE
+            """
+        )
+
+    logger.info(f"Created AUDIT {audit_table_fqn} (delta)")
+
     logger.info(
-        f"  Business columns: {len(entity_datatype)} "
+        f"Business columns: {len(entity_datatype)} "
         f"(+ ref_lakefusion_id, +5 SCD-2/source, +4 steward/provenance)"
     )
-    logger.info(f"  CDF: Enabled")
-    return table_fqn
 
-
-# COMMAND ----------
-
-logger.info("\n" + "="*60)
-logger.info("CREATING REFERENCE TABLES (master + audit)")
-logger.info("="*60)
-
-master_table = create_rdm_master_table(
-    catalog=catalog_name,
-    schema="gold",
-    entity_name=entity,
-    primary_key=primary_key,
-    entity_datatype=entity_attributes_datatype,
-    pk_comment="Source business key",
-)
-
-audit_table = create_rdm_audit_table(
-    catalog=catalog_name,
-    schema="gold",
-    entity_name=entity,
-    primary_key=primary_key,
-    entity_datatype=entity_attributes_datatype,
-    pk_comment="Source business key",
-)
-
+    logger.info("CDF: Enabled")
 
 # COMMAND ----------
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFLICT QUEUE  (unchanged — already a separate concern)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-spark.sql(f"""CREATE TABLE IF NOT EXISTS {catalog_name}.gold.{entity}_reference_conflict_queue_prod (
-  ref_lakefusion_id STRING    NOT NULL,
-  conflict_id       STRING    NOT NULL,
-  conflict_type     STRING,
-  entity_key_value  STRING,
-  field_name        STRING,
-  rdm_value         STRING,
-  source_value      STRING,
-  edited_by         STRING,
-  status            STRING  DEFAULT 'PENDING',
-  resolved_by       STRING,
-  resolved_at       TIMESTAMP,
-  created_at        TIMESTAMP
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    StringType,
+    TimestampType,
 )
-USING DELTA
-COMMENT 'Conflict queue for {entity}. Steward resolves via Integration Hub UI.'
-TBLPROPERTIES ('delta.feature.allowColumnDefaults' = 'supported')""")
+
+# =========================
+# CONFLICT QUEUE TABLE
+# =========================
+
+conflict_table_fqn = (
+    f"{catalog_name}.gold.{entity}_reference_conflict_queue_prod"
+)
+
+conflict_schema = StructType([
+
+    StructField("ref_lakefusion_id", StringType(), nullable=False),
+    StructField("conflict_id", StringType(), nullable=False),
+
+    StructField("conflict_type", StringType(), nullable=True),
+    StructField("entity_key_value", StringType(), nullable=True),
+
+    StructField("field_name", StringType(), nullable=True),
+
+    StructField("rdm_value", StringType(), nullable=True),
+    StructField("source_value", StringType(), nullable=True),
+
+    StructField("edited_by", StringType(), nullable=True),
+
+    StructField("status", StringType(), nullable=True),
+
+    StructField("resolved_by", StringType(), nullable=True),
+
+    StructField("resolved_at", TimestampType(), nullable=True),
+
+    StructField("created_at", TimestampType(), nullable=True),
+
+])
+
+empty_conflict = spark.createDataFrame([], conflict_schema)
+
+if ops is not None:
+
+    ops.create_table(
+        empty_conflict,
+        conflict_table_fqn,
+        enable_cdf=True,
+        primary_key=["ref_lakefusion_id", "conflict_id"],
+    )
+
+    logger.info(
+        f"Created CONFLICT QUEUE {conflict_table_fqn} (via ops)"
+    )
+
+else:
+
+    if not spark.catalog.tableExists(conflict_table_fqn):
+
+        (
+            empty_conflict.write
+            .format("delta")
+            .option("delta.enableChangeDataFeed", "true")
+            .option("delta.feature.allowColumnDefaults", "supported")
+            .saveAsTable(conflict_table_fqn)
+        )
+
+        spark.sql(
+            f"""
+            ALTER TABLE {conflict_table_fqn}
+            ALTER COLUMN status
+            SET DEFAULT 'PENDING'
+            """
+        )
+
+    logger.info(
+        f"Created CONFLICT QUEUE {conflict_table_fqn} (delta)"
+    )
+
+    logger.info("CDF: Enabled")

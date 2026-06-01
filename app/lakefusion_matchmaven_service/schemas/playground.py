@@ -148,11 +148,6 @@ class ExecuteCompareResponse(BaseModel):
 
 class ConditionEvaluation(BaseModel):
     attribute: str
-    match_type: str
-    function: Optional[str] = None
-    operator: Optional[str] = None
-    threshold: Optional[float] = None
-    allow_nulls: bool = False
     query_value: Optional[Any] = None
     master_value: Optional[Any] = None
     score: Optional[float] = None
@@ -163,14 +158,14 @@ class RuleEvaluation(BaseModel):
     name: str
     matched: bool
     applied: bool
-    action_on_match: str
-    logical_operator: str = "AND"
     conditions_evaluation: List[ConditionEvaluation]
 
 
 class RecordComparison(BaseModel):
     id: str
-    overall_result: str
+    match: str = "NO_MATCH"
+    score: float = 0.0
+    reason: str = "No rule matched"
     applied_rule: Optional[str] = None
     rules_evaluation: List[RuleEvaluation]
 

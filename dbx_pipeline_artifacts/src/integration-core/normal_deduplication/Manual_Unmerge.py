@@ -749,6 +749,101 @@ except Exception as e:
 
 # COMMAND ----------
 
+# --- Update Golden Dedup Health ---
+logger.info("\n" + "="*80)
+logger.info("STEP: UPDATE GOLDEN DEDUP HEALTH")
+logger.info("="*80)
+
+try:
+    _gd_master_table = f"{catalog_name}.gold.{entity}_master"
+    _gd_unified_table = f"{catalog_name}.silver.{entity}_unified"
+    _gd_pm_dedup_table = f"{catalog_name}.gold.{entity}_master_potential_match_deduplicate"
+    if experiment_id:
+        _gd_master_table += f"_{experiment_id}"
+        _gd_unified_table += f"_{experiment_id}"
+        _gd_pm_dedup_table += f"_{experiment_id}"
+    _gd_ma_table = f"{_gd_master_table}_merge_activities"
+
+    if spark.catalog.tableExists(_gd_pm_dedup_table):
+        _gd_sk_list_sql = ", ".join(f"'{sk}'" for sk in unmerge_surrogate_keys)
+        _gd_affected = spark.sql(f"""
+            SELECT DISTINCT ma.master_id AS original_master
+            FROM {_gd_ma_table} ma
+            WHERE ma.match_id IN ({_gd_sk_list_sql})
+              AND ma.action_type IN ('JOB_INSERT','JOB_MERGE','MANUAL_MERGE','INITIAL_LOAD')
+              AND ma.master_id != '{master_id}'
+              AND ma.master_id NOT IN (SELECT lakefusion_id FROM {_gd_master_table})
+        """).collect()
+        _gd_affected_masters = [r['original_master'] for r in _gd_affected]
+
+        if not _gd_affected_masters:
+            logger.info("  No affected merged masters found in golden dedup, skipping")
+        else:
+            logger.info(f"  Affected merged masters: {_gd_affected_masters}")
+
+            for _gd_merged_id in _gd_affected_masters:
+                _gd_health = spark.sql(f"""
+                    WITH source_records AS (
+                        SELECT DISTINCT ma.match_id AS source_sk
+                        FROM {_gd_ma_table} ma
+                        WHERE ma.master_id = '{_gd_merged_id}'
+                          AND ma.action_type IN ('JOB_INSERT','JOB_MERGE','MANUAL_MERGE','INITIAL_LOAD')
+                          AND ma.match_id LIKE 'sk_%'
+                    )
+                    SELECT
+                        COUNT(DISTINCT sr.source_sk) AS total,
+                        COUNT(DISTINCT CASE
+                            WHEN u.master_lakefusion_id = '{master_id}' AND u.record_status != 'DELETED'
+                            THEN sr.source_sk END) AS remaining
+                    FROM source_records sr
+                    LEFT JOIN {_gd_unified_table} u ON u.{unified_id_key} = sr.source_sk
+                """).collect()[0]
+                _gd_remaining = _gd_health['remaining']
+                _gd_total = _gd_health['total']
+                logger.info(f"  Master {_gd_merged_id}: remaining={_gd_remaining}, total={_gd_total}")
+
+                if _gd_total == 0:
+                    logger.info(f"  No source records found for {_gd_merged_id}, skipping")
+                    continue
+                elif _gd_remaining == 0:
+                    logger.info(f"  Fully unmerged — removing {_gd_merged_id}")
+                    spark.sql(f"""
+                        UPDATE {_gd_pm_dedup_table}
+                        SET potential_matches = FILTER(potential_matches, x -> x.lakefusion_id != '{_gd_merged_id}')
+                        WHERE lakefusion_id = '{master_id}'
+                    """)
+                elif _gd_remaining < _gd_total:
+                    logger.info(f"  Partially merged — updating {_gd_merged_id} to MASTER_PARTIAL_MERGE ({_gd_remaining}/{_gd_total})")
+                    _gd_struct_parts = []
+                    for _gd_attr in entity_attributes:
+                        _gd_struct_parts.append(f"'{_gd_attr}', x.{_gd_attr}")
+                    _gd_struct_parts.extend([
+                        "'__score__', x.__score__",
+                        "'__reason__', x.__reason__",
+                        "'lakefusion_id', x.lakefusion_id",
+                        "'__mergestatus__', 'MASTER_PARTIAL_MERGE'",
+                        f"'__merge_remaining__', CAST({_gd_remaining} AS STRING)",
+                        f"'__merge_total__', CAST({_gd_total} AS STRING)",
+                        "'__attributes_combined__', x.__attributes_combined__",
+                    ])
+                    _gd_ns = f"named_struct({', '.join(_gd_struct_parts)})"
+                    spark.sql(f"""
+                        UPDATE {_gd_pm_dedup_table}
+                        SET potential_matches = TRANSFORM(potential_matches, x ->
+                            IF(x.lakefusion_id = '{_gd_merged_id}', {_gd_ns}, x))
+                        WHERE lakefusion_id = '{master_id}'
+                    """)
+                else:
+                    logger.info(f"  Still fully merged ({_gd_remaining}/{_gd_total}), no update needed")
+
+            logger.info("  Golden dedup health update complete")
+    else:
+        logger.info("  Golden dedup table does not exist, skipping")
+except Exception as e:
+    logger.warning(f"Golden dedup health update failed (non-fatal): {e}")
+
+# COMMAND ----------
+
 logger.info("\n" + "="*80)
 logger.info("MANUAL UNMERGE PROCESSING COMPLETE")
 logger.info("="*80)

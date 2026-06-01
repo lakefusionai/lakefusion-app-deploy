@@ -143,8 +143,8 @@ async def lifespan(app):
                 # ------------------------------------------------------
                 try:
                     # Lazy import — see note at top of file.
-                    from lakefusion_utility.utils.databricks_util import get_app_sp_token
-                    token = get_app_sp_token()
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token, generate_pat
+                    token = get_app_sp_token() or generate_pat()
                     if token:
                         logger.info("Syncing PT config to Volume on startup...")
                         service = PTModelsConfigService(db)

@@ -172,12 +172,15 @@ def execute_sync(db: Session, force: bool = False,
     return summary
 
 
+IS_DATABRICKS_APPS = bool(os.environ.get('DATABRICKS_APP_URL'))
+
+
 def _import_file(notebook_service: NotebookService, file_path: str, workspace_path: str):
     """Import a notebook or upload a regular file to the Databricks workspace."""
     file_ext = os.path.splitext(file_path)[1].lower()
 
     if file_ext in NOTEBOOK_LANG_MAP:
-        # Notebook — import via workspace.import_() (extension stripped from workspace_path)
+        # Notebook with extension (K8s) — import via workspace.import_()
         language, import_format = NOTEBOOK_LANG_MAP[file_ext]
         with open(file_path, "rb") as f:
             content = base64.b64encode(f.read()).decode("utf-8")
@@ -186,6 +189,17 @@ def _import_file(notebook_service: NotebookService, file_path: str, workspace_pa
             content=content,
             format=import_format,
             language=language,
+            overwrite=True,
+        )
+    elif IS_DATABRICKS_APPS and file_ext == '':
+        # Databricks Apps strips .py from notebooks — extensionless file is a Python notebook
+        with open(file_path, "rb") as f:
+            content = base64.b64encode(f.read()).decode("utf-8")
+        notebook_service.w.workspace.import_(
+            path=workspace_path,
+            content=content,
+            format=ImportFormat.SOURCE,
+            language=Language.PYTHON,
             overwrite=True,
         )
     else:
@@ -292,13 +306,28 @@ def _sync_survivorship_udf(
             app_logger.warning("catalog_name or cron_warehouse_id not configured — skipping UDF registration")
             return False
 
+        from lakefusion_utility.utils.databricks_util import get_app_sp_token, generate_pat
+        token = get_app_sp_token() or generate_pat()
+        if not token:
+            app_logger.warning("No token available for UDF registration — skipping")
+            return False
+
         from lakefusion_utility.services.catalog_setup_service import CatalogSetupService
         svc = CatalogSetupService(
-            token=lakefusion_databricks_dapi,
+            token=token,
             warehouse_id=warehouse_id,
             catalog_name=catalog_name,
         )
-        success = svc.register_survivorship_udf()
+
+        # Run with timeout to prevent blocking app startup
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(svc.register_survivorship_udf)
+            try:
+                success = future.result(timeout=60)
+            except concurrent.futures.TimeoutError:
+                app_logger.warning("Survivorship UDF registration timed out after 60s — skipping (will retry next sync)")
+                return False
 
         if success:
             service.mark_imported(registry_item, file_hash=current_hash)

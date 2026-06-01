@@ -229,14 +229,15 @@ async def lifespan(app):
 
                 # Step 6: Sync PT config to Volume
                 try:
-                    token = os.environ.get('LAKEFUSION_DATABRICKS_DAPI', '')
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token, generate_pat
+                    token = get_app_sp_token() or generate_pat()
                     if token:
                         logger.info("Syncing PT config to Volume on startup...")
                         pt_service = PTModelsConfigService(db)
                         pt_service.sync_to_volume(token)
                         logger.info("PT config synced to Volume on startup")
                     else:
-                        logger.info("Skipping PT config startup sync (no DAPI token — App SP mode)")
+                        logger.warning("No token available — skipping PT config startup sync")
                 except Exception as e:
                     logger.error(f"Error during PT config startup sync: {e}")
 

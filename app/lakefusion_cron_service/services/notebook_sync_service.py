@@ -22,6 +22,9 @@ from lakefusion_utility.utils.logging_utils import get_logger
 
 app_logger = get_logger(__name__)
 
+# Databricks Apps strips .py extension from notebooks on the container filesystem
+IS_DATABRICKS_APPS = bool(os.environ.get('DATABRICKS_APP_URL'))
+
 # Extensions treated as notebooks — imported via workspace.import_() (extension removed)
 NOTEBOOK_EXTENSIONS = {'.py', '.sql', '.scala', '.r', '.ipynb'}
 # Extensions treated as regular files — uploaded via import_single_file (extension preserved)
@@ -69,7 +72,7 @@ class NotebookSyncService:
         Walk dbx_pipeline_artifacts/, register new items, archive removed ones.
         Returns counts: {registered: N, reactivated: N, archived: N}
         """
-        counts = {"registered": 0, "reactivated": 0, "archived": 0}
+        counts = {"registered": 0, "reactivated": 0, "archived": 0, "total_files_on_disk": 0}
         discovered_paths = set()
 
         if not os.path.exists(artifacts_dir):
@@ -105,11 +108,16 @@ class NotebookSyncService:
                 is_regular = file_ext in REGULAR_FILE_EXTENSIONS
 
                 if not is_notebook and not is_regular:
-                    continue  # Unknown extension — skip
+                    if IS_DATABRICKS_APPS and file_ext == '':
+                        # Databricks Apps strips .py from notebooks — treat extensionless files as notebooks
+                        is_notebook = True
+                    else:
+                        continue  # Unknown extension — skip
 
                 if is_notebook:
                     # Notebooks: strip extension from artifact_path (Databricks convention)
-                    display = os.path.splitext(file_name)[0]
+                    # In Databricks Apps, file_name already has no extension
+                    display = os.path.splitext(file_name)[0] if file_ext else file_name
                     item_type = "NOTEBOOK"
                 else:
                     # Regular files: keep extension in artifact_path
@@ -134,6 +142,9 @@ class NotebookSyncService:
                     counts=counts,
                 )
                 discovered_paths.add(artifact_path)
+                counts["total_files_on_disk"] += 1
+
+        app_logger.info(f"Filesystem walk complete: {counts['total_files_on_disk']} trackable files discovered on disk")
 
         # Archive items no longer in artifacts
         active_items = (
@@ -149,7 +160,8 @@ class NotebookSyncService:
 
         self.db.commit()
         app_logger.info(
-            f"Registry scan complete: {counts['registered']} registered, "
+            f"Registry scan complete: {counts['total_files_on_disk']} files on disk, "
+            f"{counts['registered']} new registered, "
             f"{counts['reactivated']} reactivated, {counts['archived']} archived"
         )
         return counts
@@ -361,6 +373,7 @@ class NotebookSyncService:
             .order_by(NotebookSyncRegistry.artifact_path)
             .all()
         )
+        app_logger.info(f"Force sync: {len(notebooks)} active NOTEBOOK/FILE items in registry")
 
         decisions = []
         for nb in notebooks:

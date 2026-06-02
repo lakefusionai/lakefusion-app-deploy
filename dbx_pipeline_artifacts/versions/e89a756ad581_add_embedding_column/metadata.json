@@ -1,6 +1,6 @@
 {
   "revision": "e89a756ad581_add_embedding_column",
-  "down_revision": "364310613380_deterministic_rules",
+  "down_revision": "c4d2e8f7a1b9_lf_audit_columns",
   "description": "Add attributes_combined_embedding ARRAY<FLOAT> column to master and unified tables for precomputed embedding mode",
   "created_at": "2026-04-28T12:00:00Z",
   "author": "smaheshwari@lakefusion.ai",

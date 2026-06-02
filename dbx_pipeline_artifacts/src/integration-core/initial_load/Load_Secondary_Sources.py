@@ -308,50 +308,100 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
         # Step 2d: Apply attribute mapping WITH TYPE CASTING
         logger.info(f"\n[{idx}.d] Applying attribute mapping with type casting...")
         
-        # Build the select expressions for column mapping WITH TYPE CASTING
-        # Mapping format: {entity_attr: dataset_attr}
-        select_exprs = []
-        mapped_columns = set()
-        
-        for entity_attr, dataset_attr in secondary_mapping.items():
-            if dataset_attr in secondary_df.columns:
-                # Get the target data type from entity model
-                target_dtype_str = entity_attributes_datatype.get(entity_attr, 'string')
-                target_spark_dtype = get_spark_data_type(target_dtype_str)
-                
-                # Get source data type
-                source_field = [f for f in secondary_df.schema.fields if f.name == dataset_attr][0]
-                source_dtype = source_field.dataType
-                
-                # Cast to target type to match unified/master table schema
-                select_exprs.append(col(dataset_attr).cast(target_spark_dtype).alias(entity_attr))
-                mapped_columns.add(entity_attr)
-                
-                # Log the mapping with type info
-                if str(source_dtype) != str(target_spark_dtype):
-                    logger.info(f"    Mapped: {dataset_attr} ({source_dtype}) → {entity_attr} ({target_spark_dtype}) [CAST]")
+        # ── complex-aware projection ───────────────────────────
+        # Lazy-import + sys.path bootstrap so this works in Databricks repos
+        # and local dev without a wheel install.
+        import os as _pp_os, sys as _pp_sys
+        _pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+        for _i in range(len(_pp_parts) - 1, -1, -1):
+            if _pp_parts[_i] == "src":
+                _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+                if _src_path not in _pp_sys.path:
+                    _pp_sys.path.insert(0, _src_path)
+                break
+
+        try:
+            _full_mapping_raw = dbutils.jobs.taskValues.get(
+                taskKey="Parse_Entity_Model_JSON",
+                key="attributes_mapping_full",
+                debugValue="[]",
+            )
+            _attributes_mapping_full = json.loads(_full_mapping_raw) if _full_mapping_raw else []
+        except Exception:
+            _attributes_mapping_full = []
+
+        try:
+            _records_raw = dbutils.jobs.taskValues.get(
+                taskKey="Parse_Entity_Model_JSON",
+                key="entity_attribute_records",
+                debugValue="[]",
+            )
+            entity_attribute_records = json.loads(_records_raw) if _records_raw else []
+        except Exception:
+            entity_attribute_records = []
+
+        _has_complex_attrs = any(
+            (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT")
+            for rec in entity_attribute_records
+        )
+        _full_records_for_table = None
+        for _entry in _attributes_mapping_full:
+            if secondary_table in _entry:
+                _full_records_for_table = _entry[secondary_table]
+                break
+
+        if _has_complex_attrs and _full_records_for_table:
+            from utils.complex_type_mapping import project_source_to_target
+
+            logger.info(f" Using complex-type projection")
+            mapped_df = project_source_to_target(
+                secondary_df, _full_records_for_table, entity_attribute_records
+            )
+            mapped_columns = set(mapped_df.columns)
+        else:
+            # Legacy scalar-only projection path.
+            select_exprs = []
+            mapped_columns = set()
+
+            for entity_attr, dataset_attr in secondary_mapping.items():
+                if dataset_attr in secondary_df.columns:
+                    target_dtype_str = entity_attributes_datatype.get(entity_attr, 'string')
+                    target_spark_dtype = get_spark_data_type(target_dtype_str)
+
+                    source_field = [f for f in secondary_df.schema.fields if f.name == dataset_attr][0]
+                    source_dtype = source_field.dataType
+
+                    select_exprs.append(col(dataset_attr).cast(target_spark_dtype).alias(entity_attr))
+                    mapped_columns.add(entity_attr)
+
+                    if str(source_dtype) != str(target_spark_dtype):
+                        logger.info(f"    Mapped: {dataset_attr} ({source_dtype}) → {entity_attr} ({target_spark_dtype}) [CAST]")
+                    else:
+                        logger.info(f"    Mapped: {dataset_attr} → {entity_attr} ({target_spark_dtype})")
                 else:
-                    logger.info(f"    Mapped: {dataset_attr} → {entity_attr} ({target_spark_dtype})")
-            else:
-                logger.warning(f"     Warning: Dataset column '{dataset_attr}' not found in source table")
-        
-        logger.info(f"  Mapped {len(select_exprs)} columns")
-        
-        # Add missing entity attributes as NULL with CORRECT data type from entity model
+                    logger.warning(f"     Warning: Dataset column '{dataset_attr}' not found in source table")
+
+            logger.info(f"  Mapped {len(select_exprs)} columns")
+            mapped_df = secondary_df.select(*select_exprs)
+
+        # Add missing entity attributes as NULL with the correct (possibly nested) type.
+        from utils.spark_types import get_complex_spark_data_type as _resolve_complex_dtype
+        _records_by_name = {r["name"]: r for r in entity_attribute_records if isinstance(r, dict) and r.get("name")}
         missing_attrs = 0
         for attr in entity_attributes:
-            if attr not in mapped_columns and attr != "lakefusion_id":
-                # Get the correct data type from entity model
+            if attr in mapped_columns or attr == "lakefusion_id":
+                continue
+            rec = _records_by_name.get(attr)
+            if rec and (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT"):
+                spark_dtype = _resolve_complex_dtype(rec)
+            else:
                 dtype_str = entity_attributes_datatype.get(attr, 'string')
                 spark_dtype = get_spark_data_type(dtype_str)
-                select_exprs.append(lit(None).cast(spark_dtype).alias(attr))
-                missing_attrs += 1
-        
+            mapped_df = mapped_df.withColumn(attr, lit(None).cast(spark_dtype))
+            missing_attrs += 1
+
         if missing_attrs > 0:
             logger.info(f"  Added {missing_attrs} missing attributes as NULL (with correct types)")
-        
-        # Apply all mappings in a single select operation - this avoids ambiguous references
-        mapped_df = secondary_df.select(*select_exprs)
         
         logger.info(f"  Resulting columns: {mapped_df.columns}")
         logger.info(f"  All columns now match unified table schema types")
@@ -394,10 +444,18 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
             src = display_col if display_col in mapped_df.columns else attr
             concat_cols.append(col(src))
 
-        mapped_df = mapped_df.withColumn(
-            "attributes_combined",
-            concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
-        )
+        # complex-aware attributes_combined.
+        if _has_complex_attrs:
+            from utils.attributes_combined import build_attributes_combined_column
+            mapped_df = mapped_df.withColumn(
+                "attributes_combined",
+                build_attributes_combined_column(mapped_df, combine_attrs, entity_attribute_records),
+            )
+        else:
+            mapped_df = mapped_df.withColumn(
+                "attributes_combined",
+                concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
+            )
 
         # Drop the resolver's __display columns before downstream writes
         for attr in combine_attrs:

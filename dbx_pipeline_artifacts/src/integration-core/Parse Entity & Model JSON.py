@@ -66,7 +66,22 @@ master_table = entity_json.get("path")
 primary_table = get_primary_dataset_path(entity_json["dataset_mappings"])
 dataset_tables, dataset_objects = get_dataset_tables(entity_json["dataset_mappings"])
 entity_attributes = [item["name"] for item in entity_json.get("attributes")]
+# Full attribute records carry name + type + is_array + struct_definition
+# so downstream notebooks (Create_Tables, Incremental_Load_To_Unified, …)
+# can resolve STRUCT / ARRAY columns to nested Spark types.
+entity_attribute_records = [
+    {
+        "name": item.get("name"),
+        "type": item.get("type"),
+        "is_array": bool(item.get("is_array", False)),
+        "struct_definition": item.get("struct_definition"),
+    }
+    for item in entity_json.get("attributes", [])
+]
 attributes_mapping = parse_attributes_mapping_json(entity_json["dataset_mappings"])
+# Full mapping records preserving mode + sub_field_map for complex-type
+# loaders. Legacy callers continue to read ATTRIBUTES_MAPPING.
+attributes_mapping_full = parse_attributes_mapping_full(entity_json["dataset_mappings"])
 entity_attributes_datatype = {item["name"]: item["type"] for item in entity_json.get("attributes")}
 primary_key = next(
     (attr['name'] for attr in entity_json.get("attributes") if attr.get('is_primary_key') == True), 
@@ -216,7 +231,9 @@ dbutils.jobs.taskValues.set(TaskValueKey.DATASET_TABLES.value, json.dumps(datase
 dbutils.jobs.taskValues.set(TaskValueKey.DATASET_OBJECTS.value, json.dumps(dataset_objects))
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTES.value, json.dumps(entity_attributes))
 dbutils.jobs.taskValues.set(TaskValueKey.ATTRIBUTES_MAPPING.value, json.dumps(attributes_mapping))
+dbutils.jobs.taskValues.set(TaskValueKey.ATTRIBUTES_MAPPING_FULL.value, json.dumps(attributes_mapping_full))
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTES_DATATYPE.value, json.dumps(entity_attributes_datatype))
+dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTE_RECORDS.value, json.dumps(entity_attribute_records))
 dbutils.jobs.taskValues.set(TaskValueKey.DEFAULT_SURVIVORSHIP_RULES.value, json.dumps(default_survivorship_rules))
 dbutils.jobs.taskValues.set(TaskValueKey.VALIDATION_FUNCTIONS.value, json.dumps(validation_functions))
 dbutils.jobs.taskValues.set(TaskValueKey.IS_GOLDEN_DEDUPLICATION.value, dataset_tables_len)
@@ -266,6 +283,13 @@ embedding_model_source = model_json.get('embedding_model_source', 'databricks_fo
 embedding_model_source_str = embedding_model_source
 attribute_objects = model_json.get('attributes', '')
 attributes = [attribute.get('name') for attribute in attribute_objects]
+# Sub-field selection per model-config attribute (only meaningful for STRUCT
+# / ARRAY<STRUCT> targets). Empty / missing = use all sub-fields.
+model_selected_sub_fields = {
+    a.get('name'): a.get('selected_sub_fields') or []
+    for a in attribute_objects
+    if a.get('name') and a.get('selected_sub_fields')
+}
 config_thresholds = model_json.get('config_thresold')
 vs_endpoint = model_json.get('vs_endpoint')
 additional_instructions = model_json.get('additional_instructions', '').replace("'", "''")
@@ -428,6 +452,9 @@ dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL_SOURCE.value, embedding
 dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL.value, embedding_model)
 dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL_ENDPOINT.value, embedding_model_endpoint)
 dbutils.jobs.taskValues.set(TaskValueKey.MATCH_ATTRIBUTES.value, json.dumps(attributes))
+dbutils.jobs.taskValues.set(
+    TaskValueKey.MODEL_SELECTED_SUB_FIELDS.value, json.dumps(model_selected_sub_fields)
+)
 dbutils.jobs.taskValues.set(TaskValueKey.CONFIG_THRESHOLDS.value, json.dumps(config_thresholds))
 dbutils.jobs.taskValues.set(TaskValueKey.PROCESS_RECORDS.value, process_records)
 dbutils.jobs.taskValues.set(TaskValueKey.VS_ENDPOINT.value, vs_endpoint)

@@ -59,6 +59,14 @@ reference_attribute_config = dbutils.jobs.taskValues.get(
     debugValue="{}"
 )
 
+# Full attribute records — needed so STRUCT / ARRAY survivorship outputs cast
+# back to nested types via from_json(...) before MERGE.
+entity_attribute_records_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="entity_attribute_records",
+    debugValue="[]",
+)
+
 # COMMAND ----------
 
 # Parse JSON parameters
@@ -72,6 +80,14 @@ reference_attribute_config = (
     if isinstance(reference_attribute_config, str)
     else (reference_attribute_config or {})
 )
+try:
+    entity_attribute_records = json.loads(entity_attribute_records_raw) if entity_attribute_records_raw else []
+except Exception:
+    entity_attribute_records = []
+_records_by_name = {
+    r["name"]: r for r in entity_attribute_records
+    if isinstance(r, dict) and r.get("name")
+}
 
 # COMMAND ----------
 
@@ -364,7 +380,10 @@ def apply_survivorship_wrapper(unified_records):
     Converts Spark Rows to dicts and applies survivorship.
     """
     # Convert Spark Rows to dictionaries
-    records_list = [r.asDict() for r in unified_records]
+    # recursive=True so nested STRUCT / ARRAY values become dicts / lists
+    # — required by Struct Merge and array-aware Aggregation strategies that
+    # do `isinstance(value, dict)` / `isinstance(value, list)` checks.
+    records_list = [r.asDict(recursive=True) for r in unified_records]
     
     # Apply survivorship
     result = engine.apply_survivorship(unified_records=records_list)
@@ -418,8 +437,8 @@ for attr in entity_attributes:
         continue
     
     target_type = entity_attributes_datatype.get(attr, "string")
-    
-    master_updates_cols.append(merged_record_column(attr, target_type))
+    rec = _records_by_name.get(attr)
+    master_updates_cols.append(merged_record_column(attr, target_type, rec))
 
 # attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
 # Uses build_attributes_combined_column from utils/rdm_resolver, which handles

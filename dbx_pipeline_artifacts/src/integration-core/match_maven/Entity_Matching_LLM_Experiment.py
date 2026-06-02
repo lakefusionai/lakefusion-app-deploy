@@ -132,6 +132,60 @@ max_potential_matches = dbutils.jobs.taskValues.get(
 
 # DBTITLE 1,Process Parameters
 attributes = json.loads(attributes) if isinstance(attributes, str) and attributes else []
+
+# full attribute records for LLM prompt enrichment (STRUCT / ARRAY
+# descriptors). Empty list -> scalar-only entity, prompt renders bare names.
+try:
+    _attr_records_raw = dbutils.jobs.taskValues.get(
+        taskKey="Parse_Entity_Model_JSON",
+        key="entity_attribute_records",
+        debugValue="[]",
+    )
+    entity_attribute_records = json.loads(_attr_records_raw) if _attr_records_raw else []
+except Exception:
+    entity_attribute_records = []
+
+# Bootstrap sys.path so utils.* resolves in Databricks repos + local dev.
+import os as _pp_os
+import sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _pp_src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _pp_src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _pp_src_path)
+        break
+
+# Use the core engine util when available; otherwise fall back to bare-name
+# join so scalar-only entities don't regress in environments where the wheel
+# hasn't been installed yet.
+try:
+    from lakefusion_core_engine.utils.attribute_prompt_utils import (
+        build_attribute_descriptors as _build_attribute_descriptors,
+        merge_selected_sub_fields as _merge_selected_sub_fields,
+    )
+except Exception:
+    def _build_attribute_descriptors(names, records=None, separator=" | "):
+        return separator.join(names)
+    def _merge_selected_sub_fields(records, selection):
+        return list(records or [])
+
+# Per-attribute sub-field selection from model config (sub-field selection
+# story). Empty dict = no per-attribute narrowing.
+try:
+    _selected_sub_fields_raw = dbutils.jobs.taskValues.get(
+        taskKey="Parse_Entity_Model_JSON",
+        key="model_selected_sub_fields",
+        debugValue="{}",
+    )
+    model_selected_sub_fields = json.loads(_selected_sub_fields_raw) if _selected_sub_fields_raw else {}
+except Exception:
+    model_selected_sub_fields = {}
+
+# Fold selection into entity_attribute_records so the descriptor narrows.
+entity_attribute_records = _merge_selected_sub_fields(
+    entity_attribute_records, model_selected_sub_fields
+)
 max_potential_matches = int(max_potential_matches) if max_potential_matches else 3
 
 # COMMAND ----------
@@ -761,7 +815,8 @@ logger.info("\n" + "=" * 80)
 logger.info("STEP 5: BUILD LLM QUERY")
 logger.info("=" * 80)
 
-attribute_order = ' | '.join(attributes)
+# enriched attribute descriptors for STRUCT / ARRAY attrs.
+attribute_order = _build_attribute_descriptors(attributes, entity_attribute_records)
 additional_instructions_text = additional_instructions.strip() if additional_instructions else ""
 
 logger.info(f"Building LLM query for {max_potential_matches} matches per record")
@@ -830,7 +885,7 @@ else:
         base_prompt,
         entity=entity,
         additional_instructions=additional_instructions,
-        attributes=' | '.join(attributes),
+        attributes=attribute_order, # enriched
         max_potential_matches=max_potential_matches
     )
     safe_prompt = formatted_prompt.replace("'", "\\'")

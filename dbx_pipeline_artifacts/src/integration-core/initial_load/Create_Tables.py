@@ -60,6 +60,16 @@ entity_attributes_datatype = dbutils.jobs.taskValues.get(
     debugValue=dbutils.widgets.get("entity_attributes_datatype")
 )
 
+# Full attribute records (name + type + is_array + struct_definition) — used
+# to build nested Spark schemas for STRUCT / ARRAY columns.
+# Empty list when running against a legacy task that doesn't export the
+# records; create_schema_fields then falls back to the scalar path.
+entity_attribute_records = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="entity_attribute_records",
+    debugValue="[]",
+)
+
 dataset_tables = dbutils.jobs.taskValues.get(
     taskKey="Parse_Entity_Model_JSON",
     key="dataset_tables",
@@ -77,6 +87,7 @@ experiment_id = dbutils.widgets.get("experiment_id")
 # DBTITLE 1,Parse JSON strings
 entity_attributes = json.loads(entity_attributes)
 entity_attributes_datatype = json.loads(entity_attributes_datatype)
+entity_attribute_records = json.loads(entity_attribute_records) if entity_attribute_records else []
 dataset_tables = json.loads(dataset_tables)
 
 # COMMAND ----------
@@ -113,76 +124,42 @@ logger.info(f"  Attribute Version Sources: {attribute_version_sources_table}")
 
 # COMMAND ----------
 
-def get_spark_data_type(dtype_str):
-    """
-    Convert string data type to Spark DataType.
-    Handles both old lowercase types and new uppercase types.
-    """
-    dtype_map = {
-        # New uppercase types (primary)
-        'BIGINT': LongType(),
-        'BOOLEAN': BooleanType(),
-        'DATE': DateType(),
-        'DOUBLE': DoubleType(),
-        'FLOAT': FloatType(),
-        'INT': IntegerType(),
-        'SMALLINT': ShortType(),
-        'STRING': StringType(),
-        'TINYINT': ByteType(),
-        'TIMESTAMP': TimestampType(),
-        
-        # Legacy lowercase types (backward compatibility)
-        'bigint': LongType(),
-        'boolean': BooleanType(),
-        'char': StringType(),
-        'varchar': StringType(),
-        'date': DateType(),
-        'double precision': DoubleType(),
-        'double': DoubleType(),
-        'integer': IntegerType(),
-        'int': IntegerType(),
-        'long': LongType(),
-        'numeric': FloatType(),
-        'real': FloatType(),
-        'smallint': ShortType(),
-        'text': StringType(),
-        'string': StringType(),
-        'timestamp': TimestampType(),
-        'float': FloatType(),
-        'decimal': DoubleType(),
-    }
-    
-    # Try exact match first, then lowercase fallback
-    return dtype_map.get(dtype_str, dtype_map.get(dtype_str.lower(), StringType()))
+# Centralized type resolution — supports scalar, STRUCT, and
+# ARRAY types. Includes legacy lowercase + uppercase variants for backward
+# compatibility with older entity exports.
+#
+# Locate dbx_pipeline_artifacts/src so `utils.spark_types` resolves when the
+# notebook is executed without a wheel install (Databricks repos + local dev).
+import os as _os
+import sys as _sys
+_pp = _os.getcwd().split(_os.sep)
+for _i in range(len(_pp) - 1, -1, -1):
+    if _pp[_i] == "src":
+        _src = _os.sep.join(_pp[: _i + 1])
+        if _src not in _sys.path:
+            _sys.path.insert(0, _src)
+        break
+
+from utils.spark_types import (
+    create_schema_fields as _build_schema_fields,
+    get_spark_data_type,
+)
+
 
 def create_schema_fields(attributes_list, attributes_datatype_dict, include_lakefusion_id=True):
+    """Build StructFields for an entity table.
+
+    Thin wrapper that feeds the centralized util the entity-level
+    `entity_attribute_records` so STRUCT and ARRAY columns get resolved to
+    proper nested Spark types. Legacy scalar callers see no behavior change.
     """
-    Create StructFields for a schema.
-    
-    Args:
-        attributes_list: List of attribute names (EXACT names from entity)
-        attributes_datatype_dict: Dict mapping attribute name to data type
-        include_lakefusion_id: Whether to include lakefusion_id field
-        
-    Returns:
-        List of StructField objects
-    """
-    fields = []
-    
-    # Add lakefusion_id if requested (only for master table)
-    if include_lakefusion_id:
-        fields.append(StructField(id_key, StringType(), True))
-    
-    # Add all entity attributes with EXACT names
-    for attr_name in attributes_list:
-        if attr_name == id_key:  # Skip if it's lakefusion_id
-            continue
-        
-        dtype_str = attributes_datatype_dict.get(attr_name, 'string')
-        spark_dtype = get_spark_data_type(dtype_str)
-        fields.append(StructField(attr_name, spark_dtype, True))
-    
-    return fields
+    return _build_schema_fields(
+        attributes_list,
+        attributes_datatype_dict,
+        include_lakefusion_id=include_lakefusion_id,
+        id_key=id_key,
+        attributes=entity_attribute_records or None,
+    )
 
 def enable_cdf_on_table(table_name):
     """
@@ -269,15 +246,16 @@ unified_fields = [
     StructField("__lf_modified_at", TimestampType(), True),
 ]
 
-# Add all entity attributes (NO lakefusion_id in unified)
-for attr_name in entity_attributes:
-    if attr_name == id_key:  # Skip lakefusion_id
-        continue
-    
-    # Get datatype, default to 'string' if not found
-    dtype_str = entity_attributes_datatype.get(attr_name, 'string') if isinstance(entity_attributes_datatype, dict) else 'string'
-    spark_dtype = get_spark_data_type(dtype_str)
-    unified_fields.append(StructField(attr_name, spark_dtype, True))
+# Add all entity attributes (NO lakefusion_id in unified). Delegate to the
+# centralized helper so STRUCT and ARRAY columns get nested Spark types
+# instead of the StringType fallback. include_lakefusion_id=False because
+# unified rows are keyed on surrogate_key + master_lakefusion_id, not lakefusion_id.
+unified_attr_fields = create_schema_fields(
+    entity_attributes,
+    entity_attributes_datatype if isinstance(entity_attributes_datatype, dict) else {},
+    include_lakefusion_id=False,
+)
+unified_fields.extend(unified_attr_fields)
 
 
 unified_schema = StructType(unified_fields)

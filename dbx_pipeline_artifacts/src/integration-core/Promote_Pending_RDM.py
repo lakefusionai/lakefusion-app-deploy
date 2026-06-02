@@ -102,6 +102,9 @@ match_attributes = dbutils.jobs.taskValues.get(
 rdm_configs = dbutils.jobs.taskValues.get(
     "Parse_Entity_Model_JSON", "rdm_configs", debugValue="[]",
 )
+entity_attribute_records_raw = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON", "entity_attribute_records", debugValue="[]",
+)
 
 # COMMAND ----------
 
@@ -114,6 +117,24 @@ entity_attributes = json.loads(entity_attributes) if isinstance(entity_attribute
 entity_attributes_datatype = json.loads(entity_attributes_datatype) if isinstance(entity_attributes_datatype, str) else entity_attributes_datatype
 match_attributes = json.loads(match_attributes) if isinstance(match_attributes, str) else match_attributes
 rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+try:
+    entity_attribute_records = json.loads(entity_attribute_records_raw) if entity_attribute_records_raw else []
+except Exception:
+    entity_attribute_records = []
+_records_by_name = {
+    r["name"]: r for r in entity_attribute_records
+    if isinstance(r, dict) and r.get("name")
+}
+
+# Make utils importable for build_attributes_combined_column.
+import os as _pp_os, sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _src_path)
+        break
 
 if isinstance(is_single_source, str):
     is_single_source = is_single_source.lower() == "true"
@@ -214,20 +235,33 @@ generate_lakefusion_id_udf = F.udf(
 
 
 def _add_attributes_combined(approved_df):
-    """Build attributes_combined from the resolver's __display columns,
-    falling back to the raw entity column when no __display is present."""
+    """Build attributes_combined with complex-type awareness. STRUCT folds
+    to space-joined sub-fields, ARRAY / ARRAY<STRUCT> JSON-serialize. Falls
+    back to scalar string for resolver `__display` aliases."""
     available = [a for a in match_attributes if a in approved_df.columns]
     if not available:
         return approved_df.withColumn("attributes_combined", F.lit(""))
 
-    concat_cols = []
+    from utils.attributes_combined import build_attributes_combined_column
+
+    effective_names = []
     for c in available:
         disp = f"{c}__display"
-        src = disp if disp in approved_df.columns else c
-        concat_cols.append(F.col(src).cast("string"))
+        effective_names.append(disp if disp in approved_df.columns else c)
+
+    effective_records = []
+    for original_attr, eff_name in zip(available, effective_names):
+        if eff_name == original_attr:
+            rec = _records_by_name.get(original_attr, {})
+            if rec:
+                rec = {**rec, "name": original_attr}
+            effective_records.append(rec)
+        else:
+            effective_records.append({"name": eff_name})
 
     df = approved_df.withColumn(
-        "attributes_combined", F.concat_ws(" | ", *concat_cols)
+        "attributes_combined",
+        build_attributes_combined_column(approved_df, effective_names, effective_records),
     )
     for c in available:
         disp = f"{c}__display"

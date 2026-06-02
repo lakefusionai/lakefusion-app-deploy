@@ -590,6 +590,33 @@ def build_attributes_combined_column(
         udf_cache[cache_key] = udf_fn
         return udf_fn
 
+    # Complex (STRUCT / ARRAY / ARRAY<STRUCT>) values arrive as JSON strings
+    # because the survivorship engine JSON-serialises non-scalar outputs.
+    # Strip keys + brackets and join leaf values so attributes_combined
+    # carries only the VALUES — keys inside JSON pollute vector search.
+    import json as _json
+
+    def _flatten_json_to_values(s):
+        if s is None or s == "":
+            return s
+        try:
+            parsed = _json.loads(s)
+        except Exception:
+            return s
+        def walk(x):
+            if x is None:
+                return ""
+            if isinstance(x, list):
+                return " ".join(p for p in (walk(i) for i in x) if p)
+            if isinstance(x, dict):
+                return " ".join(p for p in (walk(v) for v in x.values()) if p)
+            if isinstance(x, bool):
+                return "true" if x else "false"
+            return str(x)
+        return walk(parsed)
+
+    _flatten_udf = F.udf(_flatten_json_to_values, StringType())
+
     concat_cols = []
     for attr in match_attributes:
         if attr not in entity_attributes or attr == id_key:
@@ -604,6 +631,11 @@ def build_attributes_combined_column(
                 ref_cfg["ref_table"],
                 ref_cfg.get("output_attr", attr),
             )(col_ref)
+        else:
+            # Non-ref attrs: pass through JSON-flatten so complex types
+            # collapse to value-only strings. Scalar JSON-shape strings are
+            # rare; on parse failure the value is returned unchanged.
+            col_ref = _flatten_udf(col_ref)
 
         concat_cols.append(F.coalesce(col_ref, F.lit("")))
 

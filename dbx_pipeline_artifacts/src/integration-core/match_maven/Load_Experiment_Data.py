@@ -158,6 +158,23 @@ dataset_objects = dbutils.jobs.taskValues.get(
     debugValue="{}"
 )
 
+# Complex-type aware payloads (STRUCT / ARRAY support).
+attributes_mapping_full_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="attributes_mapping_full",
+    debugValue="[]",
+)
+entity_attribute_records_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="entity_attribute_records",
+    debugValue="[]",
+)
+model_selected_sub_fields_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="model_selected_sub_fields",
+    debugValue="{}",
+)
+
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
@@ -182,6 +199,39 @@ attributes_mapping = json.loads(attributes_mapping)
 dataset_tables = json.loads(dataset_tables)
 rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
 dataset_objects = json.loads(dataset_objects) if isinstance(dataset_objects, str) else (dataset_objects or {})
+
+try:
+    attributes_mapping_full = json.loads(attributes_mapping_full_raw) if attributes_mapping_full_raw else []
+except Exception:
+    attributes_mapping_full = []
+try:
+    entity_attribute_records = json.loads(entity_attribute_records_raw) if entity_attribute_records_raw else []
+except Exception:
+    entity_attribute_records = []
+try:
+    model_selected_sub_fields = json.loads(model_selected_sub_fields_raw) if model_selected_sub_fields_raw else {}
+except Exception:
+    model_selected_sub_fields = {}
+
+_has_complex_attrs = any(
+    (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT")
+    for rec in entity_attribute_records
+    if isinstance(rec, dict)
+)
+_records_by_name = {
+    r["name"]: r for r in entity_attribute_records
+    if isinstance(r, dict) and r.get("name")
+}
+
+# Make utils importable for project_source_to_target.
+import os as _pp_os, sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _src_path)
+        break
 
 # run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
 try:
@@ -262,45 +312,68 @@ generate_surrogate_key_udf = udf(
 def apply_attribute_mapping(df, table_name, mapping_list, entity_attrs, entity_attr_dtypes):
     """
     Apply attribute mapping with type casting to a DataFrame.
-    
-    Args:
-        df: Source DataFrame
-        table_name: Name of the source table
-        mapping_list: List of mapping dictionaries
-        entity_attrs: List of entity attribute names
-        entity_attr_dtypes: Dict of attribute data types
-        
-    Returns:
-        DataFrame with mapped and typed columns
+
+    Complex types (STRUCT, ARRAY, ARRAY<STRUCT>) are projected via
+    `project_source_to_target` so direct_column / subfield_assembly /
+    scalar-to-array auto-wrap all work and the produced struct field order
+    matches the target Delta schema (avoids DELTA_FAILED_TO_MERGE_FIELDS).
+    Scalar-only entities continue through the legacy cast path.
     """
-    # Find the mapping for this table
+    # Find legacy scalar mapping for this table (entity_attr -> dataset_attr).
     table_mapping = None
     for mapping_entry in mapping_list:
         if table_name in mapping_entry:
             table_mapping = mapping_entry[table_name]
             break
-    
+
     if not table_mapping:
         raise ValueError(f"No attribute mapping found for table: {table_name}")
-    
-    # Build select expressions
+
+    # Find full rich mapping (with mode + sub_field_map) for this table.
+    full_records = None
+    for _entry in attributes_mapping_full:
+        if isinstance(_entry, dict) and table_name in _entry:
+            full_records = _entry[table_name]
+            break
+
+    if _has_complex_attrs and full_records:
+        from utils.complex_type_mapping import project_source_to_target
+        from utils.spark_types import get_complex_spark_data_type as _resolve_complex_dtype
+
+        mapped_df = project_source_to_target(df, full_records, entity_attribute_records)
+        mapped_columns = set(mapped_df.columns)
+
+        # Backfill missing attributes as NULL with the correct (possibly
+        # nested) Spark type so the master table append schema-matches.
+        for attr in entity_attrs:
+            if attr in mapped_columns or attr == "lakefusion_id":
+                continue
+            rec = _records_by_name.get(attr)
+            if rec and (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT"):
+                spark_dtype = _resolve_complex_dtype(rec)
+            else:
+                dtype_str = entity_attr_dtypes.get(attr, 'string')
+                spark_dtype = get_spark_data_type(dtype_str)
+            mapped_df = mapped_df.withColumn(attr, lit(None).cast(spark_dtype))
+        return mapped_df
+
+    # ── Legacy scalar-only path ─────────────────────────────────────────
     select_exprs = []
     mapped_columns = set()
-    
+
     for entity_attr, dataset_attr in table_mapping.items():
         if dataset_attr in df.columns:
             target_dtype_str = entity_attr_dtypes.get(entity_attr, 'string')
             target_spark_dtype = get_spark_data_type(target_dtype_str)
             select_exprs.append(col(dataset_attr).cast(target_spark_dtype).alias(entity_attr))
             mapped_columns.add(entity_attr)
-    
-    # Add missing attributes as NULL
+
     for attr in entity_attrs:
         if attr not in mapped_columns and attr != "lakefusion_id":
             dtype_str = entity_attr_dtypes.get(attr, 'string')
             spark_dtype = get_spark_data_type(dtype_str)
             select_exprs.append(lit(None).cast(spark_dtype).alias(attr))
-    
+
     return df.select(*select_exprs)
 
 
@@ -327,15 +400,53 @@ def create_attributes_combined(df, combine_attrs, source_id):
         spark, df, rdm_configs, source_id=source_id
     )
 
-    concat_cols = []
+    # Complex-type aware combined string. STRUCT collapses to space-joined
+    # sub-field values, ARRAY/ARRAY<STRUCT> JSON-serializes. RDM resolver may
+    # have produced `<attr>__display` aliases — those take precedence for the
+    # combined string, falling back to the original column.
+    from utils.attributes_combined import build_attributes_combined_column
+
+    effective_names = []
     for attr in combine_attrs:
         display_col = f"{attr}__display"
-        src = display_col if display_col in df.columns else attr
-        concat_cols.append(col(src))
+        effective_names.append(display_col if display_col in df.columns else attr)
 
-    df = df.withColumn("attributes_combined", concat_ws(" | ", *concat_cols))
+    # Build records keyed by the *effective* column name so the builder picks
+    # the right type. Display columns are scalar strings, so passing an empty
+    # record record (record={}) makes the builder fall through to scalar.
+    effective_records = []
+    for original_attr, eff_name in zip(combine_attrs, effective_names):
+        if eff_name == original_attr:
+            rec = _records_by_name.get(original_attr, {})
+            # Builder keys lookup by record['name'], so rename if needed.
+            if rec:
+                rec = {**rec, "name": original_attr}
+            effective_records.append(rec)
+        else:
+            # Display column is always plain string — empty record yields scalar path.
+            effective_records.append({"name": eff_name})
 
-    # Drop the resolver's __display columns before downstream writes
+    # Honour MatchMaven sub-field selection — the builder restricts STRUCT
+    # / ARRAY<STRUCT> fields to those the user chose for embedding.
+    # Selection is keyed by ORIGINAL attribute name; map keys to effective
+    # column names so the builder applies them after RDM display aliasing.
+    effective_sub_field_selection = {}
+    for original_attr, eff_name in zip(combine_attrs, effective_names):
+        sel = (model_selected_sub_fields or {}).get(original_attr)
+        if sel:
+            effective_sub_field_selection[eff_name] = sel
+
+    df = df.withColumn(
+        "attributes_combined",
+        build_attributes_combined_column(
+            df,
+            effective_names,
+            effective_records,
+            selected_sub_fields_by_attr=effective_sub_field_selection,
+        ),
+    )
+
+    # Drop resolver's __display columns before downstream writes
     for attr in combine_attrs:
         display_col = f"{attr}__display"
         if display_col in df.columns:
@@ -438,11 +549,20 @@ if is_single_source:
     logger.info("-"*60)
     
     master_df = spark.table(master_table)
+    # Drop the master-only embedding column before cloning: unified_deduplicate's schema
+    # (created in Create_Tables_Experiment) excludes attributes_combined_embedding, so an
+    # unfiltered clone triggers DELTA_METADATA_MISMATCH on the overwrite below. The VS step
+    # re-adds the column via mergeSchema when embedding_mode == "precomputed".
     unified_dedup_df = master_df.withColumn("search_results", lit("").cast(StringType())) \
-                                 .withColumn("scoring_results", lit("").cast(StringType()))
-    
-    # Overwrite unified_dedup (full clone each time)
-    unified_dedup_df.write.format("delta").mode("overwrite").saveAsTable(unified_dedup_table)
+                                 .withColumn("scoring_results", lit("").cast(StringType())) \
+                                 .drop("attributes_combined_embedding")
+
+    # Overwrite unified_dedup (full clone each time). overwriteSchema=True makes the
+    # write schema-authoritative so it can't fail on drift in either direction — e.g.
+    # a re-run where unified_deduplicate already carries attributes_combined_embedding
+    # (added by the VS step's mergeSchema clone) and this trimmed clone lacks it.
+    unified_dedup_df.write.format("delta").mode("overwrite") \
+        .option("overwriteSchema", "true").saveAsTable(unified_dedup_table)
     
     logger.info(f"  All records have empty search_results and scoring_results")
 

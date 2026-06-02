@@ -1,3 +1,4 @@
+# Databricks notebook source
 from enum import Enum
 import json
 
@@ -22,7 +23,14 @@ class TaskValueKey(str, Enum):
     # Entity attributes and mapping
     ENTITY_ATTRIBUTES = "entity_attributes"
     ATTRIBUTES_MAPPING = "attributes_mapping"
+    # Full mapping records (preserves mode + sub_field_map for STRUCT/ARRAY
+    # targets). Used by complex-type loaders introduced in
+    ATTRIBUTES_MAPPING_FULL = "attributes_mapping_full"
     ENTITY_ATTRIBUTES_DATATYPE = "entity_attributes_datatype"
+    # Full attribute records (name + type + is_array + struct_definition) needed
+    # by table-creation notebooks to resolve complex (STRUCT / ARRAY) columns
+    # to nested Spark types.
+    ENTITY_ATTRIBUTE_RECORDS = "entity_attribute_records"
     RDM_FLAG = "rdm_flag"
     
     # Rules and validation
@@ -50,6 +58,11 @@ class TaskValueKey(str, Enum):
 
     # Matching configuration
     MATCH_ATTRIBUTES = "match_attributes"
+    # Per-attribute sub-field selection from the MatchMaven model config.
+    # Format: { entity_attribute_name: [sub_field_name, ...] }. Empty / absent
+    # entries mean "use all sub-fields". Consumed by LLM prompt enrichment
+    # so STRUCT / ARRAY<STRUCT> descriptors can be narrowed.
+    MODEL_SELECTED_SUB_FIELDS = "model_selected_sub_fields"
     CONFIG_THRESHOLDS = "config_thresholds"
     PROCESS_RECORDS = "process_records"
     VS_ENDPOINT = "vs_endpoint"

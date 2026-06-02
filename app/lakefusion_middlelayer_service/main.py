@@ -34,6 +34,7 @@ from app.lakefusion_middlelayer_service.api.pt_models_route import pt_models_rou
 from app.lakefusion_middlelayer_service.api.schema_evolution_route import schema_evolution_router, schema_evolution_global_router
 from app.lakefusion_middlelayer_service.api.spn_oauth_route import spn_router
 from app.lakefusion_middlelayer_service.api.notebook_sync_route import notebook_sync_router
+from app.lakefusion_middlelayer_service.api.struct_definition_route import struct_definition_router
 from lakefusion_utility.routes.ops import ops_router
 
 
@@ -93,6 +94,7 @@ app.include_router(schema_evolution_router, prefix=f'{app_prefix}')
 app.include_router(notebook_sync_router, prefix=f'{app_prefix}')
 app.include_router(schema_evolution_global_router, prefix=f'{app_prefix}')
 app.include_router(spn_router, prefix=f'{app_prefix}')
+app.include_router(struct_definition_router, prefix=f'{app_prefix}')
 
 logger.info("API up and running")
 

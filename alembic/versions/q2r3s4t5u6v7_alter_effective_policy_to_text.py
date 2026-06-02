@@ -1,7 +1,7 @@
 """alter effective_policy to text
 
 Revision ID: q2r3s4t5u6v7
-Revises: p1q2r3s4t5u6
+Revises: y0z1a2b3c4d5
 Create Date: 2026-04-15 19:30:00.000000
 
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'q2r3s4t5u6v7'
-down_revision: Union[str, None] = 'p1q2r3s4t5u6'
+down_revision: Union[str, None] = 'y0z1a2b3c4d5'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

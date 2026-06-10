@@ -1,0 +1,333 @@
+/* LakeFusion Auth callback page styles */
+
+:root {
+    /* LakeFusion Brand */
+    --lakefusion-brand: #750f11;
+
+    /* LakeFusion Primary Colors */
+    --primary: #0d9488;
+    --primary-light: #14b8a6;
+    --primary-dark: #0f766e;
+    --primary-10: rgba(13, 148, 136, 0.1);
+    --primary-20: rgba(13, 148, 136, 0.2);
+
+    /* Success Colors */
+    --success-primary: #10b981;
+    --success-secondary: #059669;
+    --success-bg: #ecfdf5;
+
+    /* Error Colors */
+    --error-primary: #ef4444;
+    --error-secondary: #dc2626;
+    --error-bg: #fef2f2;
+
+    /* Text Colors */
+    --text-primary: #1e293b;
+    --text-secondary: #64748b;
+    --text-muted: #94a3b8;
+
+    /* Background */
+    --bg-white: #ffffff;
+    --bg-slate-50: #f8fafc;
+    --bg-slate-100: #f1f5f9;
+
+    /* Shadows */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+    --shadow-lg: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+    --shadow-primary: 0 4px 14px rgba(13, 148, 136, 0.25);
+
+    /* Radius */
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 20px;
+    --radius-full: 9999px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: linear-gradient(135deg, var(--bg-slate-50) 0%, white 50%, #ecfdf5 100%);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    color: var(--text-primary);
+}
+
+.container {
+    max-width: 420px;
+    width: 100%;
+    padding: 48px 40px;
+    background: var(--bg-white);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-lg);
+    text-align: center;
+    animation: slideUp 0.4s ease-out;
+    border: 1px solid rgba(0, 0, 0, 0.05);
+}
+
+@keyframes slideUp {
+    from {
+        opacity: 0;
+        transform: translateY(20px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Logo Container */
+.logo-container {
+    position: relative;
+    margin: 0 auto 24px;
+    width: fit-content;
+}
+
+.logo-box {
+    width: 72px;
+    height: 72px;
+    border-radius: var(--radius-lg);
+    background: var(--primary-10);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.logo-box img {
+    width: 48px;
+    height: 48px;
+}
+
+.status-badge {
+    position: absolute;
+    bottom: -4px;
+    right: -4px;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-full);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: var(--shadow-md);
+    border: 2px solid white;
+}
+
+.status-badge svg {
+    width: 16px;
+    height: 16px;
+    color: white;
+}
+
+/* Success state */
+.container.success .status-badge {
+    background: var(--success-primary);
+}
+
+.container.success h1 {
+    color: var(--text-primary);
+}
+
+/* Error state */
+.container.error .status-badge {
+    background: var(--error-primary);
+}
+
+.container.error h1 {
+    color: var(--text-primary);
+}
+
+/* Legacy icon support (fallback) */
+.icon {
+    width: 72px;
+    height: 72px;
+    border-radius: var(--radius-full);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0 auto 24px;
+    box-shadow: var(--shadow-md);
+}
+
+.container.success .icon {
+    background: var(--success-primary);
+}
+
+.container.error .icon {
+    background: var(--error-primary);
+}
+
+.icon svg {
+    width: 36px;
+    height: 36px;
+    color: white;
+}
+
+/* Typography */
+h1 {
+    font-size: 26px;
+    font-weight: 700;
+    margin-bottom: 8px;
+    color: var(--text-primary);
+}
+
+/* Info card */
+.info-card {
+    background: var(--bg-slate-50);
+    padding: 20px 24px;
+    border-radius: var(--radius-md);
+    margin: 24px 0;
+    border: 1px solid var(--bg-slate-100);
+}
+
+.info-card .username {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--primary);
+    margin-bottom: 6px;
+}
+
+.info-card .description {
+    font-size: 14px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+}
+
+.info-card .error-message {
+    font-size: 13px;
+    color: var(--error-primary);
+    word-break: break-word;
+    margin-top: 8px;
+    padding: 10px;
+    background: var(--error-bg);
+    border-radius: 8px;
+}
+
+/* Security Badge */
+.security-badge {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-top: 24px;
+}
+
+.security-badge svg {
+    width: 16px;
+    height: 16px;
+    color: var(--primary);
+}
+
+/* Divider */
+.divider {
+    width: 100%;
+    height: 1px;
+    background: linear-gradient(to right, transparent, var(--bg-slate-100), transparent);
+    margin: 24px 0;
+}
+
+/* Countdown */
+.countdown {
+    font-size: 14px;
+    color: var(--text-muted);
+    margin-top: 20px;
+}
+
+.countdown .timer {
+    font-weight: 700;
+    color: var(--primary);
+}
+
+/* Progress bar */
+.progress-bar {
+    width: 100%;
+    height: 4px;
+    background: var(--bg-slate-100);
+    border-radius: var(--radius-full);
+    margin-top: 16px;
+    overflow: hidden;
+}
+
+.progress-bar .progress {
+    height: 100%;
+    background: linear-gradient(to right, var(--primary), var(--primary-light));
+    border-radius: var(--radius-full);
+    animation: shrink 5s linear forwards;
+}
+
+.container.error .progress-bar .progress {
+    background: linear-gradient(to right, var(--error-primary), #f87171);
+}
+
+@keyframes shrink {
+    from {
+        width: 100%;
+    }
+    to {
+        width: 0%;
+    }
+}
+
+/* Retry text for error page */
+.retry-text {
+    font-size: 14px;
+    color: var(--text-secondary);
+    margin-top: 16px;
+}
+
+/* Footer */
+.footer {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 32px;
+    font-size: 13px;
+    color: var(--text-muted);
+}
+
+.footer .zap-icon {
+    display: flex;
+    align-items: center;
+    color: #10b981;
+}
+
+.footer .zap-icon svg {
+    width: 14px;
+    height: 14px;
+}
+
+.footer .footer-logo {
+    width: 18px;
+    height: 18px;
+    margin-left: 2px;
+}
+
+.footer .brand {
+    font-weight: 600;
+    color: var(--lakefusion-brand);
+}
+
+.footer .separator {
+    color: var(--text-muted);
+    margin: 0 2px;
+}
+
+.footer .version {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}

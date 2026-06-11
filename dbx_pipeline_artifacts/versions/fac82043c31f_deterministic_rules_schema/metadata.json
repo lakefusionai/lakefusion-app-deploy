@@ -1,0 +1,7 @@
+{
+  "revision": "fac82043c31f_deterministic_rules_schema",
+  "down_revision": "e89a756ad581_add_embedding_column",
+  "description": "Deterministic tables migration schema",
+  "created_at": "2026-05-08T06:45:32Z",
+  "author": "sagar@lakefusion.ai"
+}

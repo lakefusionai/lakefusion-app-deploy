@@ -1,0 +1,7 @@
+{
+  "revision": "8863945dcb12_upgrading_datatypes",
+  "down_revision": "1c397f65164d_merge_cleanup",
+  "description": "Updating the datatypes to spark datatypes",
+  "created_at": "2026-01-12T02:36:45Z",
+  "author": "selango@lakefusion.ai"
+}

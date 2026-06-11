@@ -1,0 +1,7 @@
+{
+  "revision": "c4d2e8f7a1b9_lf_audit_columns",
+  "down_revision": "364310613380_deterministic_rules",
+  "description": "Add __lf_created_at and __lf_modified_at audit columns to unified table; backfill from Delta history",
+  "created_at": "2026-05-08T00:00:00Z",
+  "author": "selango@lakefusion.ai"
+}

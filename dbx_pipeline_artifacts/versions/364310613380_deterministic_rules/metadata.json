@@ -1,0 +1,7 @@
+{
+  "revision": "364310613380_deterministic_rules",
+  "down_revision": "8863945dcb12_upgrading_datatypes",
+  "description": "Deterministic to Rule Match",
+  "created_at": "2026-03-26T05:14:17Z",
+  "author": "sagar@lakefusion.ai"
+}

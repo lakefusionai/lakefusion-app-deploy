@@ -297,14 +297,13 @@ async def databricks_auth_middleware(request: FastAPIRequest, call_next):
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
 
-# NOTE: allow_origins=["*"] + allow_credentials=True is technically discouraged by
-# newer Starlette versions, but our pinned Starlette (0.49.x) permits it without error.
-# In Databricks Apps, all requests are same-origin so this is safe. If upgrading Starlette
-# to a version that enforces the restriction, switch to explicit origins or set
-# allow_credentials=False.
+# CORS: use explicit origin from DATABRICKS_APP_URL when available (Databricks Apps),
+# fall back to wildcard for local development only.
+_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+_allowed_origins = [_app_url] if _app_url else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

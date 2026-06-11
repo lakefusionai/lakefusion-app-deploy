@@ -513,22 +513,36 @@ def build_condition_column(cond: dict, rule_allow_nulls: bool, complex_types: di
                             threshold, operator, allow_nulls)
 
 
-
 def apply_rules(df_parsed: DataFrame, rules_config: list, complex_types: dict = None) -> DataFrame:
     """Evaluate each rule per (source row × candidate), produce one
     `<rule>_results` array column per rule containing matched candidate structs."""
     complex_types = complex_types or {}
     non_array_cols = [c for c in df_parsed.columns if c != "search_result_parsed"]
 
+    # A. Explode: one row per candidate
     df_exp = df_parsed.withColumn("_candidate", F.explode("search_result_parsed"))
 
+    # B. Flatten candidate struct fields to top-level columns.
+    #    The candidate struct also carries `lakefusion_id`, which collides with
+    #    the source row's own `lakefusion_id`. Flatten it under a distinct name
+    #    so we can compare the two for self-match detection.
     candidate_fields = [
         f.name for f in
         df_parsed.schema["search_result_parsed"].dataType.elementType.fields
     ]
     for field in candidate_fields:
-        df_exp = df_exp.withColumn(field, F.col(f"_candidate.{field}"))
+        if field == "lakefusion_id":
+            df_exp = df_exp.withColumn("candidate_lakefusion_id", F.col(f"_candidate.{field}"))
+        else:
+            df_exp = df_exp.withColumn(field, F.col(f"_candidate.{field}"))
 
+    # B.1 Self-match guard: a record must never match against its own id.
+    df_exp = df_exp.withColumn(
+        "_is_self_match",
+        F.col("candidate_lakefusion_id") == F.col("lakefusion_id"),
+    )
+
+    # C. Per rule: evaluate match flag (UDF runs on flat cols, not in a lambda)
     for rule in rules_config:
         rule_name        = rule["name"]
         logical_op       = rule.get("logical_operator", "AND").upper()
@@ -539,11 +553,16 @@ def apply_rules(df_parsed: DataFrame, rules_config: list, complex_types: dict = 
         for flag in cond_flags[1:]:
             rule_flag = (rule_flag & flag) if logical_op == "AND" else (rule_flag | flag)
 
+        # Exclude self-match: never count a candidate that is the source itself.
+        rule_flag = rule_flag & (~F.col("_is_self_match"))
+
+        # Coalesce 3VL NULL → False so passed rows don't disappear silently
         df_exp = df_exp.withColumn(
             f"_match_{rule_name}",
             F.coalesce(rule_flag, F.lit(False)),
         )
 
+    # D. Aggregate back: per rule, collect candidates where _match_{rule_name} is true
     per_rule_aggs = []
     for rule in rules_config:
         rule_name = rule["name"]
@@ -555,8 +574,6 @@ def apply_rules(df_parsed: DataFrame, rules_config: list, complex_types: dict = 
 
     df_grouped = df_exp.groupBy(*[F.col(c) for c in non_array_cols]).agg(*per_rule_aggs)
     return df_grouped
-
-
 def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) -> DataFrame:
     match_rules = [r for r in rules_config]
     match_cols  = [f"{r['name']}_results" for r in match_rules]

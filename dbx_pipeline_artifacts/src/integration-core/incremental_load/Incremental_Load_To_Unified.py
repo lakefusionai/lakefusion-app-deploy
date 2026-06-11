@@ -54,6 +54,18 @@ from delta.tables import DeltaTable
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/spark_types
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
 setup_lakefusion_engine()
 
 # COMMAND ----------
@@ -125,17 +137,6 @@ for _i in range(len(_pp_parts) - 1, -1, -1):
         if _pp_src_path not in _pp_sys.path:
             _pp_sys.path.insert(0, _pp_src_path)
         break
-
-from utils.spark_types import (
-    create_schema_fields,
-    get_complex_spark_data_type,
-    get_spark_data_type,
-)
-from utils.complex_type_mapping import project_source_to_target
-from utils.attributes_combined import (
-    attributes_combined_from_dict,
-    build_attributes_combined_column,
-)
 
 if experiment_id:
     experiment_id = experiment_id.replace("-", "")

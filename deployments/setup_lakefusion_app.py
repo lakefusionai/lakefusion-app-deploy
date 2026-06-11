@@ -40,14 +40,21 @@ dbutils.library.restartPython()
 dbutils.widgets.text("app_name", "lakefusionai", "App Name")
 dbutils.widgets.text("app_description", "LakeFusion AI", "App Description")
 dbutils.widgets.text("source_code_path", "/Workspace/Users/{user}/lakefusion-app-deploy", "Source Code Path")
-dbutils.widgets.text("database_name", "lakefusion-db", "Lakebase Instance Name")
-dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "PostgreSQL Database Name")
+dbutils.widgets.text("database_name", "lakefusion-db", "App DB — Lakebase Instance Name")
+dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "App DB — Lakebase Database Name")
 dbutils.widgets.text("secrets_scope", "lakefusion", "Secrets Scope Name")
 dbutils.widgets.text("oidc_client_id", "", "OIDC Client ID (for SSO)")
 dbutils.widgets.text("oidc_client_secret", "", "OIDC Client Secret (for SSO)")
 dbutils.widgets.text("databricks_dapi", "", "Databricks DAPI Token")
-dbutils.widgets.dropdown("create_database", "true", ["true", "false"], "Create Lakebase Database")
+dbutils.widgets.text("lakegraph_url", "", "LakeGraph URL")
+dbutils.widgets.dropdown("data_db_type", "lakebase", ["lakebase"], "Data DB / PIM DB — Type")
+dbutils.widgets.text("data_db_instance", "lakefusion-db", "Data DB / PIM DB — Lakebase Instance Name")
+dbutils.widgets.text("data_db_search_path", "public", "Data DB / PIM DB — Search Path")
+dbutils.widgets.dropdown("create_database", "true", ["true", "false"], "Create App DB Lakebase Database")
 dbutils.widgets.dropdown("create_secrets", "true", ["true", "false"], "Create Secrets")
+
+dbutils.widgets.text("catalog_name", "lakefusion_ai", "DB Unity Catalog Name")
+dbutils.widgets.dropdown("deploy_app", "true", ["true", "false"], "Deploy App")
 
 # COMMAND ----------
 
@@ -66,6 +73,10 @@ SECRETS_SCOPE = dbutils.widgets.get("secrets_scope")
 OIDC_CLIENT_ID = dbutils.widgets.get("oidc_client_id")
 OIDC_CLIENT_SECRET = dbutils.widgets.get("oidc_client_secret")
 DATABRICKS_DAPI = dbutils.widgets.get("databricks_dapi")
+LAKEGRAPH_URL = dbutils.widgets.get("lakegraph_url")
+DATA_DB_TYPE = dbutils.widgets.get("data_db_type")
+DATA_DB_INSTANCE = dbutils.widgets.get("data_db_instance")
+DATA_DB_SEARCH_PATH = dbutils.widgets.get("data_db_search_path")
 CREATE_DATABASE = dbutils.widgets.get("create_database") == "true"
 CREATE_SECRETS = dbutils.widgets.get("create_secrets") == "true"
 
@@ -78,13 +89,17 @@ print(f"Configuration:")
 print(f"  App Name: {APP_NAME}")
 print(f"  App Description: {APP_DESCRIPTION}")
 print(f"  Source Code Path: {SOURCE_CODE_PATH}")
-print(f"  Lakebase Instance Name: {DATABASE_NAME}")
-print(f"  PostgreSQL Database Name: {INTERNAL_DB_NAME}")
+print(f"  App DB — Lakebase Instance: {DATABASE_NAME}")
+print(f"  App DB — PostgreSQL Database: {INTERNAL_DB_NAME}")
 print(f"  Secrets Scope: {SECRETS_SCOPE}")
 print(f"  Create Database: {CREATE_DATABASE}")
 print(f"  Create Secrets: {CREATE_SECRETS}")
 print(f"  OIDC Client ID: {'[SET]' if OIDC_CLIENT_ID else '[NOT SET]'}")
 print(f"  OIDC Client Secret: {'[SET]' if OIDC_CLIENT_SECRET else '[NOT SET]'}")
+print(f"  LakeGraph URL: {LAKEGRAPH_URL or '[NOT SET]'}")
+print(f"  Data DB / PIM DB — Type: {DATA_DB_TYPE}")
+print(f"  Data DB / PIM DB — Instance: {DATA_DB_INSTANCE}")
+print(f"  Data DB / PIM DB — Search Path: {DATA_DB_SEARCH_PATH}")
 
 # COMMAND ----------
 
@@ -739,6 +754,10 @@ if content:
         "DATABRICKS_DATABASE_INSTANCE": DATABASE_NAME,
         "DATABRICKS_DATABASE_NAME": INTERNAL_DB_NAME,
         "PGDATABASE": INTERNAL_DB_NAME,
+        "LAKEGRAPH_URL": LAKEGRAPH_URL,
+        "DATA_DB_TYPE": DATA_DB_TYPE,
+        "DATA_DATABRICKS_DATABASE_INSTANCE": DATA_DB_INSTANCE,
+        "DATA_DB_SEARCH_PATH": DATA_DB_SEARCH_PATH,
     }
     for env_name, env_value in env_replacements.items():
         content = re.sub(

@@ -990,6 +990,14 @@ env:
     value: "1200"
   - name: RUN_DBX_PIPELINE_ARTIFACTS_IMPORT
     value: "True"
+  - name: LAKEGRAPH_URL
+    value: ""
+  - name: DATA_DB_TYPE
+    value: "lakebase"
+  - name: DATA_DATABRICKS_DATABASE_INSTANCE
+    value: "lakefusion-db"
+  - name: DATA_DB_SEARCH_PATH
+    value: "public"
   - name: DATABRICKS_OIDC_CLIENT_ID
     valueFrom: DATABRICKS_OIDC_CLIENT_ID
   - name: DATABRICKS_OIDC_CLIENT_SECRET

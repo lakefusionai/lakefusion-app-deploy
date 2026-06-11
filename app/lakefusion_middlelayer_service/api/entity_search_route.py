@@ -446,13 +446,14 @@ async def get_reference_review_records(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=1000),
     filters: Optional[str] = Query(None),
+    conflict_type: Optional[str] = Query(None, description="UPDATE_CONFLICT or PENDING_INSERT"),
     check: dict = Depends(token_required_wrapper),
     db: Session = Depends(get_db),
 ):
     try:
         service = EntitySearchService(db)
         token = check.get("token")
-        return service.fetch_conflict_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, page=page, page_size=page_size, filters=filters)
+        return service.fetch_conflict_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, page=page, page_size=page_size, filters=filters, conflict_type=conflict_type)
     except HTTPException:
         raise
     except Exception as e:

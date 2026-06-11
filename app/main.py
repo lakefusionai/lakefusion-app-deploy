@@ -65,6 +65,11 @@ from app.lakefusion_middlelayer_service.api.pt_models_route import pt_models_rou
 from app.lakefusion_middlelayer_service.api.schema_evolution_route import schema_evolution_router, schema_evolution_global_router
 from app.lakefusion_middlelayer_service.api.spn_oauth_route import spn_router
 from app.lakefusion_middlelayer_service.api.notebook_sync_route import notebook_sync_router as ml_notebook_sync_router
+from app.lakefusion_middlelayer_service.api.relationship_route import relationship_router
+from app.lakefusion_middlelayer_service.api.relationship_instance_route import relationship_instance_router
+from app.lakefusion_middlelayer_service.api.user_roles_route import user_roles_router
+from app.lakefusion_middlelayer_service.api.struct_definition_route import struct_definition_router
+from app.lakefusion_middlelayer_service.api.lakegraph_route import lakegraph_router
 
 # ---------------------------------------------------------------------------
 # Databricks service routers
@@ -75,6 +80,8 @@ from app.lakefusion_databricks_service.api.dataset_route import dataset_router a
 from app.lakefusion_databricks_service.api.catalog_route import catalog_router
 from app.lakefusion_databricks_service.api.notebook_route import notebook_router
 from app.lakefusion_databricks_service.api.quality_task_route import quality_task_router as dbx_quality_task_router
+from app.lakefusion_databricks_service.api.user_route import user_router
+from app.lakefusion_databricks_service.api.rbac_groups_route import rbac_groups_router
 
 # ---------------------------------------------------------------------------
 # Cron service routers
@@ -369,6 +376,11 @@ app.include_router(schema_evolution_router, prefix="/api/middle-layer")
 app.include_router(ml_notebook_sync_router, prefix="/api/middle-layer")
 app.include_router(schema_evolution_global_router, prefix="/api/middle-layer")
 app.include_router(spn_router, prefix="/api/middle-layer")
+app.include_router(relationship_router, prefix="/api/middle-layer")
+app.include_router(relationship_instance_router, prefix="/api/middle-layer")
+app.include_router(user_roles_router, prefix="/api/middle-layer")
+app.include_router(struct_definition_router, prefix="/api/middle-layer")
+app.include_router(lakegraph_router, prefix="/api/middle-layer")
 
 # --- Databricks Service (/api/databricks) ---
 app.include_router(dbx_health_router, prefix="/api/databricks")
@@ -377,6 +389,8 @@ app.include_router(dbx_dataset_router, prefix="/api/databricks")
 app.include_router(catalog_router, prefix="/api/databricks")
 app.include_router(notebook_router, prefix="/api/databricks")
 app.include_router(dbx_quality_task_router, prefix="/api/databricks")
+app.include_router(user_router, prefix="/api/databricks")
+app.include_router(rbac_groups_router, prefix="/api/databricks")
 
 # --- Cron Service (/api/cron) ---
 app.include_router(cron_notebook_sync_router, prefix="/api/cron")

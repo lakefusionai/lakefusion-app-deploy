@@ -9,6 +9,7 @@ from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.models.auth import AuthUrlResponse, AuthTokenResponse
 from pydantic import ValidationError
 import jwt
+from lakefusion_utility.utils.lf_utils import verify_and_decode_jwt
 
 app_logger = get_logger(__name__)
 
@@ -116,7 +117,7 @@ def _fetch_auth_token(data: dict) -> AuthTokenResponse:
         access_token = response_data['access_token']
         username = ''
         try:
-            unverified_claims = jwt.decode(access_token, options={"verify_signature": False})
+            unverified_claims = verify_and_decode_jwt(access_token)
             if AUTH_PROVIDER == "azuread":
                 username = unverified_claims.get('upn', unverified_claims.get('unique_name', unverified_claims.get('sub', '')))
             else:

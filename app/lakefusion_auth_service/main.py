@@ -33,10 +33,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Add CORS middleware — use explicit origin when DATABRICKS_APP_URL is set
+_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+_allowed_origins = [_app_url] if _app_url else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

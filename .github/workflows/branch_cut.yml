@@ -1,0 +1,178 @@
+name: Branch-Cut and Auto-Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Source branch name (e.g. main)"
+        required: true
+      destination:
+        description: "Destination branch (e.g. release/3.6.0)"
+        required: true
+      productName:
+        description: "Product name"
+        required: true
+        default: "LakeFusion"
+
+jobs:
+  branch-cut:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Derive version and environment
+        id: vars
+        run: |
+          DEST="${{ github.event.inputs.destination }}"
+          if [[ "$DEST" =~ ^release/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            ENVIRONMENT="production"
+            VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$DEST" =~ ^develop/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            ENVIRONMENT="development"
+            VERSION="${BASH_REMATCH[1]}"
+          elif [[ "$DEST" =~ ^staging/([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            ENVIRONMENT="staging"
+            VERSION="${BASH_REMATCH[1]}"
+          else
+            echo "❌ Invalid destination branch. Use release/x.y.z, develop/x.y.z, or staging/x.y.z"
+            exit 1
+          fi
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Setup Git Config
+        run: |
+          git config user.name "automation-bot"
+          git config user.email "bot@example.com"
+      - name: Check if destination exists
+        id: check_dest
+        run: |
+          git fetch origin
+          if git show-ref --verify --quiet "refs/remotes/origin/${{ github.event.inputs.destination }}"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "❌ Destination branch '${{ github.event.inputs.destination }}' already exists"
+            exit 1
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "ℹ️  Destination branch '${{ github.event.inputs.destination }}' does not exist - will create it"
+          fi
+      - name: Create temp branch with version update
+        run: |
+          # Create unique temp branch name
+          TEMP_BRANCH="temp/branch-cut-$(date +%s)"
+          echo "TEMP_BRANCH=$TEMP_BRANCH" >> $GITHUB_ENV
+          
+          # Checkout from source branch
+          git fetch origin "${{ github.event.inputs.source }}"
+          git checkout -b "$TEMP_BRANCH" "origin/${{ github.event.inputs.source }}"
+          
+          # Update version.json
+          cat > version.json <<EOF
+          {
+            "productName": "${{ github.event.inputs.productName }}",
+            "productVersion": "${{ steps.vars.outputs.version }}",
+            "environment": "${{ steps.vars.outputs.environment }}"
+          }
+          EOF
+          echo "✅ version.json:"
+          cat version.json
+
+          cat > dbx_pipeline_artifacts/version.json <<EOF
+          {
+            "productName": "${{ github.event.inputs.productName }}",
+            "productVersion": "${{ steps.vars.outputs.version }}",
+            "environment": "${{ steps.vars.outputs.environment }}"
+          }
+          EOF
+          
+          echo "✅ dbx_pipeline_artifacts/version.json:"
+          cat dbx_pipeline_artifacts/version.json
+          
+          git add version.json dbx_pipeline_artifacts/version.json
+
+          # Commit version.json change
+          git add version.json
+          git commit -m "chore: update version.json for ${{ github.event.inputs.destination }}"
+          git push origin "$TEMP_BRANCH"
+          
+          echo "✅ Created temp branch with version update: $TEMP_BRANCH"
+      - name: Create destination branch from temp (with bypass permissions)
+        env:
+          TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Get the SHA of the temp branch (which has version.json updated)
+          SHA=$(git rev-parse "${{ env.TEMP_BRANCH }}")
+          
+          echo "Creating branch ${{ github.event.inputs.destination }} from SHA: $SHA"
+          
+          # Create the protected branch using the PAT with bypass privileges
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST \
+            -H "Authorization: token $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/git/refs \
+            -d "{\"ref\":\"refs/heads/${{ github.event.inputs.destination }}\",\"sha\":\"$SHA\"}")
+          
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
+          
+          echo "Response body:"
+          echo "$BODY" | jq '.' || echo "$BODY"
+          
+          # Check if creation was successful (201 = created)
+          if [ "$HTTP_STATUS" = "201" ]; then
+            echo "✅ Successfully created destination branch: ${{ github.event.inputs.destination }}"
+          else
+            echo "❌ Failed to create destination branch. HTTP Status: $HTTP_STATUS"
+            echo "$BODY" | jq '.'
+            exit 1
+          fi
+      - name: Cleanup temp branch
+        if: always()
+        env:
+          TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          sleep 3
+          
+          # Delete temp branch
+          if [ -n "${{ env.TEMP_BRANCH }}" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token $TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/${{ github.repository }}/git/refs/heads/${{ env.TEMP_BRANCH }} || true
+            echo "🧹 Cleaned up: ${{ env.TEMP_BRANCH }}"
+          fi
+      - name: Summary
+        run: |
+          echo "✅ Branch '${{ github.event.inputs.destination }}' created with version.json"
+          echo ""
+          echo "📋 Configuration:"
+          echo "   Source: ${{ github.event.inputs.source }}"
+          echo "   Destination: ${{ github.event.inputs.destination }}"
+          echo "   Product: ${{ github.event.inputs.productName }}"
+          echo "   Version: ${{ steps.vars.outputs.version }}"
+          echo "   Environment: ${{ steps.vars.outputs.environment }}"
+      - name: 📄 Generate Build Summary
+        if: success()
+        run: |
+          {
+            echo "## 🚀 Branch Cut Complete"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|--------|"
+            echo "| **Source Branch** | \`${{ github.event.inputs.source }}\` |"
+            echo "| **Destination Branch** | \`${{ github.event.inputs.destination }}\` |"
+            echo "| **Product Name** | ${{ github.event.inputs.productName }} |"
+            echo "| **Version** | ${{ steps.vars.outputs.version }} |"
+            echo "| **Environment** | ${{ steps.vars.outputs.environment }} |"
+            echo ""
+            echo "### ✅ Status"
+            echo "- Branch created successfully with version.json included"  
+          } >> $GITHUB_STEP_SUMMARY
+

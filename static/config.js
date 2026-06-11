@@ -4,6 +4,7 @@ window.env = {
   AUTH_SERVICE_URL: "/api/auth/",
   AIML_SERVICE_URL: "/api/match-maven/",
   CRON_SERVICE_URL: "/api/cron/",
+  PIM_SERVICE_URL: "/api/pim/",
   DATABRICKS_HOST: "",
   AUTH_PROVIDER: "databricks"
 };

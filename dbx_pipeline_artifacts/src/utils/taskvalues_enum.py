@@ -87,6 +87,25 @@ class TaskValueKey(str, Enum):
     SCHEMA_EVOLUTION_ID_KEY = "schema_evolution_id_key"
     SCHEMA_EVOLUTION_EXPERIMENT_ID = "schema_evolution_experiment_id"
 
+    # Vector search results
+    VECTOR_SEARCH_COMPLETE = "vector_search_complete"
+    RECORDS_SEARCHED = "records_searched"
+
+    # LLM matching results
+    LLM_MATCHING_COMPLETE = "llm_matching_complete"
+    RECORDS_PROCESSED = "records_processed"
+
+    # Entity/Model metadata
+    ENTITY_CREATED_BY = "entity_created_by"
+    MODEL_CREATED_BY = "model_created_by"
+    RBAC_OWNER_EMAILS = "rbac_owner_emails"
+    ENTITY_TYPE = "entity_type"
+    STORAGE_TYPE = "storage_type"
+
+    # Master existence check
+    MASTER_EXISTS = "master_exists"
+    UNIFIED_EXISTS = "unified_exists"
+
     #Reference entity
     REFERENCE_CONFIG="entity_reference_config"
     RDM_CONFIGS="rdm_configs"
@@ -94,4 +113,4 @@ class TaskValueKey(str, Enum):
 
 
     #Lakebase
-    
+

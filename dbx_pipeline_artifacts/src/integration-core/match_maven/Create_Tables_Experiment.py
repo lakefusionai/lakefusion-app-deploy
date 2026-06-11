@@ -101,6 +101,11 @@ if isinstance(is_single_source, str):
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/spark_types
+
+# COMMAND ----------
+
+
 logger.info("="*60)
 logger.info("CREATE TABLES - MATCH MAVEN EXPERIMENT")
 logger.info("="*60)
@@ -142,6 +147,7 @@ if is_single_source:
 # Make `src` importable from this notebook so `utils.spark_types` resolves.
 import os as _os
 import sys as _sys
+_build_schema_fields = create_schema_fields
 _pp = _os.getcwd().split(_os.sep)
 for _i in range(len(_pp) - 1, -1, -1):
     if _pp[_i] == "src":
@@ -150,12 +156,8 @@ for _i in range(len(_pp) - 1, -1, -1):
             _sys.path.insert(0, _src)
         break
 
-from utils.spark_types import (
-    create_schema_fields as _build_schema_fields,
-    get_spark_data_type,
-)
 
-
+_build_schema_fields=create_schema_fields
 def create_schema_fields(attributes_list, attributes_datatype_dict, include_lakefusion_id=True):
     """Build StructFields for an entity table.
 

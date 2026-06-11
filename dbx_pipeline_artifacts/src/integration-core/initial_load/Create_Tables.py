@@ -124,6 +124,10 @@ logger.info(f"  Attribute Version Sources: {attribute_version_sources_table}")
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/spark_types
+
+# COMMAND ----------
+
 # Centralized type resolution — supports scalar, STRUCT, and
 # ARRAY types. Includes legacy lowercase + uppercase variants for backward
 # compatibility with older entity exports.
@@ -140,12 +144,8 @@ for _i in range(len(_pp) - 1, -1, -1):
             _sys.path.insert(0, _src)
         break
 
-from utils.spark_types import (
-    create_schema_fields as _build_schema_fields,
-    get_spark_data_type,
-)
 
-
+_build_schema_fields=create_schema_fields
 def create_schema_fields(attributes_list, attributes_datatype_dict, include_lakefusion_id=True):
     """Build StructFields for an entity table.
 

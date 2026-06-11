@@ -343,9 +343,18 @@ async def lifespan(app):
         try:
             with db_context() as db:
                 # Step 1: Create all tables (fallback for skipped migrations)
+                # Exclude pim_* tables: in the unified bundle the PIM routers import
+                # lakefusion_utility.models.pim, registering pim_* on the shared
+                # Base.metadata. Those tables belong only in per-entity PIM data DBs
+                # (created by initialize_pim), NOT the transactional DB, so filter them
+                # out here to avoid leaking them into the transactional database.
                 try:
                     logger.info("Creating database tables if they don't exist...")
-                    Base.metadata.create_all(bind=db.get_bind())
+                    transactional_tables = [
+                        t for t in Base.metadata.tables.values()
+                        if not t.name.startswith("pim_")
+                    ]
+                    Base.metadata.create_all(bind=db.get_bind(), tables=transactional_tables)
                     logger.info("Database tables created successfully")
                 except Exception as e:
                     logger.error(f"Error creating database tables: {e}")

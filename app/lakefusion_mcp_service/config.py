@@ -30,7 +30,8 @@ MIDDLELAYER_SERVICE_URL = os.getenv("MIDDLELAYER_SERVICE_URL", "http://middlelay
 MCP_VERSION = os.getenv("MCP_VERSION") or _get_version_from_file()
 
 # LakeFusion Portal URL (for generating profile links)
-PORTAL_URL = os.getenv("PORTAL_URL", "http://localhost:3000")
+_databricks_app_url = os.getenv("DATABRICKS_APP_URL", "")
+PORTAL_URL = os.getenv("PORTAL_URL", _databricks_app_url or "http://localhost:3000")
 
 # OAuth redirect URI for callbacks - defaults to PORTAL_URL if not set
-REDIRECT_URI = os.getenv("REDIRECT_URI", "http://mcp-service")
+REDIRECT_URI = os.getenv("REDIRECT_URI", _databricks_app_url or "http://mcp-service")

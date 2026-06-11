@@ -191,6 +191,21 @@ logger.info("\n" + "="*60)
 logger.info("STEP 1: DERIVE SECONDARY SOURCES")
 logger.info("="*60)
 
+
+# COMMAND ----------
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+
+# COMMAND ----------
+
 # Derive secondary tables by excluding primary table from dataset_tables
 secondary_tables = [table for table in dataset_tables if table != primary_table]
 
@@ -385,7 +400,8 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
             mapped_df = secondary_df.select(*select_exprs)
 
         # Add missing entity attributes as NULL with the correct (possibly nested) type.
-        from utils.spark_types import get_complex_spark_data_type as _resolve_complex_dtype
+       
+        _resolve_complex_dtype=get_complex_spark_data_type
         _records_by_name = {r["name"]: r for r in entity_attribute_records if isinstance(r, dict) and r.get("name")}
         missing_attrs = 0
         for attr in entity_attributes:
@@ -446,7 +462,6 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
 
         # complex-aware attributes_combined.
         if _has_complex_attrs:
-            from utils.attributes_combined import build_attributes_combined_column
             mapped_df = mapped_df.withColumn(
                 "attributes_combined",
                 build_attributes_combined_column(mapped_df, combine_attrs, entity_attribute_records),

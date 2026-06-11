@@ -243,10 +243,10 @@ async def get_all_records(
     return service.get_all_records(entity_id, warehouse_id, token, page, page_size, filters)
 
 @entity_search_router.get("/{entity_id}/validation-data")
-async def read_all_validation_records(entity_id:int, warehouse_id:str,validation_type:str,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+async def read_all_validation_records(entity_id:int, warehouse_id:str,validation_type:str, page: int = 1, page_size: int = 1000, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = EntitySearchService(db)
     token = check.get('token')
-    return service.read_entity_validation_data(entity_id,warehouse_id,validation_type,token)
+    return service.read_entity_validation_data(entity_id,warehouse_id,validation_type,token, page, page_size)
 
 @entity_search_router.get("/{entity_id}/profile/validation-records-id")
 async def read_entity_search_profile_validation_id(entity_id:int,id_value:str,warehouse_id:str,validation_type:str,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):

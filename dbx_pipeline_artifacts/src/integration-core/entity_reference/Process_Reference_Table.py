@@ -1,6 +1,12 @@
-# Databricks notebook source
-# MAGIC %pip install --upgrade "databricks-sdk>=0.89.0" psycopg2-binary
-# MAGIC %restart_python
+# MAGIC %pip install --upgrade "databricks-sdk>=0.114.0"
+
+# COMMAND ----------
+
+# Lakebase (w.postgres) needs a databricks-sdk newer than some DBR runtimes
+# bundle. Upgrade + restart Python HERE, before anything imports databricks.sdk,
+# so WorkspaceClient() in this fresh interpreter always exposes w.postgres.
+# (A %pip install only takes effect after the interpreter restarts.)
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -53,13 +59,13 @@ attributes_mapping = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSO
 # COMMAND ----------
 
 from lakefusion_core_engine.write_ops import create_write_ops,WriteMode
-lakebase_params = {                                # becomes PG schema name
+lakebase_params = {
     "lakebase_instance_id": lakebase_instance_id,  # project display_name
     "lakebase_branch_id": lakebase_branch_id,        # default
     "lakebase_endpoint_id": lakebase_endpoint_id,         # default
     "lakebase_database": entity,
 }
- 
+
 write_ops = create_write_ops(mode=write_mode, spark=spark, params=lakebase_params)
 
 # COMMAND ----------
@@ -637,4 +643,11 @@ def handle_delete(config, rdm_only_df, run_id, now):
 
 
 handle_delete(entity_reference_config, rdm_only, RUN_ID, NOW)
+
+# Forward sync: push the Delta changes to the Lakebase synced tables. No-op for
+# delta mode; for lakebase SNAPSHOT/TRIGGERED policies this kicks the synced-table
+# pipeline so Postgres reflects the latest Delta state. Non-fatal (logged inside).
+if write_mode == "lakebase":
+   for _t in (table_fqn, audit_table_fqn, conflict_table_fqn):
+       write_ops.trigger_sync(_t)
 logger_instance.shutdown()

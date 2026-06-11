@@ -52,21 +52,18 @@ def upgrade() -> None:
     else:
         conn.execute(sa.text("""
             DELETE FROM model_experiments
-            USING entity
-            WHERE model_experiments.entity_id = entity.id
-              AND entity.id IS NULL AND model_experiments.entity_id IS NOT NULL;
+            WHERE entity_id IS NOT NULL
+              AND entity_id NOT IN (SELECT id FROM entity);
         """))
         conn.execute(sa.text("""
             DELETE FROM match_maven_job
-            USING entity
-            WHERE match_maven_job.entity_id = entity.id
-              AND entity.id IS NULL AND match_maven_job.entity_id IS NOT NULL;
+            WHERE entity_id IS NOT NULL
+              AND entity_id NOT IN (SELECT id FROM entity);
         """))
         conn.execute(sa.text("""
             DELETE FROM match_maven_job
-            USING model_experiments
-            WHERE match_maven_job.modelid = model_experiments.id
-              AND model_experiments.id IS NULL AND match_maven_job.modelid IS NOT NULL;
+            WHERE modelid IS NOT NULL
+              AND modelid NOT IN (SELECT id FROM model_experiments);
         """))
         conn.execute(sa.text("""
             DELETE FROM integration_hub ih1

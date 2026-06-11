@@ -119,6 +119,7 @@ async def lifespan(app):
                     # latent circular import in the lakefusion_utility wheel.
                     from lakefusion_utility.utils.databricks_util import get_app_sp_token
                     service = Integration_HubService(db=db)
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token
                     token = get_app_sp_token()
                     service.sync_all_job_versions(token)
                 except Exception as e:
@@ -142,7 +143,6 @@ async def lifespan(app):
                 # Step 6: Sync PT config to Volume
                 # ------------------------------------------------------
                 try:
-                    # Lazy import — see note at top of file.
                     from lakefusion_utility.utils.databricks_util import get_app_sp_token, generate_pat
                     token = get_app_sp_token() or generate_pat()
                     if token:
@@ -151,7 +151,7 @@ async def lifespan(app):
                         service.sync_to_volume(token)
                         logger.info("PT config synced to Volume on startup")
                     else:
-                        logger.warning("No SP credentials and no fallback PAT set — skipping PT config startup sync")
+                        logger.warning("No token available — skipping PT config startup sync")
                 except Exception as e:
                     logger.error(f"Error during PT config startup sync: {e}")
 

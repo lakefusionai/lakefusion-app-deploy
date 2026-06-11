@@ -266,26 +266,48 @@ final_match_attrs = [a for a in current_match_attrs if a not in rolled_back_attr
 logger.info(f"  Final match attributes after rollback: {final_match_attrs}")
 
 if final_match_attrs:
-    match_cols = ", ".join([f"CAST(`{a}` AS STRING)" for a in final_match_attrs])
+    # COALESCE preserves NULL positions as empty strings — concat_ws would otherwise
+    # skip NULLs and collapse separators, producing a different attributes_combined
+    # than the rest of the pipeline.
+    match_cols = ", ".join([f"COALESCE(CAST(`{a}` AS STRING), '')" for a in final_match_attrs])
     concat_expr = f"concat_ws(' | ', {match_cols})"
 else:
     # No match attrs left - clear attributes_combined
     concat_expr = "''"
 
+# Precomputed embeddings derived from attributes_combined become stale when we
+# rewrite the source. Null them so Compute_Embeddings.py refills on the next run.
+# Per-table check — managed-mode tables don't carry the column.
+def _embedding_null_clause(table):
+    cols = {f.name.strip().lower() for f in spark.table(table).schema}
+    return ", attributes_combined_embedding = NULL" if "attributes_combined_embedding" in cols else ""
+
 # Update master table
 logger.info(f"  Recomputing attributes_combined on master table: {master_table_name}")
-spark.sql(f"UPDATE {master_table_name} SET attributes_combined = {concat_expr}")
+spark.sql(
+    f"UPDATE {master_table_name} "
+    f"SET attributes_combined = {concat_expr}"
+    f"{_embedding_null_clause(master_table_name)}"
+)
 logger.info(f"  Master table attributes_combined recomputed")
 
 # Update unified table
 logger.info(f"  Recomputing attributes_combined on unified table: {unified_table_name}")
-spark.sql(f"UPDATE {unified_table_name} SET attributes_combined = {concat_expr}")
+spark.sql(
+    f"UPDATE {unified_table_name} "
+    f"SET attributes_combined = {concat_expr}"
+    f"{_embedding_null_clause(unified_table_name)}"
+)
 logger.info(f"  Unified table attributes_combined recomputed")
 
 # Update unified_deduplicate table (if exists)
 if unified_dedup_table and spark.catalog.tableExists(unified_dedup_table):
     logger.info(f"  Recomputing attributes_combined on unified_dedup table: {unified_dedup_table}")
-    spark.sql(f"UPDATE {unified_dedup_table} SET attributes_combined = {concat_expr}")
+    spark.sql(
+        f"UPDATE {unified_dedup_table} "
+        f"SET attributes_combined = {concat_expr}"
+        f"{_embedding_null_clause(unified_dedup_table)}"
+    )
     logger.info(f"  Unified dedup table attributes_combined recomputed")
 
 # COMMAND ----------

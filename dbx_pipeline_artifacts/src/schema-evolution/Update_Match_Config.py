@@ -134,22 +134,41 @@ else:
     # Use COALESCE to preserve null positions as empty strings between separators
     match_cols = ", ".join([f"COALESCE(CAST(`{a}` AS STRING), '')" for a in all_match_attrs])
 
+    # Precomputed embeddings derived from attributes_combined become stale when we
+    # rewrite the source. Null them so Compute_Embeddings.py refills on the next run.
+    # Per-table check — managed-mode tables don't carry the column.
+    def _embedding_null_clause(table):
+        cols = {f.name.strip().lower() for f in spark.table(table).schema}
+        return ", attributes_combined_embedding = NULL" if "attributes_combined_embedding" in cols else ""
+
     # Update master table
     logger.info(f"Updating attributes_combined on master table: {master_table}")
-    master_sql = f"UPDATE {master_table} SET attributes_combined = concat_ws(' | ', {match_cols})"
+    master_sql = (
+        f"UPDATE {master_table} "
+        f"SET attributes_combined = concat_ws(' | ', {match_cols})"
+        f"{_embedding_null_clause(master_table)}"
+    )
     spark.sql(master_sql)
     logger.info(f"  Master table attributes_combined updated")
 
     # Update unified table
     logger.info(f"Updating attributes_combined on unified table: {unified_table}")
-    spark.sql(f"UPDATE {unified_table} SET attributes_combined = concat_ws(' | ', {match_cols})")
+    spark.sql(
+        f"UPDATE {unified_table} "
+        f"SET attributes_combined = concat_ws(' | ', {match_cols})"
+        f"{_embedding_null_clause(unified_table)}"
+    )
     logger.info(f"  Unified table attributes_combined updated")
 
     # Update unified_deduplicate table (if exists)
     tables_updated = [master_table, unified_table]
     if unified_dedup_table and spark.catalog.tableExists(unified_dedup_table):
         logger.info(f"Updating attributes_combined on unified_dedup table: {unified_dedup_table}")
-        spark.sql(f"UPDATE {unified_dedup_table} SET attributes_combined = concat_ws(' | ', {match_cols})")
+        spark.sql(
+            f"UPDATE {unified_dedup_table} "
+            f"SET attributes_combined = concat_ws(' | ', {match_cols})"
+            f"{_embedding_null_clause(unified_dedup_table)}"
+        )
         logger.info(f"  Unified dedup table attributes_combined updated")
         tables_updated.append(unified_dedup_table)
 

@@ -39,9 +39,21 @@ class AppConfig(object):
             "?driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
         )
     elif db_type == "postgresql":
-        DATABASE_URL = (
-            f"postgresql+psycopg2://{sql_username}:{encoded_password}@{sql_server}/{sql_db_name}"
-        )
+        # PG* vars (used by unified app and local PostgreSQL)
+        pghost = os.environ.get("PGHOST", "")
+        pgport = os.environ.get("PGPORT", "5432")
+        pgdatabase = os.environ.get("PGDATABASE", "")
+        pguser = os.environ.get("PGUSER", "")
+        pgpassword = os.environ.get("PGPASSWORD", "")
+        if pghost and pgdatabase:
+            encoded_pg_password = quote_plus(pgpassword) if pgpassword else ""
+            DATABASE_URL = (
+                f"postgresql+psycopg2://{pguser}:{encoded_pg_password}@{pghost}:{pgport}/{pgdatabase}"
+            )
+        else:
+            DATABASE_URL = (
+                f"postgresql+psycopg2://{sql_username}:{encoded_password}@{sql_server}/{sql_db_name}"
+            )
     elif db_type == "lakebase":
         DATABASE_URL = "" # Generate this URL dynamically in the database module
     else:

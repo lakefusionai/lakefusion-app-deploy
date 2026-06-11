@@ -6,6 +6,7 @@ Contains domain-specific classes for Match Maven entity matching:
 - DeterministicRulesService: In-process deterministic rules evaluation
 """
 
+import json
 import pandas as pd
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -430,6 +431,125 @@ class DeterministicRulesService:
             raise ValueError(f"Unsupported operator: {operator!r}")
         return ops[operator](value, threshold)
 
+    # ── Complex-type (STRUCT / ARRAY) helpers — mirror the Spark side ─────
+    # ARRAY set-membership functions (match_type "fuzzy", no operator/threshold):
+    #   intersect -> share ≥1 element; disjoint -> share none;
+    #   subset -> source ⊆ candidate; superset -> source ⊇ candidate.
+    _ARRAY_SET_FUNCS = {"intersect", "disjoint", "subset", "superset"}
+
+    @staticmethod
+    def _coerce_complex(v):
+        """Parse a JSON string into dict/list; pass dict/list through unchanged."""
+        if isinstance(v, str):
+            s = v.strip()
+            if s[:1] in ("{", "["):
+                try:
+                    return json.loads(s)
+                except (ValueError, TypeError):
+                    return v
+        return v
+
+    @staticmethod
+    def _struct_subfield(value, sub_field):
+        """Extract a sub-field from a STRUCT value (dict); None if absent."""
+        return value.get(sub_field) if isinstance(value, dict) else None
+
+    @staticmethod
+    def _elem_values(value, sub_field, case_insensitive):
+        """Flatten an ARRAY value to comparison strings.
+        ARRAY<STRUCT> + sub_field -> each element[sub_field];
+        ARRAY<STRUCT> no sub_field -> JSON of each element;
+        ARRAY<scalar> -> the element itself."""
+        if not isinstance(value, list):
+            return []
+        out = []
+        for el in value:
+            if sub_field is not None and isinstance(el, dict):
+                ev = el.get(sub_field)
+            elif isinstance(el, (dict, list)):
+                ev = json.dumps(el, sort_keys=True, default=str)
+            else:
+                ev = el
+            if ev is None:
+                continue
+            s = str(ev).strip()
+            if not s:
+                continue
+            out.append(s.lower() if case_insensitive else s)
+        return out
+
+    @staticmethod
+    def _array_set_match_py(src_set: set, cand_set: set, func: str) -> bool:
+        if func == "intersect":
+            return len(src_set & cand_set) > 0
+        if func == "disjoint":
+            return len(src_set & cand_set) == 0
+        if func == "subset":      # source ⊆ candidate
+            return src_set <= cand_set
+        if func == "superset":    # source ⊇ candidate
+            return src_set >= cand_set
+        raise ValueError(f"Unsupported array set function: {func!r}")
+
+    def _array_elem_any(self, src_vals, cand_vals, match_type, fuzzy_func,
+                        threshold, operator) -> bool:
+        """True if any (source element, candidate element) pair matches under
+        exact / fuzzy semantics — the element-wise 'any element matches'."""
+        op = operator or ">="
+        for a in src_vals:
+            for b in cand_vals:
+                if match_type == "exact":
+                    if ((a != b) if op in ("!=", "<>") else (a == b)):
+                        return True
+                    continue
+                if fuzzy_func == "levenshtein_normalized":
+                    ml = max(len(a), len(b)) or 1
+                    score = 1.0 - self._levenshtein_distance(a, b) / ml
+                elif fuzzy_func == "levenshtein_standard":
+                    score = float(self._levenshtein_distance(a, b))
+                elif fuzzy_func == "jaro_winkler":
+                    score = self._jaro_winkler_similarity(a, b)
+                elif fuzzy_func == "soundex":
+                    if self._soundex(a) == self._soundex(b):
+                        return True
+                    continue
+                else:
+                    raise ValueError(f"Unsupported fuzzy function: {fuzzy_func!r}")
+                if threshold is not None and self._apply_operator(score, op, float(threshold)):
+                    return True
+        return False
+
+    def _array_condition_mask(self, q_coerced, col_coerced, sub_field,
+                              case_insensitive, match_type, fuzzy_func,
+                              threshold, operator, allow_nulls, n) -> tuple:
+        """ARRAY attribute path: element-wise 'any match' (exact/fuzzy) or set
+        membership (intersect/disjoint/subset/superset). Returns (mask, scores)."""
+        src_vals = self._elem_values(
+            q_coerced if isinstance(q_coerced, list) else [], sub_field, case_insensitive
+        )
+        src_empty = len(src_vals) == 0
+
+        masks, scores = [], []
+        for v in col_coerced:
+            cand_vals = self._elem_values(
+                v if isinstance(v, list) else [], sub_field, case_insensitive
+            )
+            cand_empty = len(cand_vals) == 0
+
+            if fuzzy_func in self._ARRAY_SET_FUNCS:
+                ok = self._array_set_match_py(set(src_vals), set(cand_vals), fuzzy_func)
+            else:
+                ok = self._array_elem_any(
+                    src_vals, cand_vals, match_type, fuzzy_func, threshold, operator
+                )
+
+            if allow_nulls:
+                passed = (src_empty and cand_empty) or (not src_empty and not cand_empty and ok)
+            else:
+                passed = (not src_empty) and (not cand_empty) and ok
+            masks.append(bool(passed))
+            scores.append(1.0 if passed else 0.0)
+        return pd.Series(masks, dtype=bool), pd.Series(scores)
+
     # ── Condition evaluator (mirrors `build_condition_column`) ───────────
 
     def _build_condition_mask(
@@ -463,8 +583,49 @@ class DeterministicRulesService:
         operator         = cond.get("operator") or ">="
         allow_nulls      = cond.get("allow_nulls", rule_allow_nulls)
         case_insensitive = cond.get("case_insensitive", False)
+        sub_field        = cond.get("sub_field")
+        if sub_field in (None, "", "None", "null"):
+            sub_field = None
 
         n = len(col)
+
+        # ── Complex-type handling (STRUCT / ARRAY) ───────────────────────
+        # Coerce JSON-string values to dict/list, detect the attribute kind
+        # from the data, and either (ARRAY) compute the mask directly or
+        # (STRUCT) rewrite query_val/col to the scalar comparison form and fall
+        # through to the scalar logic below. Mirrors build_condition_column.
+        q_coerced = self._coerce_complex(query_val)
+        col_coerced = col.apply(self._coerce_complex)
+
+        _rep = q_coerced
+        if _rep is None:
+            for _v in col_coerced:
+                if isinstance(_v, (dict, list)):
+                    _rep = _v
+                    break
+
+        # ARRAY / ARRAY<STRUCT> → element-wise 'any match' or set membership.
+        if isinstance(_rep, list):
+            return self._array_condition_mask(
+                q_coerced, col_coerced, sub_field, case_insensitive,
+                match_type, fuzzy_func, threshold, operator, allow_nulls, n,
+            )
+
+        # STRUCT → sub-field scalar, or canonical JSON of the whole struct.
+        if isinstance(_rep, dict):
+            if sub_field is not None:
+                query_val = self._struct_subfield(q_coerced, sub_field)
+                col = col_coerced.apply(lambda v: self._struct_subfield(v, sub_field))
+            else:
+                query_val = (
+                    json.dumps(q_coerced, sort_keys=True, default=str)
+                    if isinstance(q_coerced, dict) else None
+                )
+                col = col_coerced.apply(
+                    lambda v: json.dumps(v, sort_keys=True, default=str)
+                    if isinstance(v, dict) else None
+                )
+            # fall through to the scalar comparison below with the rewrites.
 
         # ── Normalize source (single value) ──────────────────────────────
         # Empty/whitespace -> None; case is preserved here so case-sensitive

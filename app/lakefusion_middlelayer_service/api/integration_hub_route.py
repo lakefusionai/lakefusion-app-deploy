@@ -1,12 +1,14 @@
-from fastapi import HTTPException, Depends, APIRouter
+from fastapi import HTTPException, Depends, APIRouter, Query
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
 from lakefusion_utility.models.integration_hub import (
     Integration_HubCreate, Integration_HubResponse, Integration_HubUpdate,
     RefEntitySyncPipelineCreate, RefEntitySyncPipelineUpdate, RefEntitySyncPipelineResponse,
+    RelationshipSyncPipelineCreate, RelationshipSyncPipelineUpdate, RelationshipSyncPipelineResponse,
 )
 from lakefusion_utility.services.integration_hub_service import Integration_HubService, RefEntitySyncPipelineService
-from typing import List
+from lakefusion_utility.services.relationship_sync_service import RelationshipSyncPipelineService
+from typing import List, Optional
 from pydantic import BaseModel
 from lakefusion_utility.services.model_experiment_service import compare_versions
 
@@ -23,9 +25,9 @@ def create_integration_hub(task: Integration_HubCreate, db: Session = Depends(ge
 
 # Read all Entitys with an optional `is_active` filter
 @integration_hub_router.get("/", response_model=List[Integration_HubResponse])
-def read_integration_hub(is_active: bool = True, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+def read_integration_hub(is_active: bool = True, task_type: Optional[str] = Query(None, description="Filter by task_type: mdm, pim, ref_sync"), db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = Integration_HubService(db)
-    return service.read_integration_hub(is_active)
+    return service.read_integration_hub(is_active, task_type=task_type)
 
 
 class DeleteIntegrationHubPayload(BaseModel):
@@ -133,3 +135,64 @@ def delete_ref_sync_pipeline(
         delete_job=delete_job,
         warehouse_id=warehouse_id,
     )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Relationship Sync Pipelines (Story 2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@integration_hub_router.post(
+    "/relationship-sync/", response_model=RelationshipSyncPipelineResponse
+)
+def create_relationship_sync_pipeline(
+    payload: RelationshipSyncPipelineCreate,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    payload.created_by = check.get("decoded", {}).get("sub", "")
+    token = check.get("token")
+    return RelationshipSyncPipelineService(db).create(payload, token)
+
+
+@integration_hub_router.get(
+    "/relationship-sync/", response_model=List[RelationshipSyncPipelineResponse]
+)
+def list_relationship_sync_pipelines(
+    is_active: bool = True,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    return RelationshipSyncPipelineService(db).read_all(is_active)
+
+
+@integration_hub_router.patch(
+    "/relationship-sync/{task_id}", response_model=RelationshipSyncPipelineResponse
+)
+def update_relationship_sync_pipeline(
+    task_id: int,
+    payload: RelationshipSyncPipelineUpdate,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    token = check.get("token")
+    return RelationshipSyncPipelineService(db).update(task_id, payload, token)
+
+
+@integration_hub_router.delete("/relationship-sync/{task_id}")
+def delete_relationship_sync_pipeline(
+    task_id: int,
+    delete_job: bool = False,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    token = check.get("token")
+    return RelationshipSyncPipelineService(db).delete(
+        task_id,
+        token=token,
+        delete_job=delete_job,
+    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Product Entity Integration Tasks
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Product entity endpoints removed — PIM tasks use main /integration-hub/ with task_type='pim'

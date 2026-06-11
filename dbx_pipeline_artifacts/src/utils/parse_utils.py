@@ -157,29 +157,33 @@ def remove_primary_from_attr_mapping(attributes_mapping_json):
 from pyspark.sql.functions import udf, col
 from pyspark.sql.types import BooleanType
 import re
-import inspect
 
 def validation_function_exec(validation_function_list, df):
 
     for rule in validation_function_list:
-        # isolated namespace for exec
+
         local_ns = {}
 
-        # execute function code safely
+        # execute function definition
         exec(rule["function_definition"], {"re": re}, local_ns)
 
-        # extract the first function defined in the code
+        # get first callable function
         functions = [
             v for v in local_ns.values()
             if callable(v)
         ]
 
         if not functions:
-            raise ValueError(f"No function found in rule {rule['validation_id']}")
+            raise ValueError(
+                f"No function found in rule {rule['validation_id']}"
+            )
 
         validation_function = functions[0]
 
-        # register UDF
+        # IMPORTANT FIX
+        validation_function.__module__ = "__main__"
+
+        # create udf
         validate_udf = udf(validation_function, BooleanType())
 
         df = df.withColumn(
@@ -187,8 +191,10 @@ def validation_function_exec(validation_function_list, df):
             validate_udf(col(rule["attribute_name"]))
         )
 
-    # drop original attributes if needed
-    df = df.drop(*[i["attribute_name"] for i in validation_function_list])
+    df = df.drop(
+        *[i["attribute_name"] for i in validation_function_list]
+    )
+
     return df
 
 

@@ -396,9 +396,21 @@ else:
 try:
     logger.info(f"Attempting to create index: {index_name}")
     if embedding_mode == "precomputed":
-        embedding_dim_raw = dbutils.jobs.taskValues.get(
-            taskKey="Compute_Embeddings", key="embedding_dim", debugValue=None
-        )
+        try:
+            embedding_dim_raw = dbutils.jobs.taskValues.get(
+                taskKey="Compute_Embeddings", key="embedding_dim", debugValue=None
+            )
+        except Exception as e:
+            # Databricks raises "Task key does not exist in run: Compute_Embeddings" when
+            # the task isn't in the DAG at all (vs. failed or hasn't run). This happens
+            # on Integration jobs created before 4.3.0: the DAG is persisted at job-
+            # creation time and the upgrade doesn't rebuild existing jobs.
+            if "task key does not exist" in str(e).lower():
+                raise RuntimeError(
+                    "embedding_mode='precomputed' but the Compute_Embeddings task is not in "
+                    "this job's DAG. Rebuild the DAG and re-run."
+                ) from e
+            raise
         if embedding_dim_raw is None:
             raise RuntimeError(
                 "embedding_mode='precomputed' requires Compute_Embeddings task to set embedding_dim. "

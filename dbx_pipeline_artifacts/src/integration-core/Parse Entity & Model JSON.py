@@ -115,6 +115,9 @@ is_single_source = dataset_tables_len == 1
 mapping_experiment_suffix = ""
 if experiment_id and experiment_id != "prod":
     mapping_experiment_suffix = f"_{experiment_id}"
+else:
+    mapping_experiment_suffix=f"_{experiment_id}"
+
 
 rdm_configs = []
 if(rdm_flag==1):
@@ -180,9 +183,15 @@ if(rdm_flag==1):
                 "source_id":        source_id,         # THIS source's dataset_id
                 "source_attr":      source_attr,       # raw source col for THIS source
                 "ref_table":        ref_dataset.get("reference_entity_table_path"),
+                "ref_entity_name":  ref_entity_name,
+                "ref_storage_type": ref_dataset.get("reference_entity_storage_type", "delta"),
                 "ref_attr":         ref_attr,          # ref table key col (varies per source)
                 "ref_output_attr":  ref_output_attr,   # display column in ref table
                 "match_strategy":   match_strategy,    # "exact" | "fuzzy" (per source)
+                # What to do when a REF value can't be resolved (NO_MATCH/PENDING):
+                # "keep_null" (default) keeps the row with the attr nulled,
+                # "move_to_error" routes the row to the unified error table.
+                "unresolved_action": ds_match_strategy.get("unresolved_action", "keep_null"),
                 "fuzzy_algorithm":  fuzzy_algorithm,   # per source
                 "high_threshold":   high_threshold,
                 "low_threshold":    low_threshold,
@@ -249,7 +258,10 @@ dbutils.jobs.taskValues.set(TaskValueKey.REFERENCE_ATTRIBUTE_CONFIG.value, json.
 
 # COMMAND ----------
 
-entity_type=entity_json.get("entity_type", "reference")
+entity_type = entity_json.get("entity_type", "reference")
+storage_type = entity_json.get("storage_type", "delta")
+dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_TYPE.value, entity_type)
+dbutils.jobs.taskValues.set(TaskValueKey.STORAGE_TYPE.value, storage_type)
 
 # COMMAND ----------
 

@@ -1,7 +1,7 @@
 """add complex data types schema: struct_definition, struct_field, entityattributes.is_array + struct_definition_id, ENABLE_COMPLEX_DATA_TYPES flag
 
 Revision ID: a2b3c4d5e6f7
-Revises: p1q2r3s4t5u6
+Revises: z1a2b3c4d5e6
 Create Date: 2026-05-19 00:00:00.000000
 
 Foundation schema for ARRAY / STRUCT / ARRAY<STRUCT> attribute support
@@ -26,7 +26,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "a2b3c4d5e6f7"
-down_revision: Union[str, None] = "p1q2r3s4t5u6"
+down_revision: Union[str, None] = "z1a2b3c4d5e6"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

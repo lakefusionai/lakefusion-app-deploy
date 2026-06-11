@@ -39,6 +39,8 @@ entity_attribute_records_raw = dbutils.jobs.taskValues.get(
 
 # COMMAND ----------
 
+
+
 # Parse JSON parameters
 entity_attributes = json.loads(entity_attributes)
 match_attributes = json.loads(match_attributes)
@@ -56,6 +58,10 @@ for _i in range(len(_pp_parts) - 1, -1, -1):
         if _src_path not in _pp_sys.path:
             _pp_sys.path.insert(0, _src_path)
         break
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/attributes_combined
 
 # COMMAND ----------
 
@@ -166,7 +172,6 @@ logger.info("STEP 3: PREPARE MASTER RECORDS")
 logger.info("="*80)
 
 from pyspark.sql.functions import concat_ws, coalesce
-from utils.attributes_combined import build_attributes_combined_column
 
 # Select entity attributes plus lakefusion_id
 master_columns = [id_key] + [attr for attr in entity_attributes if attr != id_key]

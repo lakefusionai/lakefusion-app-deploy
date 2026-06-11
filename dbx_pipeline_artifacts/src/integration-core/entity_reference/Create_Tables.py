@@ -1,6 +1,12 @@
-# Databricks notebook source
-# MAGIC %pip install --upgrade "databricks-sdk>=0.61.0" psycopg2-binary
-# MAGIC %restart_python
+# MAGIC %pip install --upgrade "databricks-sdk>=0.114.0"
+
+# COMMAND ----------
+
+# Lakebase (w.postgres) needs a databricks-sdk newer than some DBR runtimes
+# bundle. Upgrade + restart Python HERE, before anything imports databricks.sdk,
+# so WorkspaceClient() in this fresh interpreter always exposes w.postgres.
+# (A %pip install only takes effect after the interpreter restarts.)
+dbutils.library.restartPython()
 
 # COMMAND ----------
 
@@ -84,13 +90,20 @@ entity_attributes_datatype = json.loads(entity_attributes_datatype)
 # COMMAND ----------
 
 from lakefusion_core_engine.write_ops import create_write_ops,WriteMode
-lakebase_params = {                                # becomes PG schema name
-    "lakebase_instance_id": lakebase_instance_id,  # project display_name
-    "lakebase_branch_id": lakebase_branch_id,        # default
-    "lakebase_endpoint_id": lakebase_endpoint_id,         # default
+lakebase_params = {
+    # Lakebase database-INSTANCE name (what w.database.get_database_instance
+    # expects). If this doesn't resolve, the engine falls back to the sole
+    # instance or errors listing the valid names.
+    "lakebase_instance_id": lakebase_instance_id,
+    "lakebase_branch_id": lakebase_branch_id,    # retained for compat (unused in resolution)
+    "lakebase_endpoint_id": lakebase_endpoint_id,  # retained for compat (unused in resolution)
+    # Target Postgres logical database for the synced tables + change-log.
+    # Per-entity DB (named after the entity); the change-log triggers and the
+    # UI write path use this same database. The synced table keeps the source
+    # UC schema (e.g. gold).
     "lakebase_database": entity,
 }
- 
+
 ops = create_write_ops(mode=write_mode, spark=spark, params=lakebase_params)
 
 # COMMAND ----------
@@ -327,3 +340,98 @@ else:
     )
 
     logger.info("CDF: Enabled")
+
+# Forward sync: push the freshly created tables to the Lakebase synced tables.
+# No-op for delta mode; for lakebase SNAPSHOT/TRIGGERED policies this kicks the
+# synced-table pipeline. Non-fatal (logged inside).
+if write_mode == "lakebase":
+   for _t in (table_fqn, audit_table_fqn, conflict_table_fqn):
+       ops.trigger_sync(_t)
+
+# COMMAND ----------
+
+# =========================
+# CHANGE-DATA CAPTURE (lakebase reverse-sync)
+# =========================
+# UI edits write the Lakebase synced tables; Postgres AFTER triggers snapshot each
+# change (full row as JSONB) into gold."{entity}_change_log". The workflow notebook
+# Sync_Lakebase_Changelog_To_Delta.py drains that log back into Delta. App-managed
+# (no CDF / Preview enablement). DDL is idempotent — safe to re-run.
+#
+# Note: the {table}_synced Postgres tables are materialized asynchronously by the
+# synced-table pipeline; if a trigger create fails because its table isn't live yet,
+# we log and continue — re-running this notebook once the table exists installs it.
+if write_mode == "lakebase":
+    from lakefusion_core_engine.lakebase_client import LakebasePgClient
+
+    pg_schema = "gold"
+    change_log = f"{entity}_change_log"
+    log_fn = f"{entity}_log_change"
+    synced_targets = [
+        (f"{entity}_reference_prod_synced", "master"),
+        (f"{entity}_reference_audit_prod_synced", "audit"),
+        (f"{entity}_reference_conflict_queue_prod_synced", "conflict"),
+    ]
+
+    changelog_ddl = f'''
+    CREATE TABLE IF NOT EXISTS "{pg_schema}"."{change_log}" (
+        seq          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        source_table TEXT NOT NULL,
+        target_kind  TEXT NOT NULL,
+        operation    TEXT NOT NULL,
+        row_data     JSONB,
+        changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        processed    BOOLEAN NOT NULL DEFAULT FALSE,
+        processed_at TIMESTAMPTZ,
+        batch_id     TEXT
+    );
+    '''
+    index_ddl = (
+        f'CREATE INDEX IF NOT EXISTS "idx_{change_log}_unprocessed" '
+        f'ON "{pg_schema}"."{change_log}" (processed, seq);'
+    )
+    # to_jsonb(NEW/OLD) captures the full post/pre-change row, including complex
+    # (STRUCT/ARRAY) attrs — the workflow rehydrates them via the Delta schema.
+    fn_ddl = f'''
+    CREATE OR REPLACE FUNCTION "{pg_schema}"."{log_fn}"() RETURNS trigger AS $LF$
+    DECLARE payload JSONB;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN payload := to_jsonb(OLD);
+        ELSE                     payload := to_jsonb(NEW);
+        END IF;
+        INSERT INTO "{pg_schema}"."{change_log}"(source_table, target_kind, operation, row_data)
+        VALUES (TG_TABLE_NAME, TG_ARGV[0], TG_OP, payload);
+        RETURN NULL;
+    END;
+    $LF$ LANGUAGE plpgsql;
+    '''
+
+    with LakebasePgClient(
+        instance_id=lakebase_instance_id,
+        branch_id=lakebase_branch_id or "production",
+        endpoint_id=lakebase_endpoint_id or "primary",
+        database=lakebase_params["lakebase_database"],
+    ) as pg:
+        pg.execute(changelog_ddl)
+        pg.execute(index_ddl)
+        pg.execute(fn_ddl)
+        for synced_table, target_kind in synced_targets:
+            try:
+                # drop-then-create so the function ref / target_kind arg stays current
+                pg.execute(
+                    f'DROP TRIGGER IF EXISTS "zz_changelog" '
+                    f'ON "{pg_schema}"."{synced_table}";'
+                )
+                pg.execute(
+                    f'CREATE TRIGGER "zz_changelog" '
+                    f'AFTER INSERT OR UPDATE OR DELETE ON "{pg_schema}"."{synced_table}" '
+                    f"FOR EACH ROW EXECUTE FUNCTION \"{pg_schema}\".\"{log_fn}\"('{target_kind}');"
+                )
+                logger.info(f"Installed change-log trigger on {pg_schema}.{synced_table} ({target_kind})")
+            except Exception as e:
+                logger.warning(
+                    f"Could not install change-log trigger on {pg_schema}.{synced_table} "
+                    f"({target_kind}) yet: {e}. Re-run Create_Tables once the synced "
+                    f"table is materialized."
+                )
+    logger.info(f"Change-log ready: {pg_schema}.{change_log}")

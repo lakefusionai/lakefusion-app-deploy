@@ -68,7 +68,10 @@ from lakefusion_core_engine.utils.databricks_groups import (
     grant_vector_search_endpoint_permissions,
     grant_uc_model_privileges,
     add_group_members_by_email,
+    grant_lakebase_project_access,
+    grant_postgres_table_permissions,
 )
+from lakefusion_core_engine.lakebase_client import LakebasePgClient
 
 PIPELINE_TYPE = "integration"
 VS_ENDPOINT = None
@@ -277,6 +280,82 @@ model_rows = grants_by_resource.get("uc_model", [])
 for row in model_rows:
     grant_uc_model_privileges(spark, row.full_name, row.group_name, row.privileges)
     print(f"  Granted UC model perms: {row.full_name} -> {row.group_name}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Step 6 — Grant access to reference entity tables (if master uses RDM)
+# When a master entity has REFERENCE_ENTITY attributes, the pipeline reads/writes
+# reference mapping tables and reference prod tables. The master entity's SCIM
+# groups need SELECT + MODIFY on those tables (Delta UC grants).
+# For Lakebase reference entities, also grant Postgres-level access on synced tables.
+rdm_configs_list = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSON", "rdm_configs", default=[], debugValue="[]")
+if isinstance(rdm_configs_list, str):
+    rdm_configs_list = json.loads(rdm_configs_list) if rdm_configs_list else []
+
+ref_tables_to_grant = set()
+lakebase_ref_entities = {}
+ref_entity_names = set()
+for cfg in (rdm_configs_list or []):
+    if cfg.get("mapping_table"):
+        ref_tables_to_grant.add(cfg["mapping_table"])
+    if cfg.get("ref_table"):
+        ref_tables_to_grant.add(cfg["ref_table"])
+    if cfg.get("ref_entity_name"):
+        ref_entity_names.add(cfg["ref_entity_name"])
+    if cfg.get("ref_storage_type") == "lakebase" and cfg.get("ref_entity_name"):
+        ref_name = cfg["ref_entity_name"]
+        if ref_name not in lakebase_ref_entities:
+            lakebase_ref_entities[ref_name] = [
+                f"{ref_name}_reference_prod_synced",
+                f"{ref_name}_reference_audit_prod_synced",
+                f"{ref_name}_reference_conflict_queue_prod_synced",
+            ]
+
+if ref_tables_to_grant:
+    print(f"  Found {len(ref_tables_to_grant)} reference table(s) to grant UC access")
+    ref_privileges = {dev_group: ["SELECT", "MODIFY"], steward_group: ["SELECT", "MODIFY"]}
+    for ref_name in ref_entity_names:
+        ref_groups = entity_group_names(ref_name)
+        ref_privileges[ref_groups["developer"]] = ["SELECT", "MODIFY"]
+        ref_privileges[ref_groups["data_steward"]] = ["SELECT", "MODIFY"]
+    for table_path in sorted(ref_tables_to_grant):
+        try:
+            result = grant_uc_object_permissions(
+                w, table_path, catalog.SecurableType.TABLE, ref_privileges,
+            )
+            granted = len(result.get("results", []))
+            skipped = len(result.get("skipped", []))
+            print(f"    {table_path}: {granted} granted, {skipped} skipped")
+        except Exception as e:
+            print(f"    {table_path}: failed — {e}")
+else:
+    print("  No reference entity tables — skipping UC grants")
+
+if lakebase_ref_entities:
+    print(f"  Found {len(lakebase_ref_entities)} Lakebase reference entit(ies) — applying Postgres grants")
+    group_list = [dev_group, steward_group]
+    lakebase_instance_id = dbutils.widgets.get("lakebase_instance_id") if "lakebase_instance_id" in [w.name for w in dbutils.widgets.getAll()] else ""
+
+    if lakebase_instance_id:
+        try:
+            grant_lakebase_project_access(w, f"projects/{lakebase_instance_id}", group_list)
+        except Exception as e:
+            print(f"    Failed granting Lakebase project access: {e}")
+
+        for ref_name, synced_tables in lakebase_ref_entities.items():
+            try:
+                pg = LakebasePgClient(
+                    instance_id=lakebase_instance_id,
+                    database="databricks_postgres",
+                    workspace_client=w,
+                )
+                with pg:
+                    grant_postgres_table_permissions(pg, "gold", synced_tables, group_list)
+                print(f"    Postgres grants applied for {ref_name}")
+            except Exception as e:
+                print(f"    Failed Postgres grants for {ref_name}: {e}")
+    else:
+        print("    Skipping Lakebase grants — lakebase_instance_id not configured")
 
 # COMMAND ----------
 

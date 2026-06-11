@@ -13,7 +13,7 @@ already applied on an environment under the old id, run on that DB:
 (only if the applied row was THIS migration, not the entity_type_subtype one).
 
 1. Adds execution_type column to entity_search_databricks_job.
-2. Inserts ENABLE_SQL_STEWARDSHIP feature flag (INACTIVE by default).
+2. Inserts ENABLE_SQL_STEWARDSHIP feature flag (ACTIVE by default).
 3. Migrates legacy status values to standardized uppercase enum:
    prepare → SUBMITTED, match_merge_pending → PENDING,
    match_merge_successed → COMPLETED, match_merge_failed → FAILED
@@ -102,12 +102,12 @@ def upgrade() -> None:
                 """),
                 {
                     "name": "ENABLE_SQL_STEWARDSHIP",
-                    "status": "INACTIVE",
+                    "status": "ACTIVE",
                     "description": "Enable SQL warehouse-based stewardship operations (merge, not-a-match) instead of notebook jobs. ~10x faster.",
                     "now": datetime.utcnow()
                 }
             )
-            logger.info("Inserted feature flag: ENABLE_SQL_STEWARDSHIP (INACTIVE)")
+            logger.info("Inserted feature flag: ENABLE_SQL_STEWARDSHIP (ACTIVE)")
     except Exception as e:
         logger.info(f"Could not insert feature flag: {e}")
 

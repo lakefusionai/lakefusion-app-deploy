@@ -216,6 +216,20 @@ if not primary_table_mapping:
 logger.info(f"Found attribute mapping for {primary_table}")
 logger.info(f"Mapping: {len(primary_table_mapping)} attributes")
 
+# COMMAND ----------
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+
+# COMMAND ----------
+
 # ── complex-type projection ───────────────────────────────────
 # If the entity has any STRUCT or ARRAY (is_array=true) attributes AND the
 # pipeline received the full mapping payload, delegate to the centralized
@@ -261,7 +275,6 @@ for _entry in attributes_mapping_full:
         break
 
 if _has_complex_attrs and _primary_full_records:
-    from utils.complex_type_mapping import project_source_to_target
 
     logger.info("Using complex-type projection")
     mapped_df = project_source_to_target(
@@ -298,8 +311,8 @@ else:
 # Add any missing entity attributes as NULL with CORRECT data type from entity model.
 # Uses the centralized create_schema_fields helper so STRUCT / ARRAY columns
 # get nested nulls of the right type.
-from utils.spark_types import get_complex_spark_data_type as _resolve_complex_dtype
 
+_resolve_complex_dtype=get_complex_spark_data_type
 _records_by_name = {r["name"]: r for r in entity_attribute_records if isinstance(r, dict) and r.get("name")}
 missing_attrs = 0
 for attr in entity_attributes:
@@ -384,7 +397,6 @@ for attr in combine_attrs:
 # concat_ws when no STRUCT / ARRAY attributes are present so vector search
 # behaviour is byte-identical for scalar-only entities.
 if _has_complex_attrs:
-    from utils.attributes_combined import build_attributes_combined_column
     id_df = id_df.withColumn(
         "attributes_combined",
         build_attributes_combined_column(id_df, combine_attrs, entity_attribute_records),

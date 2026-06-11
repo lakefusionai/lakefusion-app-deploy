@@ -1,3 +1,8 @@
+# Databricks notebook source
+# MAGIC %run ./spark_types
+
+# COMMAND ----------
+
 """Runtime transforms for complex-type dataset mappings.
 
 This module is the *pipeline* side of the contract. The save-time
@@ -37,8 +42,6 @@ from pyspark.sql.types import (
     StructField,
     StructType,
 )
-
-from utils.spark_types import get_complex_spark_data_type, get_spark_data_type
 
 
 class StructSchemaMismatchError(RuntimeError):

@@ -1,3 +1,4 @@
+# Databricks notebook source
 """attributes_combined flattening for complex-type aware ingestion.
 
 `attributes_combined` is the flat string that downstream vector search

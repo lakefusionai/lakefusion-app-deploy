@@ -376,6 +376,7 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
     # ── Enrich batch_df from mapping, then split approved vs pending ──────
     enriched = batch_df
     pending_clauses = []
+    saw_ref_attr = False
 
     for cfg in configs:
         attr_name = cfg["attribute_name"]
@@ -403,48 +404,79 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
             "left",
         )
 
-        # Row is pending FOR THIS ATTR if:
+        # Row is UNRESOLVED for this attr if:
         #   - source value is non-null AND
         #   - status is PENDING / NO_MATCH / missing (no row in mapping)
         # If source value is null/empty, attr doesn't block (nothing to resolve).
+        # An unresolved attr only routes the row to the error table when its
+        # unresolved_action is "move_to_error". The default "keep_null" keeps
+        # the row and nulls the attr instead (handled in the replacement loop).
         attr_str = F.col(attr_name).cast("string")
-        is_blocking = (
+        is_unresolved = (
             attr_str.isNotNull() & (attr_str != "") &
             (
                 F.col(f"_mp_{attr_name}_status").isNull() |
                 ~F.col(f"_mp_{attr_name}_status").isin(*_APPROVED_STATUSES)
             )
         )
-        pending_clauses.append(is_blocking)
+        saw_ref_attr = True
+        if (cfg.get("unresolved_action") or "keep_null") == "move_to_error":
+            pending_clauses.append(is_unresolved)
 
-    if not pending_clauses:
+    if not saw_ref_attr:
+        # No REF attrs present in batch columns — nothing to resolve
         return batch_df, empty_df
 
-    # Combine — row is pending if ANY ref attr is blocking
-    any_pending = pending_clauses[0]
-    for c in pending_clauses[1:]:
-        any_pending = any_pending | c
-    enriched = enriched.withColumn("_any_pending", any_pending)
+    # Combine — row is pending if ANY move_to_error ref attr is unresolved
+    if pending_clauses:
+        any_pending = pending_clauses[0]
+        for c in pending_clauses[1:]:
+            any_pending = any_pending | c
+        enriched = enriched.withColumn("_any_pending", any_pending)
+        approved_df = enriched.filter(~F.col("_any_pending") | F.col("_any_pending").isNull())
+        pending_df = enriched.filter(F.col("_any_pending"))
+    else:
+        # All ref attrs are keep_null → no row is ever routed to the error table
+        enriched = enriched.withColumn("_any_pending", F.lit(False))
+        approved_df = enriched
+        pending_df = enriched.filter(F.col("_any_pending"))
 
-    approved_df = enriched.filter(~F.col("_any_pending") | F.col("_any_pending").isNull())
-    pending_df = enriched.filter(F.col("_any_pending"))
-
-    # In approved_df: replace REF column with ref_id; add __display column
+    # In approved_df: replace REF column with its resolved ref_id and add a
+    # __display column. For move_to_error attrs, approved rows are always
+    # resolved (unresolved ones were split into pending_df). For keep_null
+    # attrs an unresolved value is nulled out — the row is kept but the attr
+    # (and its display) become NULL.
     for cfg in configs:
         attr_name = cfg["attribute_name"]
         if attr_name not in batch_df.columns:
             continue
-        approved_df = (
-            approved_df
-            .withColumn(
-                attr_name,
-                F.coalesce(F.col(f"_mp_{attr_name}_id"), F.col(attr_name)),
+        if (cfg.get("unresolved_action") or "keep_null") == "keep_null":
+            is_resolved = F.col(f"_mp_{attr_name}_status").isin(*_APPROVED_STATUSES)
+            approved_df = (
+                approved_df
+                .withColumn(
+                    attr_name,
+                    F.when(is_resolved, F.col(f"_mp_{attr_name}_id"))
+                     .otherwise(F.lit(None).cast("string")),
+                )
+                .withColumn(
+                    f"{attr_name}__display",
+                    F.when(is_resolved, F.col(f"_mp_{attr_name}_display"))
+                     .otherwise(F.lit(None).cast("string")),
+                )
             )
-            .withColumn(
-                f"{attr_name}__display",
-                F.coalesce(F.col(f"_mp_{attr_name}_display"), F.col(attr_name)),
+        else:
+            approved_df = (
+                approved_df
+                .withColumn(
+                    attr_name,
+                    F.coalesce(F.col(f"_mp_{attr_name}_id"), F.col(attr_name)),
+                )
+                .withColumn(
+                    f"{attr_name}__display",
+                    F.coalesce(F.col(f"_mp_{attr_name}_display"), F.col(attr_name)),
+                )
             )
-        )
 
     # Build _rdm_pending_reason per pending row — a human-readable string of
     # which REF attrs blocked this row, with their status and raw value:
@@ -454,6 +486,10 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
     for cfg in configs:
         attr_name = cfg["attribute_name"]
         if attr_name not in batch_df.columns:
+            continue
+        # Only move_to_error attrs can put a row in pending_df, so the reason
+        # string must describe those attrs only.
+        if (cfg.get("unresolved_action") or "keep_null") != "move_to_error":
             continue
         attr_str = F.col(attr_name).cast("string")
         is_blocking = (
@@ -481,6 +517,12 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
         pending_df = pending_df.withColumn(
             "_rdm_pending_reason",
             F.concat_ws("; ", *reason_parts),
+        )
+    else:
+        # No move_to_error attrs → pending_df is empty, but keep the column so
+        # callers can select it unconditionally.
+        pending_df = pending_df.withColumn(
+            "_rdm_pending_reason", F.lit(None).cast("string")
         )
 
     # Drop intermediate cols (keep _rdm_pending_reason on pending_df)

@@ -1,3 +1,4 @@
+# Databricks notebook source
 """Centralized Spark type resolution for LakeFusion entity attributes.
 
 Consolidates the scalar-type dictionary that previously lived (copy-pasted) in

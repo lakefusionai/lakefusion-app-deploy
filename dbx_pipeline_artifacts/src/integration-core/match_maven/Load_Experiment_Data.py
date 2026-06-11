@@ -185,6 +185,28 @@ model_selected_sub_fields_raw = dbutils.jobs.taskValues.get(
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+
+# COMMAND ----------
+
 # DBTITLE 1,Import core engine components
 from lakefusion_core_engine.identifiers import generate_lakefusion_id, generate_surrogate_key
 from lakefusion_core_engine.models import RecordStatus
@@ -337,9 +359,7 @@ def apply_attribute_mapping(df, table_name, mapping_list, entity_attrs, entity_a
             break
 
     if _has_complex_attrs and full_records:
-        from utils.complex_type_mapping import project_source_to_target
-        from utils.spark_types import get_complex_spark_data_type as _resolve_complex_dtype
-
+        _resolve_complex_dtype=get_complex_spark_data_type
         mapped_df = project_source_to_target(df, full_records, entity_attribute_records)
         mapped_columns = set(mapped_df.columns)
 
@@ -404,7 +424,6 @@ def create_attributes_combined(df, combine_attrs, source_id):
     # sub-field values, ARRAY/ARRAY<STRUCT> JSON-serializes. RDM resolver may
     # have produced `<attr>__display` aliases — those take precedence for the
     # combined string, falling back to the original column.
-    from utils.attributes_combined import build_attributes_combined_column
 
     effective_names = []
     for attr in combine_attrs:
@@ -551,8 +570,10 @@ if is_single_source:
     master_df = spark.table(master_table)
     # Drop the master-only embedding column before cloning: unified_deduplicate's schema
     # (created in Create_Tables_Experiment) excludes attributes_combined_embedding, so an
-    # unfiltered clone triggers DELTA_METADATA_MISMATCH on the overwrite below. The VS step
-    # re-adds the column via mergeSchema when embedding_mode == "precomputed".
+    # unfiltered clone triggers DELTA_METADATA_MISMATCH on the overwrite below. Safe to drop:
+    # the VS step (Entity_Matching_Vector_Search_Experiment, STEP 0) unconditionally
+    # re-clones master -> unified_deduplicate with mergeSchema, re-adding the column before
+    # it is ever read (only the precomputed-mode search reads it).
     unified_dedup_df = master_df.withColumn("search_results", lit("").cast(StringType())) \
                                  .withColumn("scoring_results", lit("").cast(StringType())) \
                                  .drop("attributes_combined_embedding")

@@ -528,12 +528,24 @@ from fastapi import Request as FastAPIRequest
 @app.middleware("http")
 async def databricks_auth_middleware(request: FastAPIRequest, call_next):
     """
-    Handle Databricks authentication for API routes.
-    In Databricks Apps, authentication is handled automatically via cookies/headers.
-    This middleware ensures proper header propagation.
+    Handle Databricks authentication and CSRF protection for API routes.
+    Validates Origin/Referer on state-changing requests to prevent cross-site request forgery.
     """
+    # CSRF: validate Origin/Referer on state-changing methods
+    _csrf_safe_methods = {"GET", "HEAD", "OPTIONS"}
+    if request.method not in _csrf_safe_methods:
+        _dbx_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+        if _dbx_app_url:
+            from urllib.parse import urlparse
+            origin = request.headers.get("origin") or request.headers.get("referer")
+            if origin:
+                parsed = urlparse(origin)
+                allowed_host = urlparse(_dbx_app_url).netloc
+                if parsed.netloc and parsed.netloc != allowed_host:
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(status_code=403, content={"detail": "Cross-origin request rejected"})
+
     response = await call_next(request)
-    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
 

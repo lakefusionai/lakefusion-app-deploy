@@ -1,6 +1,10 @@
 import re
 from sqlalchemy.orm import Session
-from lakefusion_utility.models.pim import PimAttributeDefinition
+from lakefusion_utility.models.pim import (
+    PimAttributeDefinition, PimSpecificationConfig,
+    PimValueText, PimValueNumber, PimValueBoolean,
+    PimValueDate, PimValueSelect, PimValueMultiselect, PimValueReference,
+)
 from lakefusion_utility.utils.logging_utils import get_logger
 from app.lakefusion_pim_service.services.pim_attribute_service import PimAttributeService
 
@@ -53,21 +57,27 @@ class PimAttributeSyncService:
         # Handle delete action
         if attr_data.get("action") == "delete":
             source_id = attr_data.get("source_attr_id")
+
+            attr = None
             if source_id:
-                # Find by source_id in description or by iterating globals
-                attrs = (
+                attr = (
                     self.data_db.query(PimAttributeDefinition)
-                    .filter(
-                        PimAttributeDefinition.scope == "general",
-                        PimAttributeDefinition.description.like(f"%source_id={source_id}%"),
-                    )
-                    .all()
+                    .filter(PimAttributeDefinition.source_attr_id == int(source_id))
+                    .first()
                 )
-                for attr in attrs:
-                    self.data_db.delete(attr)
-                    app_logger.info(f"Deleted global attribute: {attr.code} (source_id={source_id})")
-                if attrs:
-                    return {"action": "deleted", "count": len(attrs)}
+
+            if attr:
+                # Clean up values referencing this attribute across all typed value tables
+                for VT in [PimValueText, PimValueNumber, PimValueBoolean,
+                            PimValueDate, PimValueSelect, PimValueMultiselect, PimValueReference]:
+                    self.data_db.query(VT).filter(VT.attribute_id == attr.id).delete(synchronize_session=False)
+                # Clean up specification configs
+                self.data_db.query(PimSpecificationConfig).filter(
+                    PimSpecificationConfig.attribute_id == attr.id
+                ).delete(synchronize_session=False)
+                self.data_db.delete(attr)
+                app_logger.info(f"Deleted attribute: {attr.code} (source_attr_id={source_id}, scope={attr.scope})")
+                return {"action": "deleted", "count": 1}
             return {"action": "delete_skipped", "reason": "attribute not found"}
 
         code = _normalize_code(attr_data["name"])
@@ -166,7 +176,8 @@ class PimAttributeSyncService:
                 reference_entity_id=ref_entity_id,
                 group=group,
                 display_order=display_order,
-                description=f"Synced from entity attribute (source_id={attr_data.get('source_attr_id')})",
+                source_attr_id=attr_data.get("source_attr_id"),
+                description=attr_data.get("description") or None,
             )
             self.data_db.add(new_attr)
             self.data_db.flush()

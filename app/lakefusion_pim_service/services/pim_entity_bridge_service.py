@@ -188,54 +188,6 @@ class PimEntityBridgeService:
         Base.metadata.create_all(bind=data_engine, tables=pim_tables)
         app_logger.info(f"Created {len(pim_tables)} pim_* tables in {db_name}")
 
-        # Step 3b: Add new columns to existing tables (create_all won't add columns to existing tables)
-        from sqlalchemy import text
-        with data_engine.connect() as conn:
-            # pim_value_text — translation columns
-            for col, col_type in [
-                ("translation_model", "VARCHAR(255)"),
-                ("translation_source_locale", "VARCHAR(10)"),
-                ("translated_at", "TIMESTAMP"),
-            ]:
-                try:
-                    conn.execute(text(f"ALTER TABLE pim_value_text ADD COLUMN {col} {col_type}"))
-                    app_logger.info(f"Added column {col} to pim_value_text")
-                except Exception:
-                    pass  # Column already exists
-
-            # pim_attribute_definition — group, display_order, is_identifier, is_label
-            for col, col_type, default in [
-                ("\"group\"", "VARCHAR(100) NOT NULL", "'General'"),
-                ("display_order", "INTEGER NOT NULL", "0"),
-                ("is_identifier", "BOOLEAN NOT NULL", "FALSE"),
-                ("is_label", "BOOLEAN NOT NULL", "FALSE"),
-            ]:
-                try:
-                    conn.execute(text(f"ALTER TABLE pim_attribute_definition ADD COLUMN {col} {col_type} DEFAULT {default}"))
-                    app_logger.info(f"Added column {col} to pim_attribute_definition")
-                except Exception:
-                    pass  # Column already exists
-
-            # Drop sku/name/ean from pim_entity if they exist (old schema)
-            for col in ["sku", "name", "ean"]:
-                try:
-                    conn.execute(text(f"ALTER TABLE pim_entity DROP COLUMN IF EXISTS {col}"))
-                except Exception:
-                    pass
-
-            # Rename old tables if they exist
-            for old_name, new_name in [
-                ("pim_taxonomy_attribute_config", "pim_specification_config"),
-                ("pim_resolved_attribute_config", "pim_resolved_specification"),
-            ]:
-                try:
-                    conn.execute(text(f"ALTER TABLE {old_name} RENAME TO {new_name}"))
-                    app_logger.info(f"Renamed table {old_name} → {new_name}")
-                except Exception:
-                    pass  # Already renamed or doesn't exist
-
-            conn.commit()
-
         # Step 4: Seed hierarchy tiers (uses engine from pool via backward-compat aliases)
         import app.lakefusion_pim_service.utils.app_db as app_db_module
         self._seed_hierarchy_tiers(entity_id, app_db_module)

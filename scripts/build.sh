@@ -444,7 +444,7 @@ async def lifespan(app):
                             secret_service = SecretScopeService(token="", scope_name=scope_name)
                             secret_service.upsert_secret(key="lakefusion_spn", value=app_sp_client_id)
                             secret_service.upsert_secret(key="lakefusion_spn_secret", value=app_sp_client_secret)
-                            secret_service.grant_read_acl(principal="users")
+                            secret_service.grant_read_acl()
                             logger.info(f"Auto-provisioned SPN to DB + Secret Scope ({scope_name}): {app_sp_client_id}")
                         else:
                             logger.info(f"lakefusion_spn already set: {existing_spn}")

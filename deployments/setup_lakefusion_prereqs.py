@@ -1,16 +1,13 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # LakeFusion App Setup Notebook
+# MAGIC # LakeFusion Prerequisites Setup
 # MAGIC
-# MAGIC This notebook helps you set up the LakeFusion Databricks App with all required configurations:
-# MAGIC 1. Create Databricks App (if not exists)
-# MAGIC 2. Create Lakebase OLTP Database (if not exists)
-# MAGIC 3. Set up secrets scope and secrets
-# MAGIC 4. Configure app resources (database, secrets)
+# MAGIC This notebook sets up the infrastructure prerequisites for LakeFusion.
 # MAGIC
-# MAGIC ## Prerequisites
-# MAGIC - Databricks workspace admin access
-# MAGIC - Service principal for OIDC authentication (optional, for SSO)
+# MAGIC **What this notebook does:**
+# MAGIC 2. Create Lakebase Database Instance
+# MAGIC 3. Create PostgreSQL Database in the Instance
+# MAGIC 4. Register Database as Unity Catalog
 
 # COMMAND ----------
 
@@ -36,15 +33,13 @@ dbutils.library.restartPython()
 
 # COMMAND ----------
 
-# Widget definitions
-dbutils.widgets.text("app_name", "lakefusionai", "App Name")
-dbutils.widgets.text("app_description", "LakeFusion AI", "App Description")
-dbutils.widgets.text("source_code_path", "/Workspace/Users/{user}/lakefusion-app-deploy", "Source Code Path")
-dbutils.widgets.text("database_name", "lakefusion-db", "Lakebase Instance Name")
-dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "PostgreSQL Database Name")
+# Widget definitions — prerequisites only (no app-specific widgets)
+dbutils.widgets.text("database_name", "lakefusion-db", "App DB — Lakebase Instance Name")
+dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "App DB — Lakebase Database Name")
 dbutils.widgets.text("secrets_scope", "lakefusion", "Secrets Scope Name")
 dbutils.widgets.text("oidc_client_id", "", "OIDC Client ID (for SSO)")
 dbutils.widgets.text("oidc_client_secret", "", "OIDC Client Secret (for SSO)")
+dbutils.widgets.text("catalog_name", "lakefusion_ai", "DB Unity Catalog Name")
 dbutils.widgets.dropdown("create_database", "true", ["true", "false"], "Create Lakebase Database")
 dbutils.widgets.dropdown("create_secrets", "true", ["true", "false"], "Create Secrets")
 
@@ -56,29 +51,20 @@ dbutils.widgets.dropdown("create_secrets", "true", ["true", "false"], "Create Se
 # COMMAND ----------
 
 # Get configuration values
-APP_NAME = dbutils.widgets.get("app_name")
-APP_DESCRIPTION = dbutils.widgets.get("app_description")
-SOURCE_CODE_PATH = dbutils.widgets.get("source_code_path")
 DATABASE_NAME = dbutils.widgets.get("database_name")
 INTERNAL_DB_NAME = dbutils.widgets.get("internal_db_name")
 SECRETS_SCOPE = dbutils.widgets.get("secrets_scope")
 OIDC_CLIENT_ID = dbutils.widgets.get("oidc_client_id")
 OIDC_CLIENT_SECRET = dbutils.widgets.get("oidc_client_secret")
+CATALOG_NAME = dbutils.widgets.get("catalog_name")
 CREATE_DATABASE = dbutils.widgets.get("create_database") == "true"
 CREATE_SECRETS = dbutils.widgets.get("create_secrets") == "true"
 
-# Replace {user} placeholder in source code path
-current_user = spark.sql("SELECT current_user()").collect()[0][0]
-if "{user}" in SOURCE_CODE_PATH:
-    SOURCE_CODE_PATH = SOURCE_CODE_PATH.replace("{user}", current_user)
-
 print(f"Configuration:")
-print(f"  App Name: {APP_NAME}")
-print(f"  App Description: {APP_DESCRIPTION}")
-print(f"  Source Code Path: {SOURCE_CODE_PATH}")
-print(f"  Lakebase Instance Name: {DATABASE_NAME}")
-print(f"  PostgreSQL Database Name: {INTERNAL_DB_NAME}")
+print(f"  App DB — Lakebase Instance: {DATABASE_NAME}")
+print(f"  App DB — Database Name: {INTERNAL_DB_NAME}")
 print(f"  Secrets Scope: {SECRETS_SCOPE}")
+print(f"  Unity Catalog Name: {CATALOG_NAME}")
 print(f"  Create Database: {CREATE_DATABASE}")
 print(f"  Create Secrets: {CREATE_SECRETS}")
 print(f"  OIDC Client ID: {'[SET]' if OIDC_CLIENT_ID else '[NOT SET]'}")
@@ -322,16 +308,10 @@ def wait_for_instance_running(instance_name, timeout=300):
     return False
 
 def get_postgres_credentials(instance_name):
-    """Get credentials for PostgreSQL connection using Databricks SDK.
-
-    Uses generate_database_credential() to get a short-lived OAuth token
-    for Lakebase OLTP authentication from notebooks.
-    """
-    # Get current user for username
+    """Get credentials for PostgreSQL connection using Databricks SDK."""
     context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
     username = context.userName().get()
 
-    # Generate database credential (short-lived OAuth token)
     cred = w.database.generate_database_credential(
         request_id=str(uuid.uuid4()),
         instance_names=[instance_name]
@@ -428,7 +408,6 @@ if CREATE_DATABASE and db_info:
     if db_info and not getattr(db_info, "effective_enable_pg_native_login", False):
         print("Enabling native PostgreSQL login...")
         enable_native_pg_login(DATABASE_NAME)
-        # Wait a bit for the setting to take effect
         time.sleep(5)
 
     current_state = str(db_info.state) if db_info and db_info.state else None
@@ -445,16 +424,10 @@ if CREATE_DATABASE and db_info:
 
 # MAGIC %md
 # MAGIC ## Step 2c: Create Database and Register as Unity Catalog
-# MAGIC
-# MAGIC Create a new PostgreSQL database and register it as a Unity Catalog catalog in one step.
 
 # COMMAND ----------
 
 from databricks.sdk.service.database import DatabaseCatalog
-
-# Widget for catalog name
-dbutils.widgets.text("catalog_name", "lakefusion_ai", "Unity Catalog Name")
-CATALOG_NAME = dbutils.widgets.get("catalog_name")
 
 def create_database_and_catalog(instance_name, db_name, catalog_name):
     """Create a new PostgreSQL database and register it as a Unity Catalog catalog."""
@@ -505,7 +478,6 @@ def grant_catalog_privileges(instance_name, db_name):
         conn.autocommit = True
         cursor = conn.cursor()
 
-        # Grant privileges on public schema
         cursor.execute("GRANT ALL ON SCHEMA public TO PUBLIC;")
         cursor.execute("GRANT CREATE ON SCHEMA public TO PUBLIC;")
         cursor.execute("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO PUBLIC;")
@@ -531,12 +503,10 @@ if CREATE_DATABASE and db_info:
 
     current_state = str(db_info.state) if db_info and db_info.state else None
     if db_info and current_state in ["RUNNING", "AVAILABLE", "State.RUNNING", "State.AVAILABLE", "DatabaseInstanceState.AVAILABLE"]:
-        # Create database and register as catalog
         print(f"\nCreating database '{INTERNAL_DB_NAME}' and catalog '{CATALOG_NAME}'...")
         catalog = create_database_and_catalog(DATABASE_NAME, INTERNAL_DB_NAME, CATALOG_NAME)
 
         if catalog:
-            # Grant privileges for table creation
             print("\nGranting schema privileges...")
             grant_catalog_privileges(DATABASE_NAME, INTERNAL_DB_NAME)
 
@@ -550,424 +520,28 @@ if CREATE_DATABASE and db_info:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3: Check/Create Databricks App
+# MAGIC ## Summary
 
 # COMMAND ----------
 
-def get_app(app_name):
-    """Get app details using raw API."""
-    response = api_request("GET", f"/api/2.0/apps/{app_name}")
-    if response.status_code == 200:
-        return response.json()
-    elif response.status_code == 404:
-        return None
-    else:
-        print(f"Error getting app: {response.text}")
-        return None
+print("=" * 60)
+print("  PREREQUISITES SETUP COMPLETE")
+print("=" * 60)
 
-def create_app(app_name, description, source_code_path):
-    """Create a Databricks App using raw API."""
-    response = api_request("POST", "/api/2.0/apps", {
-        "name": app_name,
-        "description": description,
-        "default_source_code_path": source_code_path
-    })
-    if response.status_code == 200:
-        print(f"Created app: {app_name}")
-        return response.json()
-    else:
-        print(f"Failed to create app: {response.text}")
-        return None
+if CREATE_SECRETS:
+    print(f"  ✅ Secrets Scope: {SECRETS_SCOPE}")
+    if OIDC_CLIENT_ID:
+        print(f"     - DATABRICKS_OIDC_CLIENT_ID: [SET]")
+    if OIDC_CLIENT_SECRET:
+        print(f"     - DATABRICKS_OIDC_CLIENT_SECRET: [SET]")
 
-def update_app_resources(app_name, resources):
-    """Update app resources (database, secrets) using raw API."""
-    # Use raw API for app resources as SDK types may vary by version
-    response = api_request("PATCH", f"/api/2.0/apps/{app_name}", {
-        "resources": resources
-    })
-    if response.status_code == 200:
-        print(f"Updated app resources for: {app_name}")
-        return response.json()
-    else:
-        print(f"Failed to update app resources: {response.text}")
-        return None
-
-print("=" * 50)
-print("Step 3: Setting up Databricks App")
-print("=" * 50)
-
-app_info = get_app(APP_NAME)
-if app_info:
-    print(f"App already exists: {APP_NAME}")
-    print(f"App URL: {app_info.get('url', 'N/A')}")
-    print(f"App Status: {app_info.get('app_status', {}).get('state', 'N/A')}")
-    print(f"Compute Status: {app_info.get('compute_status', {}).get('state', 'N/A')}")
-else:
-    print(f"Creating app: {APP_NAME}")
-    app_info = create_app(APP_NAME, APP_DESCRIPTION, SOURCE_CODE_PATH)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 4: Configure App Resources
-
-# COMMAND ----------
-
-def wait_for_app_ready(app_name, timeout=600):
-    """Wait for app compute to be in ACTIVE or STOPPED state."""
-    print(f"Checking app compute state...")
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        app_info = get_app(app_name)
-        if app_info:
-            compute_state = app_info.get("compute_status", {}).get("state", "UNKNOWN")
-            print(f"  Compute state: {compute_state}")
-            if compute_state in ["ACTIVE", "STOPPED", "RUNNING"]:
-                return True
-            elif compute_state in ["STARTING", "STOPPING", "PENDING"]:
-                print(f"  Waiting for compute to be ready...")
-                time.sleep(20)
-            else:
-                # Unknown state, try anyway
-                return True
-        else:
-            return False
-    print("Timeout waiting for app compute to be ready")
-    return False
-
-print("=" * 50)
-print("Step 4: Configuring App Resources")
-print("=" * 50)
-
-# Wait for app to be ready before updating resources
-if not wait_for_app_ready(APP_NAME):
-    print("Warning: Could not verify app state, attempting update anyway...")
-
-# Build resources list
-resources = []
-
-# Add Lakebase OLTP database resource
 if CREATE_DATABASE:
-    resources.append({
-        "name": "lakefusion-db",
-        "database": {
-            "instance_name": DATABASE_NAME,        # Lakebase instance name (e.g., "lakefusion-db")
-            "database_name": INTERNAL_DB_NAME,     # PostgreSQL database name (e.g., "lakefusion_transactional_db")
-            "permission": "CAN_CONNECT_AND_CREATE"
-        }
-    })
+    db_info = get_lakebase_database(DATABASE_NAME)
+    if db_info:
+        print(f"  ✅ Lakebase Instance: {DATABASE_NAME}")
+        print(f"     Endpoint: {db_info.read_write_dns or 'N/A'}")
+        print(f"     State: {db_info.state}")
+    print(f"  ✅ PostgreSQL Database: {INTERNAL_DB_NAME}")
+    print(f"  ✅ Unity Catalog: {CATALOG_NAME}")
 
-# Add secret resources
-if CREATE_SECRETS and OIDC_CLIENT_ID:
-    resources.append({
-        "name": "DATABRICKS_OIDC_CLIENT_ID",
-        "secret": {
-            "scope": SECRETS_SCOPE,
-            "key": "DATABRICKS_OIDC_CLIENT_ID",
-            "permission": "READ"
-        }
-    })
-
-if CREATE_SECRETS and OIDC_CLIENT_SECRET:
-    resources.append({
-        "name": "DATABRICKS_OIDC_CLIENT_SECRET",
-        "secret": {
-            "scope": SECRETS_SCOPE,
-            "key": "DATABRICKS_OIDC_CLIENT_SECRET",
-            "permission": "READ"
-        }
-    })
-
-if resources:
-    print(f"Configuring {len(resources)} resources:")
-    for r in resources:
-        print(f"  - {r['name']}")
-
-    result = update_app_resources(APP_NAME, resources)
-    if result:
-        print("Resources configured successfully!")
-else:
-    print("No resources to configure")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 4a: Update app.yml with widget values
-
-# COMMAND ----------
-
-import base64
-from databricks.sdk.service.workspace import ImportFormat, ExportFormat
-
-# Read existing app.yml as raw text (preserves formatting that Databricks Apps requires)
-app_yml_path = f"{SOURCE_CODE_PATH}/app.yml"
-try:
-    export_resp = w.workspace.export(path=app_yml_path, format=ExportFormat.AUTO)
-    content = base64.b64decode(export_resp.content).decode('utf-8')
-    print(f"Read existing app.yml from {app_yml_path}")
-except Exception as e:
-    print(f"⚠️  Could not read existing app.yml: {e}")
-    content = ""
-
-if content:
-    # String replacements to update dynamic values while preserving YAML formatting
-    import re
-
-    # Update app name
-    content = re.sub(r'^name: .+$', f'name: {APP_NAME}', content, count=1, flags=re.MULTILINE)
-
-    # Update database resource name and database
-    content = re.sub(r'(resources:\n  - name: ).+', rf'\g<1>{DATABASE_NAME}', content)
-    content = re.sub(r'(    database: ).+', rf'\g<1>{INTERNAL_DB_NAME}', content)
-
-    # Update env var values
-    env_replacements = {
-        "DATABRICKS_DATABASE_INSTANCE": DATABASE_NAME,
-        "DATABRICKS_DATABASE_NAME": INTERNAL_DB_NAME,
-        "PGDATABASE": INTERNAL_DB_NAME,
-    }
-    for env_name, env_value in env_replacements.items():
-        content = re.sub(
-            rf'(- name: {env_name}\n    value: ).+',
-            rf'\g<1>"{env_value}"',
-            content
-        )
-
-    print("---")
-    print(content)
-
-    w.workspace.import_(
-        path=app_yml_path,
-        content=base64.b64encode(content.encode()).decode(),
-        format=ImportFormat.AUTO,
-        overwrite=True
-    )
-    print(f"✅ app.yml updated at {app_yml_path}")
-else:
-    print("❌ No existing app.yml found — run the build/deploy first")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 5: Summary
-
-# COMMAND ----------
-
-print("=" * 50)
-print("Setup Summary")
-print("=" * 50)
-
-# Get final app state
-final_app_info = get_app(APP_NAME)
-if final_app_info:
-    print(f"\nApp Name: {final_app_info.get('name')}")
-    print(f"App URL: {final_app_info.get('url', 'N/A')}")
-    print(f"Source Code Path: {final_app_info.get('default_source_code_path', 'N/A')}")
-    print(f"App Status: {final_app_info.get('app_status', {}).get('state', 'N/A')}")
-    print(f"Compute Status: {final_app_info.get('compute_status', {}).get('state', 'N/A')}")
-
-    print(f"\nConfigured Resources:")
-    for resource in final_app_info.get('resources', []):
-        print(f"  - {resource.get('name')}")
-
-    print(f"\nService Principal: {final_app_info.get('service_principal_name', 'N/A')}")
-
-    print("\n" + "=" * 50)
-    print("Next Steps:")
-    print("=" * 50)
-    print("1. Sync your app code to the source code path")
-    print("2. Start the app compute if stopped")
-    print("3. Deploy the app")
-    print(f"\nApp URL: {final_app_info.get('url', 'N/A')}")
-else:
-    print("Failed to retrieve app information")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 6: Sync App Files to Workspace
-
-# COMMAND ----------
-
-# import base64
-# import os
-
-# def sync_file_to_workspace(local_content, workspace_path):
-#     """Upload a file to the Databricks workspace."""
-#     encoded_content = base64.b64encode(local_content.encode('utf-8')).decode('utf-8')
-#     response = api_request("POST", "/api/2.0/workspace/import", {
-#         "path": workspace_path,
-#         "format": "AUTO",
-#         "content": encoded_content,
-#         "overwrite": True
-#     })
-#     if response.status_code == 200:
-#         return True
-#     else:
-#         print(f"Failed to upload {workspace_path}: {response.text}")
-#         return False
-
-# def ensure_workspace_directory(path):
-#     """Ensure a directory exists in the workspace."""
-#     response = api_request("POST", "/api/2.0/workspace/mkdirs", {
-#         "path": path
-#     })
-#     return response.status_code == 200
-
-# def list_workspace_files(path):
-#     """List files in a workspace directory."""
-#     response = api_request("GET", f"/api/2.0/workspace/list?path={path}")
-#     if response.status_code == 200:
-#         return response.json().get("objects", [])
-#     return []
-
-# # Widget for sync control
-# dbutils.widgets.dropdown("sync_files", "false", ["true", "false"], "Sync App Files")
-# dbutils.widgets.text("local_app_path", "/Workspace/Repos/lakefusion-app", "Local App Source Path")
-
-# SYNC_FILES = dbutils.widgets.get("sync_files") == "true"
-# LOCAL_APP_PATH = dbutils.widgets.get("local_app_path")
-
-# print("=" * 50)
-# print("Step 6: Sync App Files")
-# print("=" * 50)
-
-# if SYNC_FILES:
-#     print(f"Syncing files from: {LOCAL_APP_PATH}")
-#     print(f"Syncing files to: {SOURCE_CODE_PATH}")
-
-#     # Ensure target directory exists
-#     ensure_workspace_directory(SOURCE_CODE_PATH)
-
-#     # List source files and copy them
-#     source_files = list_workspace_files(LOCAL_APP_PATH)
-#     if source_files:
-#         for obj in source_files:
-#             src_path = obj.get("path")
-#             file_name = src_path.split("/")[-1]
-#             dest_path = f"{SOURCE_CODE_PATH}/{file_name}"
-
-#             if obj.get("object_type") == "FILE":
-#                 # Read and copy file
-#                 read_response = api_request("GET", f"/api/2.0/workspace/export?path={src_path}&format=AUTO")
-#                 if read_response.status_code == 200:
-#                     content = read_response.json().get("content", "")
-#                     # Re-upload to destination
-#                     upload_response = api_request("POST", "/api/2.0/workspace/import", {
-#                         "path": dest_path,
-#                         "format": "AUTO",
-#                         "content": content,
-#                         "overwrite": True
-#                     })
-#                     if upload_response.status_code == 200:
-#                         print(f"  Synced: {file_name}")
-#                     else:
-#                         print(f"  Failed to sync: {file_name}")
-#             elif obj.get("object_type") == "DIRECTORY":
-#                 print(f"  Skipping directory: {file_name} (recursive sync not implemented)")
-
-#         print("File sync completed!")
-#     else:
-#         print(f"No files found in {LOCAL_APP_PATH}")
-#         print("Make sure the source path exists and contains your app files.")
-# else:
-#     print("File sync skipped (SYNC_FILES=false)")
-#     print(f"To sync files, set 'Sync App Files' widget to 'true'")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Step 7: Deploy App
-
-# COMMAND ----------
-
-dbutils.widgets.dropdown("deploy_app", "true", ["true", "false"], "Deploy App")
-DEPLOY_APP = dbutils.widgets.get("deploy_app") == "true"
-
-def start_app_compute(app_name):
-    """Start app compute using raw API."""
-    response = api_request("POST", f"/api/2.0/apps/{app_name}/start")
-    if response.status_code == 200:
-        print(f"Started app compute: {app_name}")
-        return True
-    else:
-        print(f"Failed to start app compute: {response.text}")
-        return False
-
-def deploy_app(app_name, source_code_path):
-    """Deploy app from source code path using raw API."""
-    response = api_request("POST", f"/api/2.0/apps/{app_name}/deployments", {
-        "source_code_path": source_code_path
-    })
-    if response.status_code == 200:
-        print(f"Deployment started for: {app_name}")
-        return response.json()
-    else:
-        print(f"Failed to deploy app: {response.text}")
-        return None
-
-def get_deployment_status(app_name, deployment_id):
-    """Get deployment status."""
-    response = api_request("GET", f"/api/2.0/apps/{app_name}/deployments/{deployment_id}")
-    if response.status_code == 200:
-        return response.json()
-    return None
-
-def wait_for_deployment(app_name, deployment_id, timeout=600):
-    """Wait for deployment to complete."""
-    print(f"Waiting for deployment {deployment_id} to complete...")
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        status = get_deployment_status(app_name, deployment_id)
-        if status:
-            state = status.get("status", {}).get("state", "UNKNOWN")
-            print(f"  Deployment state: {state}")
-            if state == "SUCCEEDED":
-                return True
-            elif state in ["FAILED", "CANCELLED"]:
-                print(f"Deployment failed: {status.get('status', {}).get('message', 'Unknown error')}")
-                return False
-        time.sleep(15)
-    print("Deployment timed out")
-    return False
-
-print("=" * 50)
-print("Step 7: Deploy App")
-print("=" * 50)
-
-if DEPLOY_APP:
-    # Check current app status
-    app_info = get_app(APP_NAME)
-    if app_info:
-        compute_state = app_info.get("compute_status", {}).get("state", "UNKNOWN")
-        print(f"Current compute state: {compute_state}")
-
-        # Start compute if stopped
-        if compute_state == "STOPPED":
-            print("Starting app compute...")
-            start_app_compute(APP_NAME)
-            # Wait for compute to start
-            print("Waiting for compute to start...")
-            time.sleep(30)
-
-        # Deploy the app
-        print(f"Deploying app from: {SOURCE_CODE_PATH}")
-        deployment = deploy_app(APP_NAME, SOURCE_CODE_PATH)
-
-        if deployment:
-            deployment_id = deployment.get("deployment_id")
-            print(f"Deployment ID: {deployment_id}")
-
-            # Wait for deployment to complete
-            if wait_for_deployment(APP_NAME, deployment_id):
-                print("\n" + "=" * 50)
-                print("DEPLOYMENT SUCCESSFUL!")
-                print("=" * 50)
-                print(f"App URL: {app_info.get('url', 'N/A')}")
-            else:
-                print("\nDeployment did not complete successfully. Check the app logs for details.")
-    else:
-        print(f"App {APP_NAME} not found. Please create the app first.")
-else:
-    print("Deployment skipped (DEPLOY_APP=false)")
-    print("To deploy the app, set 'Deploy App' widget to 'true'")
+print("=" * 60)

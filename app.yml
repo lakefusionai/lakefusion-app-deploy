@@ -21,16 +21,6 @@ env:
     value: "lakebase"
   - name: DEPLOYMENT_ENV
     value: "production"
-  - name: DATABRICKS_DATABASE_INSTANCE
-    value: lakefusion-db
-  - name: DATABRICKS_DATABASE_NAME
-    value: lakefusion_transactional_db
-  - name: DATABRICKS_DATABASE_PORT
-    value: "5432"
-  - name: PGPORT
-    value: "5432"
-  - name: PGDATABASE
-    value: lakefusion_transactional_db
   - name: DB_POOL_SIZE
     value: "10"
   - name: DB_MAX_OVERFLOW

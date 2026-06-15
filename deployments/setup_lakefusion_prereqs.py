@@ -34,12 +34,12 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # Widget definitions — prerequisites only (no app-specific widgets)
-dbutils.widgets.text("database_name", "lakefusion-db", "App DB — Lakebase Instance Name")
-dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "App DB — Lakebase Database Name")
-dbutils.widgets.text("secrets_scope", "lakefusion", "Secrets Scope Name")
+dbutils.widgets.text("database_name", "", "App DB — Lakebase Instance Name")
+dbutils.widgets.text("internal_db_name", "", "App DB — Lakebase Database Name")
+dbutils.widgets.text("secrets_scope", "", "Secrets Scope Name")
 dbutils.widgets.text("oidc_client_id", "", "OIDC Client ID (for SSO)")
 dbutils.widgets.text("oidc_client_secret", "", "OIDC Client Secret (for SSO)")
-dbutils.widgets.text("catalog_name", "lakefusion_ai", "DB Unity Catalog Name")
+dbutils.widgets.text("catalog_name", "", "Database Unity Catalog Name")
 dbutils.widgets.dropdown("create_database", "true", ["true", "false"], "Create Lakebase Database")
 dbutils.widgets.dropdown("create_secrets", "true", ["true", "false"], "Create Secrets")
 
@@ -60,15 +60,44 @@ CATALOG_NAME = dbutils.widgets.get("catalog_name")
 CREATE_DATABASE = dbutils.widgets.get("create_database") == "true"
 CREATE_SECRETS = dbutils.widgets.get("create_secrets") == "true"
 
+# --- Validate required parameters ---
+_errors = []
+
+# OIDC credentials are critical — check first
+if not OIDC_CLIENT_ID:
+    _errors.append("OIDC Client ID is required. Register an OAuth app in Account Console > Settings > App connections.")
+if not OIDC_CLIENT_SECRET:
+    _errors.append("OIDC Client Secret is required. Register an OAuth app in Account Console > Settings > App connections.")
+
+if _errors:
+    for e in _errors:
+        print(f"❌ {e}")
+    raise SystemExit("Setup aborted: OIDC credentials are required. Please configure them in the widgets above and re-run.")
+
+# Other required parameters
+if not DATABASE_NAME:
+    _errors.append("Lakebase Instance Name is required.")
+if not INTERNAL_DB_NAME:
+    _errors.append("PostgreSQL Database Name is required.")
+if not SECRETS_SCOPE:
+    _errors.append("Secrets Scope Name is required.")
+if not CATALOG_NAME:
+    _errors.append("Database Unity Catalog Name is required.")
+
+if _errors:
+    for e in _errors:
+        print(f"❌ {e}")
+    raise SystemExit("Setup aborted: Please fill in all required parameters in the widgets above and re-run.")
+
 print(f"Configuration:")
 print(f"  App DB — Lakebase Instance: {DATABASE_NAME}")
 print(f"  App DB — Database Name: {INTERNAL_DB_NAME}")
 print(f"  Secrets Scope: {SECRETS_SCOPE}")
-print(f"  Unity Catalog Name: {CATALOG_NAME}")
+print(f"  Database Unity Catalog Name: {CATALOG_NAME}")
 print(f"  Create Database: {CREATE_DATABASE}")
 print(f"  Create Secrets: {CREATE_SECRETS}")
-print(f"  OIDC Client ID: {'[SET]' if OIDC_CLIENT_ID else '[NOT SET]'}")
-print(f"  OIDC Client Secret: {'[SET]' if OIDC_CLIENT_SECRET else '[NOT SET]'}")
+print(f"  OIDC Client ID: [SET]")
+print(f"  OIDC Client Secret: [SET]")
 
 # COMMAND ----------
 

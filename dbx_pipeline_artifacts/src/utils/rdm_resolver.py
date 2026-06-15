@@ -27,7 +27,7 @@ Pending rows:
     - Caller writes to a separate `{entity}_unified_reference_pending` table.
 
 Status policy:
-    AUTO_APPROVED, KEEP_RDM → row is approved for unified
+    AUTO_APPROVED, KEEP_RDM, APPROVED, MANUALLY_ADDED → row is approved for unified
     PENDING, NO_MATCH, missing → row goes to pending table
 """
 
@@ -90,7 +90,12 @@ _MERGE_COND = (
     "tgt.source_value = src.source_value"
 )
 
-_APPROVED_STATUSES = ("AUTO_APPROVED", "KEEP_RDM")
+# Mapping-table statuses that count as RESOLVED (row may flow to unified).
+# Must stay in sync with EntitySearchService.APPROVED_STATUSES — the UI writes
+# "APPROVED" on steward approve and "MANUALLY_ADDED" on manual add/import, so a
+# resolver that only recognized AUTO_APPROVED/KEEP_RDM would never promote a
+# steward-approved mapping (Promote_Pending_RDM would leave it pending forever).
+_APPROVED_STATUSES = ("AUTO_APPROVED", "KEEP_RDM", "APPROVED", "MANUALLY_ADDED")
 
 
 # ── Step 1: ensure mapping tables exist ────────────────────────────────────

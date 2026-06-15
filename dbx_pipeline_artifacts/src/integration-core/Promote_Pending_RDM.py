@@ -15,7 +15,8 @@ gap:
   2. Re-reads the corresponding source rows from each source table (matching
      by deterministic surrogate_key)
   3. Re-runs the RDM resolver — this time picking up the steward's updates
-  4. Promotes rows now resolving to AUTO_APPROVED / KEEP_RDM into unified
+  4. Promotes rows now resolving to an approved status (AUTO_APPROVED / KEEP_RDM
+     / APPROVED / MANUALLY_ADDED) into unified
      (and into master, if they came from the primary source)
   5. Deletes the promoted entries from the error log
   6. Re-logs still-pending rows with the latest error_message

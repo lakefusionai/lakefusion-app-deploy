@@ -213,7 +213,7 @@ if errored_count == 0:
     dbutils.notebook.exit("nothing_to_promote")
 
 # Cache for repeated joins
-errored_keys_df = errored_keys_df.cache()
+errored_keys_df = errored_keys_df
 
 # COMMAND ----------
 
@@ -234,7 +234,10 @@ generate_lakefusion_id_udf = F.udf(
     StringType(),
 )
 
+# COMMAND ----------
+# MAGIC %run ../utils/attributes_combined
 
+# COMMAND ----------
 def _add_attributes_combined(approved_df):
     """Build attributes_combined with complex-type awareness. STRUCT folds
     to space-joined sub-fields, ARRAY / ARRAY<STRUCT> JSON-serialize. Falls
@@ -243,7 +246,7 @@ def _add_attributes_combined(approved_df):
     if not available:
         return approved_df.withColumn("attributes_combined", F.lit(""))
 
-    from utils.attributes_combined import build_attributes_combined_column
+   
 
     effective_names = []
     for c in available:

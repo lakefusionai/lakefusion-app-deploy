@@ -10,7 +10,7 @@ command:
 
 resources:
   - name: lakefusion-db
-    type: database
+    type: postgres
     database: lakefusion_transactional_db
     permission: CAN_CONNECT_AND_CREATE
 

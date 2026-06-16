@@ -903,7 +903,7 @@ command:
 
 resources:
   - name: lakefusion-db
-    type: database
+    type: postgres
     database: lakefusion_transactional_db
     permission: CAN_CONNECT_AND_CREATE
 
@@ -1035,7 +1035,7 @@ echo ""
 info "Build complete! Output at: $OUT"
 echo ""
 echo "  Structure:"
-find "$OUT" -maxdepth 3 -type f | sort | head -30
+find "$OUT" -maxdepth 3 -type f | sort | head -30 || true
 echo "  ..."
 echo ""
 echo "  Next steps:"

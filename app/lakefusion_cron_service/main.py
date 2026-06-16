@@ -2,6 +2,7 @@ import os
 import sys
 from fastapi import FastAPI
 from starlette.responses import RedirectResponse
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 
 from lakefusion_utility.utils.logging_utils import get_logger, init_logger
@@ -26,6 +27,7 @@ from lakefusion_utility.models.dbconfig import DBConfigProperties
 from lakefusion_utility.config_defaults import CONFIG_DEFAULTS
 from sqlalchemy.orm import Session
 from app.lakefusion_cron_service.config import run_dbx_pipeline_artifacts_import
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
 
 from lakefusion_utility.routes.ops import ops_router
 
@@ -37,6 +39,14 @@ app_prefix = "/api/cron"
 
 # Logger
 logger = get_logger(__name__)
+
+
+def _apscheduler_event_listener(event):
+    job_id = getattr(event, "job_id", "<unknown>")
+    if event.code == EVENT_JOB_MISSED:
+        logger.warning(
+            f"APS job missed job_id={job_id} scheduled_run_time={getattr(event, 'scheduled_run_time', None)}"
+        )
 
 from lakefusion_utility.utils.database import lifespan as base_lifespan
 from contextlib import asynccontextmanager
@@ -159,7 +169,31 @@ async def lifespan(app):
             logger.error(f"Error during startup: {e}")
             raise
 
-        yield  # continue the application lifecycle
+        from apscheduler.events import EVENT_JOB_MISSED
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from app.lakefusion_cron_service.cron_jobs import get_scheduler_jobs
+
+        scheduler = BackgroundScheduler()
+        scheduler.add_listener(
+            _apscheduler_event_listener,
+            EVENT_JOB_MISSED,
+        )
+        scheduler = get_scheduler_jobs(scheduler=scheduler)
+        scheduler.start()
+
+        aps_logger = get_logger("apscheduler")
+        aps_logger.setLevel(logging.INFO)
+
+        logger.info("\n--- Registered APScheduler Jobs ---")
+        for job in scheduler.get_jobs():
+            logger.info(f"ID: {job.id}, Next Run: {getattr(job, 'next_run_time', None)}, Trigger: {job.trigger}")
+        logger.info("-----------------------------------\n")
+
+        try:
+            yield  # continue the application lifecycle
+        finally:
+            logger.info("Shutting down APScheduler")
+            scheduler.shutdown(wait=False)
 
 app = FastAPI(
     title="Cron Service API",
@@ -193,17 +227,3 @@ logger.info("API up and running")
 async def original_endpoint():
     return RedirectResponse(url=f"{app_prefix}/docs")
 
-# APScheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-from app.lakefusion_cron_service.cron_jobs import get_scheduler_jobs
-
-# Create the scheduler instance
-scheduler = BackgroundScheduler()
-scheduler = get_scheduler_jobs(scheduler=scheduler)
-scheduler.start()
-
-# Print all registered jobs
-print("\n--- Registered APScheduler Jobs ---")
-for job in scheduler.get_jobs():
-    print(f"ID: {job.id}, Next Run: {job.next_run_time}, Trigger: {job.trigger}")
-print("-----------------------------------\n")

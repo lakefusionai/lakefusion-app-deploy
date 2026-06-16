@@ -4,7 +4,7 @@ from app.lakefusion_pim_service.utils.app_db import get_data_db, token_required_
 from lakefusion_utility.models.pim import (
     PimAttributeDefinitionCreate, PimAttributeDefinitionResponse,
     PimAttributeDefinitionEnrichedResponse, PimAttributeDefinitionUpdate,
-    PimAttributeBulkCreateResponse,
+    PimAttributeBulkCreateResponse, PimAttributeBulkImportResponse,
     PimAttributeOptionCreate, PimAttributeOptionResponse, PimAttributeOptionUpdate,
 )
 from app.lakefusion_pim_service.services.pim_attribute_service import PimAttributeService
@@ -35,6 +35,17 @@ def bulk_create_attributes(
 ):
     service = PimAttributeService(db)
     return service.bulk_create_definitions(data)
+
+
+@pim_attribute_router.post("/import", response_model=PimAttributeBulkImportResponse)
+def bulk_import_attributes(
+    data: List[PimAttributeDefinitionCreate],
+    db: Session = Depends(get_data_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    """Flat-file import (Specifications tab): skips existing codes, seeds SELECT/MULTISELECT options."""
+    service = PimAttributeService(db)
+    return service.bulk_import_definitions(data)
 
 
 @pim_attribute_router.get("/", response_model=List[PimAttributeDefinitionEnrichedResponse])

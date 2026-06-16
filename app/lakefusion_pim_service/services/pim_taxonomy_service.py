@@ -6,7 +6,7 @@ from sqlalchemy import func
 from lakefusion_utility.models.pim import (
     PimTaxonomyNode, PimTaxonomyNodeCreate, PimTaxonomyNodeUpdate,
     PimSpecificationConfig, PimResolvedSpecification, PimEntity,
-    PimAttributeDefinition, PimAttributeOption, PimTaxonomyBulkImportRequest,
+    PimAttributeDefinition, PimTaxonomyBulkImportRequest,
     to_value_key,
 )
 from lakefusion_utility.utils.app_db import db_commit_auto_rollback
@@ -79,7 +79,7 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def bulk_create_nodes(self, items: list[PimTaxonomyNodeCreate]):
         try:
-            codes = [item.code for item in items]
+            codes = [to_value_key(item.code) for item in items]
             if len(codes) != len(set(codes)):
                 raise HTTPException(status_code=400, detail="Duplicate codes found in the request.")
 
@@ -122,15 +122,16 @@ class PimTaxonomyService:
                     errors.append(f"Row {idx + 1}: code and label are required.")
                     continue
 
+                code = to_value_key(data.code)
                 level, parent_path = parent_map[data.parent_id]
-                materialized_path = f"{parent_path}/{data.code}" if parent_path else data.code
+                materialized_path = f"{parent_path}/{code}" if parent_path else code
 
                 # Reactivate a previously soft-deleted node with the same (parent_id, code)
                 existing_inactive = (
                     self.db.query(PimTaxonomyNode)
                     .filter(
                         PimTaxonomyNode.parent_id == data.parent_id,
-                        PimTaxonomyNode.code == data.code,
+                        PimTaxonomyNode.code == code,
                         PimTaxonomyNode.is_active == False,
                     )
                     .first()
@@ -146,7 +147,7 @@ class PimTaxonomyService:
                     continue
 
                 node = PimTaxonomyNode(
-                    code=data.code,
+                    code=code,
                     label=data.label,
                     parent_id=data.parent_id,
                     materialized_path=materialized_path,
@@ -184,12 +185,13 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def create_node(self, data: PimTaxonomyNodeCreate):
         try:
+            code = to_value_key(data.code)
             # Check for duplicate code under same parent (active nodes)
             existing_active = (
                 self.db.query(PimTaxonomyNode)
                 .filter(
                     PimTaxonomyNode.parent_id == data.parent_id,
-                    PimTaxonomyNode.code == data.code,
+                    PimTaxonomyNode.code == code,
                     PimTaxonomyNode.is_active == True,
                 )
                 .first()
@@ -197,7 +199,7 @@ class PimTaxonomyService:
             if existing_active:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Taxonomy node with code '{data.code}' already exists under this parent.",
+                    detail=f"Taxonomy node with code '{code}' already exists under this parent.",
                 )
 
             # Compute level and materialized_path
@@ -206,17 +208,17 @@ class PimTaxonomyService:
                 if not parent:
                     raise HTTPException(status_code=404, detail="Parent taxonomy node not found.")
                 level = parent.level + 1
-                materialized_path = f"{parent.materialized_path}/{data.code}"
+                materialized_path = f"{parent.materialized_path}/{code}"
             else:
                 level = 0
-                materialized_path = data.code
+                materialized_path = code
 
             # Reactivate a previously soft-deleted node with the same (parent_id, code)
             existing_inactive = (
                 self.db.query(PimTaxonomyNode)
                 .filter(
                     PimTaxonomyNode.parent_id == data.parent_id,
-                    PimTaxonomyNode.code == data.code,
+                    PimTaxonomyNode.code == code,
                     PimTaxonomyNode.is_active == False,
                 )
                 .first()
@@ -236,7 +238,7 @@ class PimTaxonomyService:
                 return existing_inactive
 
             node = PimTaxonomyNode(
-                code=data.code,
+                code=code,
                 label=data.label,
                 parent_id=data.parent_id,
                 materialized_path=materialized_path,
@@ -370,7 +372,7 @@ class PimTaxonomyService:
 
             parent_changed = False
             if data.code is not None:
-                node.code = data.code
+                node.code = to_value_key(data.code)
             if data.label is not None:
                 node.label = data.label
             if data.display_order is not None:
@@ -564,21 +566,22 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def bulk_import_taxonomy(self, data: PimTaxonomyBulkImportRequest):
         """
-        Bulk import taxonomy nodes, attribute definitions, and bindings
-        in a single transaction. Much faster than individual API calls.
+        Bulk import taxonomy nodes and their spec bindings in a single transaction.
+        Specifications (attribute definitions) are NOT created here — they are
+        imported separately via the Specifications tab. Bindings reference spec
+        codes that must already exist; unresolved codes are reported as errors.
         """
         import uuid
 
         errors = []
         nodes_created = 0
-        attributes_created = 0
         bindings_created = 0
 
         def _uuid():
             return str(uuid.uuid4())
 
         # ── Phase 1: Create taxonomy nodes (ordered by depth) ──
-        app_logger.info(f"Bulk taxonomy import: {len(data.nodes)} nodes, {len(data.attributes)} attributes, {len(data.bindings)} bindings")
+        app_logger.info(f"Bulk taxonomy import: {len(data.nodes)} nodes, {len(data.bindings)} bindings")
 
         # Build parent-code → depth map for ordering
         parent_map = {n.code: n.parent_code for n in data.nodes}
@@ -609,12 +612,12 @@ class PimTaxonomyService:
         now = datetime.utcnow()
 
         for node in sorted_nodes:
-            code = node.code.lower().replace(" ", "_")
+            code = to_value_key(node.code)
             if code in existing_codes:
                 continue  # skip duplicates
 
             node_id = _uuid()
-            parent_id = code_to_id.get(node.parent_code) if node.parent_code else None
+            parent_id = code_to_id.get(to_value_key(node.parent_code)) if node.parent_code else None
 
             # Calculate level and path
             level = 0
@@ -649,87 +652,11 @@ class PimTaxonomyService:
                 self.db.execute(PimTaxonomyNode.__table__.insert(), nodes_to_insert)
                 app_logger.info(f"Bulk taxonomy: inserted {len(nodes_to_insert)} nodes")
 
-            # Phase 2b: Build and insert attribute definitions
-            existing_attr_codes = set()
-            for row in self.db.query(PimAttributeDefinition.code).all():
-                existing_attr_codes.add(row.code)
-
+            # Phase 2b: Resolve spec (attribute) codes to ids for binding.
+            # Specs are created in the Specifications tab, so they must already exist.
             attr_code_to_id = {}
             for row in self.db.query(PimAttributeDefinition.code, PimAttributeDefinition.id).all():
                 attr_code_to_id[row.code] = row.id
-
-            # Pre-fetch valid tier codes for level validation
-            from lakefusion_utility.models.pim import PimEntityTier
-            valid_tier_codes = {t.code for t in self.db.query(PimEntityTier.code).all()}
-
-            attrs_to_insert = []
-            options_to_insert = []
-            for attr in (data.attributes or []):
-                code = attr.code.lower().replace(" ", "_")
-                if code in existing_attr_codes:
-                    continue
-
-                attr_id = _uuid()
-                scope = attr.scope or 'specifications'
-                group = attr.group or ('Specifications' if scope == 'specifications' else 'General')
-                level = attr.level or 'PRODUCT'
-                # Validate level
-                if level != 'ALL':
-                    for lvl in level.split(","):
-                        lvl = lvl.strip()
-                        if lvl and lvl != 'ALL' and lvl not in valid_tier_codes:
-                            raise HTTPException(status_code=400, detail=f"Invalid level '{lvl}' for attribute '{code}'. Valid: {', '.join(sorted(valid_tier_codes))}, ALL")
-                dtype = attr.data_type or 'TEXT'
-                attrs_to_insert.append({
-                    'id': attr_id,
-                    'code': code,
-                    'label': attr.label,
-                    'data_type': dtype,
-                    'level': level,
-                    'scope': scope,
-                    'description': attr.description,
-                    'reference_entity_id': attr.reference_entity_id if dtype == 'REFERENCE' else None,
-                    'is_localizable': False,
-                    'is_system': False,
-                    'group': group,
-                    'display_order': attr.display_order or 0,
-                    'created_at': now,
-                    'updated_at': now,
-                })
-                attr_code_to_id[attr.code] = attr_id
-                attr_code_to_id[code] = attr_id
-                existing_attr_codes.add(code)
-                attributes_created += 1
-
-                # Seed options for SELECT/MULTISELECT from the spec CSV "Values" column.
-                if dtype in ('SELECT', 'MULTISELECT') and attr.options:
-                    seen_keys = set()
-                    for idx, o in enumerate(attr.options):
-                        olabel = (o.label or '').strip()
-                        if not olabel:
-                            continue
-                        okey = (o.value_key or '').strip() or to_value_key(olabel)
-                        base, n = okey, 2
-                        while okey in seen_keys:
-                            okey = f"{base}_{n}"; n += 1
-                        seen_keys.add(okey)
-                        options_to_insert.append({
-                            'id': _uuid(),
-                            'attribute_id': attr_id,
-                            'value_key': okey,
-                            'label': olabel,
-                            'display_order': o.display_order if o.display_order is not None else idx,
-                            'is_active': o.is_active if o.is_active is not None else True,
-                            'created_at': now,
-                            'updated_at': now,
-                        })
-
-            if attrs_to_insert:
-                self.db.execute(PimAttributeDefinition.__table__.insert(), attrs_to_insert)
-                app_logger.info(f"Bulk taxonomy: inserted {len(attrs_to_insert)} attributes")
-            if options_to_insert:
-                self.db.execute(PimAttributeOption.__table__.insert(), options_to_insert)
-                app_logger.info(f"Bulk taxonomy: inserted {len(options_to_insert)} attribute options")
 
             # Phase 3: Build and insert bindings
             existing_bindings = set()
@@ -740,11 +667,16 @@ class PimTaxonomyService:
                 existing_bindings.add(f"{row.taxonomy_node_id}:{row.attribute_id}")
 
             bindings_to_insert = []
+            unknown_specs = set()
             for bind in (data.bindings or []):
-                node_id = code_to_id.get(bind.category_code) or code_to_id.get(bind.category_code.lower().replace(" ", "_"))
-                attr_id = attr_code_to_id.get(bind.attribute_code) or attr_code_to_id.get(bind.attribute_code.lower().replace(" ", "_"))
+                node_id = code_to_id.get(bind.category_code) or code_to_id.get(to_value_key(bind.category_code))
+                attr_id = attr_code_to_id.get(bind.attribute_code) or attr_code_to_id.get(to_value_key(bind.attribute_code))
 
-                if not node_id or not attr_id:
+                if not attr_id:
+                    # Spec code in the file does not exist — surface it instead of dropping silently.
+                    unknown_specs.add(bind.attribute_code)
+                    continue
+                if not node_id:
                     continue
 
                 binding_key = f"{node_id}:{attr_id}"
@@ -769,16 +701,22 @@ class PimTaxonomyService:
                 self.db.execute(PimSpecificationConfig.__table__.insert(), bindings_to_insert)
                 app_logger.info(f"Bulk taxonomy: inserted {len(bindings_to_insert)} bindings")
 
+            if unknown_specs:
+                errors.append(
+                    f"Skipped bindings for {len(unknown_specs)} unknown spec code(s): "
+                    f"{', '.join(sorted(unknown_specs))}. Import them via the Specifications tab first."
+                )
+
             # Phase 4: Single commit
             db_commit_auto_rollback(db=self.db)
-            app_logger.info(f"Bulk taxonomy import complete: {nodes_created} nodes, {attributes_created} attrs, {bindings_created} bindings")
+            app_logger.info(f"Bulk taxonomy import complete: {nodes_created} nodes, {bindings_created} bindings")
 
         except Exception as e:
             # Rollback entire transaction — DB stays clean
             self.db.rollback()
             app_logger.exception(f"Bulk taxonomy import failed, rolled back: {str(e)}")
             errors.append(f"Import failed (rolled back): {str(e)}")
-            return {"nodes_created": 0, "attributes_created": 0, "bindings_created": 0, "errors": errors}
+            return {"nodes_created": 0, "bindings_created": 0, "errors": errors}
 
         # ── Phase 5: Rebuild resolved config cache (after successful commit) ──
         if bindings_created > 0:
@@ -790,7 +728,6 @@ class PimTaxonomyService:
 
         return {
             "nodes_created": nodes_created,
-            "attributes_created": attributes_created,
             "bindings_created": bindings_created,
             "errors": errors,
         }

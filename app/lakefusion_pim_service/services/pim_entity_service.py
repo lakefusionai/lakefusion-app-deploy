@@ -11,6 +11,7 @@ from lakefusion_utility.models.pim import (
     PimValueDate, PimValueSelect, PimValueMultiselect,
     PimValueReference,
     PimImportNode, PimBulkImportRequest,
+    PimFlatImportRequest,
     to_value_key,
 )
 from lakefusion_utility.utils.app_db import db_commit_auto_rollback
@@ -1837,3 +1838,378 @@ class PimEntityService:
                 f"(option not defined). They were NOT written."
             )
         return {"created": created, "errors": errors, "rejected_values": rejected_values}
+
+    # =======================================================================
+    # FLAT FILE IMPORT — SKU-keyed upsert with per-field Add/Overwrite modes
+    # =======================================================================
+
+    def flat_import(self, data: PimFlatImportRequest):
+        """
+        Item-grain flat-file import. SKU (identifier value at the item tier) is
+        the match key: existing items are updated per each mapped field's mode
+        (overwrite / add_only), new items are inserted. Parent products (and
+        optional variants) are located or created by their identifier key.
+        Blank incoming values never erase existing data. Rows with validation
+        errors are skipped; valid rows still import.
+        """
+        import uuid
+
+        now = datetime.utcnow()
+        inserted = 0
+        updated = 0
+        errors = []
+
+        def _fail(row_number, reason):
+            errors.append({'row_number': row_number, 'reason': reason})
+
+        id_attr = self._get_identifier_attr()
+        if not id_attr:
+            raise HTTPException(
+                status_code=400,
+                detail="No identifier attribute (is_identifier) is defined — required to match rows by SKU.",
+            )
+        label_attr = self._get_label_attr()
+        id_attr_id = id_attr.id
+        label_attr_id = label_attr.id if label_attr else None
+
+        attr_defs = {a.id: a for a in self.db.query(PimAttributeDefinition).all()}
+        option_keys = {}
+        for o in self.db.query(PimAttributeOption).filter(PimAttributeOption.is_active == True).all():
+            option_keys.setdefault(o.attribute_id, set()).add(o.value_key)
+
+        def _blank(v):
+            return v is None or not str(v).strip()
+
+        # ---- Phase 1: validate rows (any bad typed value fails the whole row) ----
+        def _validate_level(lvl):
+            for v in (lvl.values or []):
+                if _blank(v.value):
+                    continue
+                ad = attr_defs.get(v.attribute_id)
+                if not ad:
+                    return f"Unknown attribute '{v.attribute_id}'"
+                if ad.data_type == 'NUMBER':
+                    try:
+                        float(str(v.value))
+                    except (ValueError, TypeError):
+                        return f"'{v.value}' is not a number for '{ad.label}'"
+                elif ad.data_type == 'DATE':
+                    try:
+                        _date.fromisoformat(str(v.value).strip())
+                    except (ValueError, TypeError):
+                        return f"'{v.value}' is not a valid date (YYYY-MM-DD) for '{ad.label}'"
+                elif ad.data_type == 'SELECT':
+                    if to_value_key(str(v.value)) not in option_keys.get(ad.id, set()):
+                        return f"'{v.value}' is not a defined option of '{ad.label}'"
+                elif ad.data_type == 'MULTISELECT':
+                    parts = [p.strip() for chunk in str(v.value).split(';') for p in chunk.split(',')]
+                    for part in [p for p in parts if p]:
+                        if to_value_key(part) not in option_keys.get(ad.id, set()):
+                            return f"'{part}' is not a defined option of '{ad.label}'"
+            return None
+
+        valid_rows = []
+        seen_skus = {}
+        for row in data.rows:
+            if _blank(row.item.key):
+                _fail(row.row_number, "Missing SKU")
+                continue
+            if _blank(row.product.key):
+                _fail(row.row_number, "Missing Product ID")
+                continue
+            sku = str(row.item.key).strip()
+            if sku in seen_skus:
+                _fail(row.row_number, f"Duplicate SKU '{sku}' (first at row {seen_skus[sku]})")
+                continue
+            reason = None
+            for lvl in (row.product, row.variant, row.item):
+                if lvl is None:
+                    continue
+                reason = _validate_level(lvl)
+                if reason:
+                    break
+            if reason:
+                _fail(row.row_number, reason)
+                continue
+            seen_skus[sku] = row.row_number
+            valid_rows.append(row)
+
+        if not valid_rows:
+            return {'inserted': 0, 'updated': 0, 'failed': len(errors), 'errors': errors}
+
+        # ---- Phase 2: match existing entities by identifier value, per tier ----
+        all_keys = set()
+        for row in valid_rows:
+            all_keys.add(str(row.product.key).strip())
+            all_keys.add(str(row.item.key).strip())
+            if row.variant is not None and not _blank(row.variant.key):
+                all_keys.add(str(row.variant.key).strip())
+
+        def _chunks(seq, size=1000):
+            seq = list(seq)
+            for i in range(0, len(seq), size):
+                yield seq[i:i + size]
+
+        existing_by_tier = {}   # (tier_code, identifier_value) -> PimEntity
+        for chunk in _chunks(all_keys):
+            matched = (
+                self.db.query(PimEntity, PimValueText.value)
+                .join(PimValueText, PimValueText.product_id == PimEntity.id)
+                .filter(
+                    PimValueText.attribute_id == id_attr_id,
+                    PimValueText.locale == '',
+                    PimValueText.value.in_(chunk),
+                    PimEntity.active == True,
+                )
+                .all()
+            )
+            for ent, key in matched:
+                existing_by_tier.setdefault((ent.entity_type_id, key), ent)
+
+        # ---- Phase 3: prefetch existing values of mapped attributes ----
+        mapped_attr_ids = set()
+        for row in valid_rows:
+            for lvl in (row.product, row.variant, row.item):
+                if lvl is None:
+                    continue
+                for v in (lvl.values or []):
+                    mapped_attr_ids.add(v.attribute_id)
+        if label_attr_id:
+            mapped_attr_ids.add(label_attr_id)
+
+        existing_ids = [e.id for e in existing_by_tier.values()]
+        TABLE_BY_TYPE = {
+            'TEXT': PimValueText, 'NUMBER': PimValueNumber, 'BOOLEAN': PimValueBoolean,
+            'DATE': PimValueDate, 'SELECT': PimValueSelect,
+            'MULTISELECT': PimValueMultiselect, 'REFERENCE': PimValueReference,
+        }
+        existing_vals = {dt: {} for dt in TABLE_BY_TYPE}
+        if existing_ids and mapped_attr_ids:
+            for dt, Model in TABLE_BY_TYPE.items():
+                for chunk in _chunks(existing_ids):
+                    for r in self.db.query(Model).filter(
+                        Model.product_id.in_(chunk),
+                        Model.attribute_id.in_(list(mapped_attr_ids)),
+                        Model.locale == '',
+                    ).all():
+                        existing_vals[dt].setdefault((r.product_id, r.attribute_id), []).append(r)
+
+        # ---- Phase 4: walk rows, accumulating inserts / in-place ORM updates ----
+        entities_to_insert = []                            # raw dicts for PimEntity bulk insert
+        values_to_insert = {dt: [] for dt in TABLE_BY_TYPE}
+        written = set()           # (entity_id, attribute_id) handled this run — first occurrence wins
+        status_written = set()    # entity ids whose status was decided this run
+        taxonomy_written = set()
+        entity_cache = {}         # (tier_code, key) -> state dict
+
+        def _uuid():
+            return str(uuid.uuid4())
+
+        def _new_value_row(pid, attr_id, **extra):
+            base = {
+                'id': _uuid(), 'product_id': pid, 'attribute_id': attr_id,
+                'locale': '', 'source': 'IMPORT', 'version': 1,
+                'created_at': now, 'updated_at': now,
+            }
+            base.update(extra)
+            return base
+
+        def _apply_value(pid, ad, raw, mode):
+            """Write one typed value respecting mode. Blank never erases."""
+            if _blank(raw):
+                return
+            k = (pid, ad.id)
+            if k in written:
+                return
+            written.add(k)
+            dt = ad.data_type
+
+            if dt == 'MULTISELECT':
+                rows = existing_vals['MULTISELECT'].get(k) or []
+                if rows and mode == 'add_only':
+                    return
+                for r in rows:
+                    self.db.delete(r)
+                existing_vals['MULTISELECT'][k] = []
+                parts = [p.strip() for chunk in str(raw).split(';') for p in chunk.split(',')]
+                for key in dict.fromkeys(to_value_key(p) for p in parts if p):
+                    values_to_insert['MULTISELECT'].append(_new_value_row(pid, ad.id, ref_value_key=key))
+                return
+
+            rows = existing_vals.get(dt, {}).get(k) or []
+            existing = rows[0] if rows else None
+            if existing is not None:
+                # Only TEXT can hold an "empty" value; other types are present or absent
+                is_empty = dt == 'TEXT' and _blank(existing.value)
+                if not is_empty and mode == 'add_only':
+                    return
+                if dt == 'NUMBER':
+                    existing.value = float(str(raw))
+                elif dt == 'BOOLEAN':
+                    existing.value = str(raw).strip().lower() in ('true', '1', 'yes')
+                elif dt == 'DATE':
+                    existing.value = _date.fromisoformat(str(raw).strip())
+                elif dt == 'SELECT':
+                    existing.ref_value_key = to_value_key(str(raw))
+                elif dt == 'REFERENCE':
+                    existing.ref_id = str(raw)
+                else:
+                    existing.value = str(raw)
+                existing.source = 'IMPORT'
+                existing.version = (existing.version or 1) + 1
+                existing.updated_at = now
+                return
+
+            if dt == 'NUMBER':
+                values_to_insert['NUMBER'].append(_new_value_row(
+                    pid, ad.id, value=float(str(raw)),
+                    currency='', price_type='', territory='',
+                ))
+            elif dt == 'BOOLEAN':
+                values_to_insert['BOOLEAN'].append(_new_value_row(
+                    pid, ad.id, value=str(raw).strip().lower() in ('true', '1', 'yes')))
+            elif dt == 'DATE':
+                values_to_insert['DATE'].append(_new_value_row(
+                    pid, ad.id, value=_date.fromisoformat(str(raw).strip())))
+            elif dt == 'SELECT':
+                values_to_insert['SELECT'].append(_new_value_row(
+                    pid, ad.id, ref_value_key=to_value_key(str(raw))))
+            elif dt == 'REFERENCE':
+                values_to_insert['REFERENCE'].append(_new_value_row(
+                    pid, ad.id, ref_table=ad.reference_entity_id or '', ref_id=str(raw)))
+            else:
+                values_to_insert['TEXT'].append(_new_value_row(pid, ad.id, value=str(raw)))
+
+        def _entity_get(state, field):
+            return state['insert_dict'][field] if state['is_new'] else getattr(state['orm'], field)
+
+        def _entity_set(state, field, value):
+            if state['is_new']:
+                state['insert_dict'][field] = value
+                state['insert_dict']['updated_at'] = now
+            else:
+                setattr(state['orm'], field, value)
+                state['orm'].updated_at = now
+
+        def _apply_status(state, status, mode):
+            if _blank(status):
+                return
+            if state['id'] in status_written:
+                return
+            status_written.add(state['id'])
+            # A just-created entity's 'Draft' is a placeholder, not data — always writable
+            current = None if state.get('status_is_default') else _entity_get(state, 'status')
+            if _blank(current) or mode == 'overwrite':
+                _entity_set(state, 'status', str(status).strip())
+                state['status_is_default'] = False
+
+        def _apply_taxonomy(state, node_id, mode):
+            if not node_id:
+                return
+            if state['id'] in taxonomy_written:
+                return
+            taxonomy_written.add(state['id'])
+            if not _entity_get(state, 'taxonomy_node_id') or mode == 'overwrite':
+                _entity_set(state, 'taxonomy_node_id', node_id)
+
+        def _get_or_create_entity(tier_code, key, parent_id):
+            ck = (tier_code, key)
+            if ck in entity_cache:
+                return entity_cache[ck]
+            ent = existing_by_tier.get(ck)
+            if ent is not None:
+                state = {'id': ent.id, 'orm': ent, 'is_new': False}
+                entity_cache[ck] = state
+                return state
+            pid = _uuid()
+            insert_dict = {
+                'id': pid, 'entity_type_id': tier_code, 'taxonomy_node_id': None,
+                'parent_id': parent_id, 'status': 'Draft', 'active': True,
+                'promoted': False, 'published_at': None,
+                'created_at': now, 'updated_at': now,
+            }
+            entities_to_insert.append(insert_dict)
+            values_to_insert['TEXT'].append(_new_value_row(pid, id_attr_id, value=key))
+            written.add((pid, id_attr_id))
+            state = {'id': pid, 'insert_dict': insert_dict, 'is_new': True, 'status_is_default': True}
+            entity_cache[ck] = state
+            return state
+
+        def _apply_level(state, lvl):
+            if label_attr is not None and not _blank(lvl.label):
+                _apply_value(state['id'], label_attr, lvl.label, lvl.label_mode or 'overwrite')
+            _apply_status(state, lvl.status, lvl.status_mode or 'overwrite')
+            _apply_taxonomy(state, lvl.taxonomy_node_id, lvl.taxonomy_mode or 'overwrite')
+            for v in (lvl.values or []):
+                ad = attr_defs.get(v.attribute_id)
+                if ad is not None:
+                    _apply_value(state['id'], ad, v.value, v.mode or 'overwrite')
+
+        for row in valid_rows:
+            product_key = str(row.product.key).strip()
+            sku = str(row.item.key).strip()
+
+            product_state = _get_or_create_entity(data.product_tier_code, product_key, None)
+            _apply_level(product_state, row.product)
+
+            parent_state = product_state
+            if data.variant_tier_code and row.variant is not None and not _blank(row.variant.key):
+                variant_state = _get_or_create_entity(
+                    data.variant_tier_code, str(row.variant.key).strip(), product_state['id'])
+                _apply_level(variant_state, row.variant)
+                parent_state = variant_state
+
+            item_ck = (data.item_tier_code, sku)
+            item_is_new = item_ck not in entity_cache and item_ck not in existing_by_tier
+            item_state = _get_or_create_entity(data.item_tier_code, sku, parent_state['id'])
+            _apply_level(item_state, row.item)
+
+            # Category is mapped at the product level only — variants and items
+            # inherit the product's effective category
+            if row.product.taxonomy_node_id:
+                product_taxonomy = _entity_get(product_state, 'taxonomy_node_id')
+                if product_taxonomy:
+                    taxonomy_mode = row.product.taxonomy_mode or 'overwrite'
+                    if parent_state is not product_state:
+                        _apply_taxonomy(parent_state, product_taxonomy, taxonomy_mode)
+                    _apply_taxonomy(item_state, product_taxonomy, taxonomy_mode)
+
+            if item_is_new:
+                inserted += 1
+            else:
+                updated += 1
+
+        # ---- Phase 5: persist in a single transaction ----
+        try:
+            # Flush ORM updates/deletes first so multiselect overwrites don't
+            # collide with their replacement inserts on the unique constraint
+            self.db.flush()
+            if entities_to_insert:
+                self.db.execute(PimEntity.__table__.insert(), entities_to_insert)
+            for dt, Model in TABLE_BY_TYPE.items():
+                if values_to_insert[dt]:
+                    self.db.execute(Model.__table__.insert(), values_to_insert[dt])
+            db_commit_auto_rollback(db=self.db)
+        except Exception as e:
+            self.db.rollback()
+            app_logger.exception(f"Flat import failed, rolled back: {e}")
+            err_msg = str(e)
+            if len(err_msg) > 500:
+                err_msg = err_msg[:500] + "..."
+            for row in valid_rows:
+                _fail(row.row_number, f"Import failed: {err_msg}")
+            return {'inserted': 0, 'updated': 0, 'failed': len(errors), 'errors': errors}
+
+        # ---- Phase 6: refresh denormalized flat rows ----
+        affected_ids = {s['id'] for s in entity_cache.values()}
+        affected_ids |= {e['parent_id'] for e in entities_to_insert if e.get('parent_id')}
+        try:
+            self.refresh_flat_rows(list(affected_ids))
+            db_commit_auto_rollback(db=self.db)
+        except Exception as e:
+            app_logger.exception(f"Flat import: flat table refresh failed: {e}")
+
+        app_logger.info(
+            f"Flat import complete: {inserted} inserted, {updated} updated, {len(errors)} failed"
+        )
+        return {'inserted': inserted, 'updated': updated, 'failed': len(errors), 'errors': errors}

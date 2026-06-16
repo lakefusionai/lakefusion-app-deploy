@@ -7,6 +7,7 @@ from lakefusion_utility.models.pim import (
     PimEntityUpdate, PimPublishRequest,
     PimBatchValueWriteRequest, PimBatchValueResponse,
     PimBulkImportRequest, PimBulkImportResponse,
+    PimFlatImportRequest, PimFlatImportResponse,
 )
 from app.lakefusion_pim_service.services.pim_entity_service import PimEntityService
 from app.lakefusion_pim_service.services.pim_value_service import PimValueService
@@ -45,6 +46,17 @@ def bulk_import(
     """Bulk import a full N-tier product hierarchy in a single transaction."""
     service = PimEntityService(db)
     return service.bulk_import_hierarchy(data)
+
+
+@pim_entity_router.post("/flat-import", response_model=PimFlatImportResponse)
+def flat_import(
+    data: PimFlatImportRequest,
+    db: Session = Depends(get_data_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    """Flat-file import: item-grain rows upserted by SKU with per-field Add/Overwrite modes."""
+    service = PimEntityService(db)
+    return service.flat_import(data)
 
 
 @pim_entity_router.get("/", response_model=PimEntityEnrichedListResponse)

@@ -84,7 +84,7 @@ class PimAttributeService:
             label = (label or '').strip()
             if not label:
                 continue
-            key = (value_key or '').strip() or to_value_key(label)
+            key = to_value_key(value_key) if (value_key or '').strip() else to_value_key(label)
             # de-dup key within this attribute
             base = key
             n = 2
@@ -122,7 +122,7 @@ class PimAttributeService:
             label = (o.label or '').strip()
             if not label:
                 continue
-            key = (o.value_key or '').strip() or to_value_key(label)
+            key = to_value_key(o.value_key) if (o.value_key or '').strip() else to_value_key(label)
             incoming_keys.add(key)
             row = existing.get(key)
             if row:
@@ -244,15 +244,16 @@ class PimAttributeService:
     # ------------------------------------------------------------------
     def create_definition(self, data: PimAttributeDefinitionCreate):
         try:
+            code = to_value_key(data.code)
             existing = (
                 self.db.query(PimAttributeDefinition)
-                .filter(PimAttributeDefinition.code == data.code)
+                .filter(PimAttributeDefinition.code == code)
                 .first()
             )
             if existing:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"Attribute with code '{data.code}' already exists.",
+                    detail=f"Attribute with code '{code}' already exists.",
                 )
 
             # REFERENCE resolves to an RDM entity → requires reference_entity_id.
@@ -295,7 +296,7 @@ class PimAttributeService:
             self._auto_swap_identifier_label(id_flag, label_flag)
 
             attr = PimAttributeDefinition(
-                code=data.code,
+                code=code,
                 label=data.label,
                 data_type=data.data_type,
                 reference_entity_id=data.reference_entity_id,
@@ -335,7 +336,7 @@ class PimAttributeService:
     def bulk_create_definitions(self, items: list[PimAttributeDefinitionCreate]):
         try:
             # Collect all codes to check for duplicates in one query
-            codes = [item.code for item in items]
+            codes = [to_value_key(item.code) for item in items]
             if len(codes) != len(set(codes)):
                 raise HTTPException(status_code=400, detail="Duplicate codes found in the request.")
 
@@ -382,7 +383,7 @@ class PimAttributeService:
                     self._auto_swap_identifier_label(id_flag, label_flag)
 
                 attr = PimAttributeDefinition(
-                    code=data.code,
+                    code=to_value_key(data.code),
                     label=data.label,
                     data_type=data.data_type,
                     reference_entity_id=data.reference_entity_id,
@@ -421,6 +422,71 @@ class PimAttributeService:
             message = traceback.format_exc()
             app_logger.exception(f"Unable to bulk create attribute definitions. Reason - {message}")
             raise HTTPException(status_code=500, detail=f"Failed to bulk create attributes: {str(e)}")
+
+    # ------------------------------------------------------------------
+    # BULK IMPORT (Specifications tab flat-file import)
+    # ------------------------------------------------------------------
+    def bulk_import_definitions(self, items: list[PimAttributeDefinitionCreate]):
+        """Import attribute definitions from the Specifications flat-file import.
+        Existing codes are skipped (not updated). Valid rows are committed in a
+        single transaction; per-row validation failures are reported as errors
+        without aborting the rest. SELECT/MULTISELECT options are persisted to
+        pim_attribute_option."""
+        try:
+            existing_codes = {row.code for row in self.db.query(PimAttributeDefinition.code).all()}
+            valid_tier_codes = {t.code for t in self.db.query(PimEntityTier.code).all()}
+
+            created = 0
+            skipped = 0
+            errors = []
+            for idx, data in enumerate(items):
+                code = to_value_key(data.code)
+                if not code:
+                    errors.append(f"Row {idx + 1}: missing code.")
+                    continue
+                if code in existing_codes:
+                    skipped += 1
+                    continue
+
+                level = data.level or 'ALL'
+                if level != "ALL":
+                    invalid_levels = [l.strip() for l in level.split(",") if l.strip() and l.strip() != "ALL" and l.strip() not in valid_tier_codes]
+                    if invalid_levels:
+                        errors.append(f"Row {idx + 1} ({code}): invalid level '{','.join(invalid_levels)}'. Valid: {', '.join(sorted(valid_tier_codes))}, ALL")
+                        continue
+
+                attr = PimAttributeDefinition(
+                    code=code,
+                    label=data.label,
+                    data_type=data.data_type or 'TEXT',
+                    description=data.description,
+                    is_localizable=data.is_localizable,
+                    level=level,
+                    scope=data.scope or 'specifications',
+                    group=data.group,
+                    display_order=data.display_order or 0,
+                )
+                self.db.add(attr)
+                existing_codes.add(code)
+                created += 1
+
+                if (data.data_type or '').upper() in ('SELECT', 'MULTISELECT') and data.options:
+                    self.db.flush()  # need attr.id before adding options
+                    self._seed_options(attr.id, [
+                        (o.label, o.value_key, o.display_order, o.is_active)
+                        for o in data.options
+                    ])
+
+            db_commit_auto_rollback(db=self.db, raise_exception=True)
+            app_logger.info(f"Bulk attribute import: {created} created, {skipped} skipped, {len(errors)} errors")
+            return {"created": created, "skipped": skipped, "errors": errors}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            self.db.rollback()
+            app_logger.exception(f"Bulk attribute import failed, rolled back: {traceback.format_exc()}")
+            return {"created": 0, "skipped": 0, "errors": [f"Import failed (rolled back): {str(e)}"]}
 
     # ------------------------------------------------------------------
     # LIST

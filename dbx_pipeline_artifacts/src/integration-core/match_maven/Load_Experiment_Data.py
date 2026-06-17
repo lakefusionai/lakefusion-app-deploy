@@ -309,6 +309,63 @@ logger.info("="*60)
 
 # COMMAND ----------
 
+# DBTITLE 1,Validate primary key — fail on NULL or duplicate values
+# Match Maven experiments previously skipped the primary-key validation that
+# Integration Jobs enforce (Validate_Initial_Load): every dataset table's PK
+# column must have NO NULLs and NO duplicates. Without this, experiments ran on
+# dirty PKs. Fail fast with a clear error so the experiment surfaces the issue.
+def _resolve_source_pk_column(table_name):
+    """source dataset column mapped to the entity primary key, or None if unmapped."""
+    for _entry in attributes_mapping:
+        if table_name in _entry:
+            return _entry[table_name].get(primary_key)
+    return None
+
+logger.info("\n" + "=" * 60)
+logger.info("VALIDATION: PRIMARY KEY NULL / DUPLICATE CHECK")
+logger.info("=" * 60)
+
+_pk_violations = []
+for _table in dataset_tables:
+    _src_pk = _resolve_source_pk_column(_table)
+    if not _src_pk:
+        logger.warning(f"  Skipping {_table}: primary key '{primary_key}' not mapped")
+        continue
+    try:
+        _df = spark.read.table(_table)
+    except Exception as _e:
+        logger.warning(f"  Skipping {_table}: could not read table - {_e}")
+        continue
+    if _src_pk not in _df.columns:
+        logger.warning(f"  Skipping {_table}: column '{_src_pk}' not found")
+        continue
+
+    _total = _df.count()
+    _null = _df.filter(col(_src_pk).isNull()).count()
+    _distinct = _df.select(_src_pk).distinct().count()
+    _dupes = _total - _distinct
+
+    if _null > 0:
+        _pk_violations.append(f"{_table}.{_src_pk}: {_null} NULL value(s)")
+        logger.error(f"  NULLs: {_table}.{_src_pk} — {_null}/{_total}")
+    if _dupes > 0:
+        _pk_violations.append(f"{_table}.{_src_pk}: {_dupes} duplicate value(s)")
+        logger.error(f"  Duplicates: {_table}.{_src_pk} — {_dupes} dup(s), distinct {_distinct}/{_total}")
+    if _null == 0 and _dupes == 0:
+        logger.info(f"  OK: {_table}.{_src_pk} ({_total} records)")
+
+if _pk_violations:
+    _msg = (
+        "Primary key validation failed — fix the source data and re-run:\n  - "
+        + "\n  - ".join(_pk_violations)
+    )
+    logger.error(_msg)
+    raise ValueError(_msg)
+
+logger.info("Primary key validation passed (no NULLs, no duplicates)")
+
+# COMMAND ----------
+
 # DBTITLE 1,Determine if this is initial or incremental load
 #master_count_before = spark.table(master_table).count()
 #master_count_before = spark.table(master_table).isEmpty()

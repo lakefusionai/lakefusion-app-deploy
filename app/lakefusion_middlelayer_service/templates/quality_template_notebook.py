@@ -45,7 +45,12 @@ def exit_with_response(message: str, status: int, data=None, file=None, has_more
         totalCount=totalCount,
         session_token=session_token
     )
-    dbutils.notebook.exit(response.to_json())
+    payload = response.to_json()
+
+    if status >= 500:
+        raise Exception(payload)   # marks run as FAILED
+
+    dbutils.notebook.exit(payload)
 
 # COMMAND ----------
 

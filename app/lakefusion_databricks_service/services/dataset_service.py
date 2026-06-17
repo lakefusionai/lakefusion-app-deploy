@@ -790,29 +790,13 @@ def fetch_metadata_cleansed_dataset(token: str, db, dataset_id: int, use_cleaned
         # Preferred path: Unity Catalog Tables API returns full nested
         # `type_text` (e.g. ARRAY<STRING>, STRUCT<...>, ARRAY<STRUCT<...>>)
         # which `information_schema.COLUMNS.data_type` truncates to just
-        # "ARRAY"/"STRUCT". Fall back to legacy query on SDK failure
+        # "ARRAY"/"STRUCT". Fall back to DESCRIBE TABLE on SDK failure
         # (view / non-UC / permission edge cases).
+        # Tags are not fetched here — callers (Map Datasets, validation)
+        # don't need them. Use the non-cleansed meta-data endpoint for tags.
         try:
             w = _create_workspace_client(token)
             table_info = w.tables.get(full_name=full_name)
-
-            tags_by_col = {}
-            try:
-                tags_query = (
-                    f"SELECT column_name, "
-                    f"map_from_arrays(collect_list(tag_name), collect_list(tag_value)) AS tags_map "
-                    f"FROM {raw_catalog}.information_schema.column_tags "
-                    f"WHERE table_name = '{raw_table}' AND schema_name = '{raw_schema}' "
-                    f"GROUP BY column_name"
-                )
-                tags_resp = sqlservice_conn.execute_dataset(tags_query) or []
-                for row in tags_resp:
-                    col = row.get("column_name") if isinstance(row, dict) else None
-                    tmap = (row.get("tags_map") if isinstance(row, dict) else None) or {}
-                    if col:
-                        tags_by_col[col] = tmap
-            except Exception as tag_err:
-                app_logger.warning(f"Column tag fetch failed (non-fatal): {tag_err}")
 
             columns = []
             for c in (table_info.columns or []):
@@ -823,26 +807,28 @@ def fetch_metadata_cleansed_dataset(token: str, db, dataset_id: int, use_cleaned
                         c.type_name.value if getattr(c, "type_name", None) else ""
                     ),
                     "comment": getattr(c, "comment", None),
-                    "tags_map": tags_by_col.get(c.name, {}),
                 })
             return HttpResponse(status=200, data=columns)
         except Exception as sdk_err:
             app_logger.warning(
                 f"Tables API metadata fetch failed for {full_name}, falling back "
-                f"to information_schema. Reason: {sdk_err}"
+                f"to DESCRIBE TABLE. Reason: {sdk_err}"
             )
 
-        # ── Fallback: legacy information_schema query (truncates nested types).
-        query = f"""SELECT c1.column_name AS col_name,\
-c1.data_type,\
-c1.comment,\
-COALESCE(c2.tags_map, map()) AS tags_map \
-FROM {table_path[0]}.information_schema.COLUMNS c1 \
-LEFT JOIN ( SELECT column_name,map_from_arrays(collect_list(tag_name), collect_list(tag_value)) AS tags_map FROM \
-{table_path[0]}.information_schema.column_tags WHERE table_name = '{raw_table}' GROUP BY column_name ) c2 ON c1.column_name = c2.column_name \
-WHERE c1.table_name = '{raw_table}' AND c1.table_schema = '{raw_schema}';"""
+        # ── Fallback: DESCRIBE TABLE — faster than information_schema join.
+        tilde_path = ".".join(table_path)
+        query = f"DESCRIBE TABLE {tilde_path}"
         data = sqlservice_conn.execute_dataset(query)
-        return HttpResponse(status=200, data=data)
+        columns = []
+        for row in (data or []):
+            col_name = (row.get("col_name") if isinstance(row, dict) else None) or ""
+            if col_name.strip() and not col_name.startswith("#"):
+                columns.append({
+                    "col_name": col_name,
+                    "data_type": row.get("data_type", ""),
+                    "comment": row.get("comment", None),
+                })
+        return HttpResponse(status=200, data=columns)
     except Exception as e:
         raise_on_dbx_permission_error(e, "fetch cleansed dataset metadata")
         # Log the full exception traceback and error message

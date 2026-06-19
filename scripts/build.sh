@@ -478,7 +478,7 @@ async def lifespan(app):
                             secret_service = SecretScopeService(token="", scope_name=scope_name)
                             secret_service.upsert_secret(key="lakefusion_spn", value=app_sp_client_id)
                             secret_service.upsert_secret(key="lakefusion_spn_secret", value=app_sp_client_secret)
-                            secret_service.grant_read_acl(principal="users")
+                            secret_service.grant_read_acl()
                             logger.info(f"Auto-provisioned SPN to DB + Secret Scope ({scope_name}): {app_sp_client_id}")
                         else:
                             logger.info(f"lakefusion_spn already set: {existing_spn}")
@@ -569,12 +569,24 @@ from fastapi import Request as FastAPIRequest
 @app.middleware("http")
 async def databricks_auth_middleware(request: FastAPIRequest, call_next):
     """
-    Handle Databricks authentication for API routes.
-    In Databricks Apps, authentication is handled automatically via cookies/headers.
-    This middleware ensures proper header propagation.
+    Handle Databricks authentication and CSRF protection for API routes.
+    Validates Origin/Referer on state-changing requests to prevent cross-site request forgery.
     """
+    # CSRF: validate Origin/Referer on state-changing methods
+    _csrf_safe_methods = {"GET", "HEAD", "OPTIONS"}
+    if request.method not in _csrf_safe_methods:
+        _dbx_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+        if _dbx_app_url:
+            from urllib.parse import urlparse
+            origin = request.headers.get("origin") or request.headers.get("referer")
+            if origin:
+                parsed = urlparse(origin)
+                allowed_host = urlparse(_dbx_app_url).netloc
+                if parsed.netloc and parsed.netloc != allowed_host:
+                    from fastapi.responses import JSONResponse
+                    return JSONResponse(status_code=403, content={"detail": "Cross-origin request rejected"})
+
     response = await call_next(request)
-    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["X-Frame-Options"] = "SAMEORIGIN"
     return response
 
@@ -973,7 +985,7 @@ command:
 
 resources:
   - name: lakefusion-db
-    type: database
+    type: postgres
     database: lakefusion_transactional_db
     permission: CAN_CONNECT_AND_CREATE
 
@@ -984,16 +996,6 @@ env:
     value: "lakebase"
   - name: DEPLOYMENT_ENV
     value: "production"
-  - name: DATABRICKS_DATABASE_INSTANCE
-    value: lakefusion-db
-  - name: DATABRICKS_DATABASE_NAME
-    value: lakefusion_transactional_db
-  - name: DATABRICKS_DATABASE_PORT
-    value: "5432"
-  - name: PGPORT
-    value: "5432"
-  - name: PGDATABASE
-    value: lakefusion_transactional_db
   - name: DB_POOL_SIZE
     value: "10"
   - name: DB_MAX_OVERFLOW

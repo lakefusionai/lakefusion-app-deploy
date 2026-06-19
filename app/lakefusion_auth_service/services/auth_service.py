@@ -28,6 +28,27 @@ AZURE_AD_CLIENT_ID = os.environ.get("AZURE_AD_CLIENT_ID", "")
 AZURE_AD_CLIENT_SECRET = os.environ.get("AZURE_AD_CLIENT_SECRET", "")
 DATABRICKS_RESOURCE_ID = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 
+# Build redirect_uri allowlist from configured URLs
+from urllib.parse import urlparse
+
+def _validate_redirect_uri(redirect_uri: str) -> str:
+    """Validate redirect_uri against allowed hosts to prevent open redirect attacks."""
+    allowed_origins = set()
+    for url in [databricks_app_url, portal_url]:
+        if url:
+            parsed = urlparse(url)
+            if parsed.netloc:
+                allowed_origins.add(parsed.netloc)
+
+    parsed_redirect = urlparse(redirect_uri)
+    if not parsed_redirect.netloc or parsed_redirect.netloc not in allowed_origins:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid redirect_uri: host '{parsed_redirect.netloc}' is not in the allowed list"
+        )
+    return redirect_uri
+
+
 def get_oidc_url(db: Session, redirect_uri: Optional[str]=None) -> AuthUrlResponse:
     """
     Generate the OIDC authorization URL and store the code verifier and challenge in the database.
@@ -54,6 +75,8 @@ def get_oidc_url(db: Session, redirect_uri: Optional[str]=None) -> AuthUrlRespon
 
         if not redirect_uri:
             redirect_uri = portal_url
+
+        _validate_redirect_uri(redirect_uri)
 
         # Construct the authorization URL based on provider
         if AUTH_PROVIDER == "azuread":
@@ -159,6 +182,8 @@ def generate_auth_token(code: str, state: str, db: Session, redirect_uri: Option
 
         if not redirect_uri:
             redirect_uri = portal_url
+
+        _validate_redirect_uri(redirect_uri)
 
         # Generate auth token data with provider-specific credentials and scopes
         if AUTH_PROVIDER == "azuread":

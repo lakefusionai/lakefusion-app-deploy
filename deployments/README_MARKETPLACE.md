@@ -1,4 +1,4 @@
-# LakeFusion - Setup Guide
+# LakeFusion - Marketplace Installation Guide
 
 ## Step 1: Register OIDC Client (Required for SSO)
 
@@ -14,7 +14,7 @@ Before installing LakeFusion, you must register an OAuth application in your Dat
    - **Scopes**: `all-apis`, `offline_access`, `openid`, `profile`
 4. Save and note the **Client ID** and **Client Secret** — you'll need these during setup
 
-> The redirect URL follows the Databricks Apps URL pattern. Replace `<your-app-name>`, `<workspace-id>`, and `<region>` with your actual values. You can find these after creating the app in Step 3.
+> The redirect URL follows the Databricks Apps URL pattern. Replace `<your-app-name>`, `<workspace-id>`, and `<region>` with your actual values. You can find these after installing the app in Step 3.
 
 ---
 
@@ -43,30 +43,36 @@ Run `setup_lakefusion_prereqs.py` in a Databricks notebook to provision infrastr
 
 ---
 
-## Step 3: Run Full App Setup
+## Step 3: Install from Databricks Marketplace
 
-Run `setup_lakefusion_app.py` to create and configure the Databricks App:
-
-**What it does:**
-1. Creates the Databricks App (if not exists)
-2. Runs prerequisites (if not already done)
-3. Configures app resources (database, secrets)
-4. Updates app.yml with your configuration
-5. Deploys the app
-
-**Additional Widgets (beyond prereqs):**
-
-| Widget | Default | Description |
-|--------|---------|-------------|
-| `app_name` | `lakefusionai` | Databricks App name |
-| `app_description` | `LakeFusion AI` | Description |
-| `source_code_path` | `/Workspace/Users/{user}/lakefusion-app-deploy` | Source code path |
-| `lakegraph_url` | _(empty)_ | LakeGraph URL (optional) |
-| `deploy_app` | `true` | Whether to deploy after setup |
+1. Go to **Marketplace** in your Databricks workspace
+2. Search for **LakeFusion**
+3. Click **Install** (or **Request Access** if access-gated)
+4. Configure the app resources when prompted:
+   - **Database**: Select the Lakebase instance created in Step 2
+   - **Secrets**: Select the secrets scope created in Step 2
+5. Wait for the app to deploy and start
 
 ---
 
-## Step 4: Set Up Data Catalog
+## Step 4: Post-Installation Setup
+
+After the app is running, configure LakeFusion settings:
+
+1. Open the LakeFusion app URL
+2. Navigate to **Settings** > **General Settings** (`/settings/general-settings`)
+3. Update the following parameters:
+
+| Setting | Description | Example |
+|---------|-------------|---------|
+| **Catalog Name** | The Unity Catalog name where processed master data is stored. This catalog serves as the central repository for organizing and managing all entity datasets. | `lakefusion_ai` |
+| **Cron Warehouse ID** | The SQL warehouse ID for scheduled jobs and synchronization tasks. Find this in your workspace under **SQL Warehouses**. | `5433afee246b68c2` |
+| **DBX Cloud** | The Databricks cloud environment where workloads are deployed. | `azure`, `aws`, or `gcp` |
+| **Notebook Path** | The workspace path where LakeFusion pipeline notebooks are stored. | `/Workspace/Lakefusion_Notebooks/match-maven-notebooks-universe` |
+
+---
+
+## Step 5: Set Up Data Catalog
 
 The App Service Principal needs write access to the data catalog. Run the following SQL to create the required schemas and volumes:
 
@@ -84,7 +90,7 @@ CREATE VOLUME IF NOT EXISTS <catalog_name>.metadata.metadata_files;
 CREATE VOLUME IF NOT EXISTS <catalog_name>.default.pipeline_logs;
 ```
 
-Replace `<catalog_name>` with the catalog name you configured in Step 2 (e.g., `lakefusion_ai`).
+Replace `<catalog_name>` with the catalog name you configured in Step 4 (e.g., `lakefusion_ai`).
 
 **Grant permissions to the App Service Principal:**
 
@@ -98,15 +104,21 @@ GRANT SELECT, MODIFY ON CATALOG <catalog_name> TO `<app-sp-client-id>`;
 GRANT READ VOLUME, WRITE VOLUME ON CATALOG <catalog_name> TO `<app-sp-client-id>`;
 ```
 
+> The `<app-sp-client-id>` is the service principal automatically created for your app. Find it in **Apps** > your app > **Overview**.
+
 **Grant workspace permissions:**
 
-The App SP also needs **CAN MANAGE** permission on the notebooks root folder (`/Workspace/Lakefusion_Notebooks/`). Set this via the Databricks workspace UI under **Workspace** > right-click the folder > **Permissions**.
+The App SP also needs **CAN MANAGE** permission on the notebooks root folder (`/Workspace/Lakefusion_Notebooks/`). Set this via the Databricks workspace UI:
+1. Go to **Workspace** in the left nav
+2. Navigate to or create `/Workspace/Lakefusion_Notebooks/`
+3. Right-click the folder > **Permissions**
+4. Add the App Service Principal with **CAN MANAGE**
 
 ---
 
-## Step 5: Configure User Authorization Scopes
+## Step 6: Configure User Authorization Scopes
 
-After the app is created, configure user authorization scopes in the Databricks UI:
+Configure user authorization scopes in the Databricks UI:
 
 1. Go to **Apps** > your app > **Authorization**
 2. Add the following scopes:
@@ -125,7 +137,7 @@ After the app is created, configure user authorization scopes in the Databricks 
 
 ---
 
-## Step 6: Grant App Permissions
+## Step 7: Grant App Permissions
 
 Grant **CAN USE** permission to users/groups who need access:
 
@@ -156,12 +168,6 @@ To call LakeFusion APIs programmatically (without a browser):
    ```
 
 > The calling service principal must have **CAN USE** permission on the app.
-
----
-
-## Re-provisioning
-
-Both notebooks are idempotent — existing resources are detected and skipped. Set `create_database` / `create_secrets` to `false` to skip specific steps.
 
 ---
 

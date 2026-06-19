@@ -1317,6 +1317,43 @@ df_scoring_updates = df_with_match_status.groupBy(unified_id_key).agg(
     to_json(col("results_array"))
 ).select(unified_id_key, "scoring_results")
 
+# ── Skip-LLM no-match records ─────────────────────────────────────────────────
+# When deterministic NOT_A_MATCH / NO_MATCH rules remove EVERY candidate, the
+# record is excluded from LLM (has_positive_match=false AND filtered_search_results
+# IS NULL) and ends up ACTIVE with empty scoring_results — never finalized into its
+# own master. Synthesize a NO_MATCH scoring_results from its deterministic rows so
+# it (1) gets scoring_results populated and (2) lands in processed_unified as
+# no-match → Process_Unmatched_Records finalizes it (record_status=MERGED).
+# LLM-FAILED records had remaining candidates (filtered_search_results IS NOT NULL),
+# so they are NOT in this set and are correctly left for retry/error handling.
+if deteministic_unified_table_exists:
+    df_skip_llm_scoring = spark.sql(f"""
+        SELECT
+            d.{unified_id_key},
+            to_json(collect_list(named_struct(
+                'id',            det.exploded_result.id,
+                'match',         det.exploded_result.match,
+                'score',         CAST(det.exploded_result.score AS DOUBLE),
+                'reason',        det.exploded_result.reason,
+                'lakefusion_id', det.exploded_result.lakefusion_id
+            ))) AS scoring_results
+        FROM _det_filter d
+        JOIN {unified_deteministic_table} det
+          ON det.{unified_id_key} = d.{unified_id_key}
+        WHERE d.has_positive_match = false
+          AND d.filtered_search_results IS NULL
+          AND det.exploded_result.match NOT IN ('MATCH', 'POTENTIAL_MATCH')
+        GROUP BY d.{unified_id_key}
+    """)
+    # Guard: never override a record that was actually LLM-scored this run.
+    df_skip_llm_scoring = df_skip_llm_scoring.join(
+        df_scoring_updates.select(unified_id_key), on=unified_id_key, how="left_anti"
+    )
+    _skip_count = df_skip_llm_scoring.count()
+    if _skip_count:
+        logger.info(f"  Synthesizing NO_MATCH scoring_results for {_skip_count} skip-LLM record(s)")
+        df_scoring_updates = df_scoring_updates.unionByName(df_skip_llm_scoring)
+
 unified_delta = DeltaTable.forName(spark, unified_table)
 
 unified_delta.alias("target").merge(

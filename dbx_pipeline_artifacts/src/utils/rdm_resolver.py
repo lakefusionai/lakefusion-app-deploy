@@ -21,14 +21,18 @@ Approved rows:
     - Per-attr `<attr>__display` column added (ref_value), for use in
       attributes_combined; caller should drop it before writing to unified.
 
-Pending rows:
-    - Rows where ANY REFERENCE_ENTITY attr resolved to PENDING / NO_MATCH /
-      unresolved. Original column values preserved (raw source values).
-    - Caller writes to a separate `{entity}_unified_reference_pending` table.
+Pending rows (returned as pending_df, logged to the unified error table):
+    - Rows where ANY REFERENCE_ENTITY attr is PENDING / NO_MATCH / unresolved,
+      regardless of unresolved_action. Raw source values preserved.
+    - move_to_error attrs ALSO hold the whole record back from unified; keep_null
+      attrs are still logged here but the record stays in unified with the attr
+      nulled (so a keep_null failure appears in BOTH approved_df and pending_df).
 
 Status policy:
-    AUTO_APPROVED, KEEP_RDM, APPROVED, MANUALLY_ADDED → row is approved for unified
-    PENDING, NO_MATCH, missing → row goes to pending table
+    AUTO_APPROVED, KEEP_RDM, APPROVED, MANUALLY_ADDED → resolved (row approved for unified)
+    PENDING, NO_MATCH, missing → unresolved:
+        - always logged to the error table (pending_df)
+        - removed from unified only when unresolved_action == "move_to_error"
 """
 
 from functools import reduce
@@ -343,7 +347,10 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
         which REF attrs blocked the row (e.g.
         "country=PENDING(United Statz); state=NO_MATCH(XX)"). Caller routes
         to UnifiedErrorHandler with stage="RDM" using surrogate_key as the
-        key and _rdm_pending_reason as error_message.
+        key and _rdm_pending_reason as error_message. A keep_null attr's
+        failure appears in pending_df (logged) while the row also stays in
+        approved_df with the attr nulled; a move_to_error failure appears
+        only in pending_df.
 
     No-op behavior:
         If rdm_configs has no entries for source_id, returns (batch_df,
@@ -380,7 +387,8 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
 
     # ── Enrich batch_df from mapping, then split approved vs pending ──────
     enriched = batch_df
-    pending_clauses = []
+    error_clauses = []    # is_unresolved for EVERY ref attr → row logged to error table
+    exclude_clauses = []  # is_unresolved for move_to_error ref attrs → also held back from master
     saw_ref_attr = False
 
     for cfg in configs:
@@ -413,9 +421,11 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
         #   - source value is non-null AND
         #   - status is PENDING / NO_MATCH / missing (no row in mapping)
         # If source value is null/empty, attr doesn't block (nothing to resolve).
-        # An unresolved attr only routes the row to the error table when its
-        # unresolved_action is "move_to_error". The default "keep_null" keeps
-        # the row and nulls the attr instead (handled in the replacement loop).
+        # EVERY unresolved ref attr is logged to the error table (error_clauses).
+        # unresolved_action only decides MASTER placement: "move_to_error" also
+        # holds the whole record back from master (exclude_clauses); the default
+        # "keep_null" keeps the record in master and nulls the attr (replacement
+        # loop below) — but is still logged to the error table.
         attr_str = F.col(attr_name).cast("string")
         is_unresolved = (
             attr_str.isNotNull() & (attr_str != "") &
@@ -425,26 +435,36 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
             )
         )
         saw_ref_attr = True
+        error_clauses.append(is_unresolved)
         if (cfg.get("unresolved_action") or "keep_null") == "move_to_error":
-            pending_clauses.append(is_unresolved)
+            exclude_clauses.append(is_unresolved)
 
     if not saw_ref_attr:
         # No REF attrs present in batch columns — nothing to resolve
         return batch_df, empty_df
 
-    # Combine — row is pending if ANY move_to_error ref attr is unresolved
-    if pending_clauses:
-        any_pending = pending_clauses[0]
-        for c in pending_clauses[1:]:
-            any_pending = any_pending | c
-        enriched = enriched.withColumn("_any_pending", any_pending)
-        approved_df = enriched.filter(~F.col("_any_pending") | F.col("_any_pending").isNull())
-        pending_df = enriched.filter(F.col("_any_pending"))
+    # Two independent masks:
+    #   _any_error           — row has ANY unresolved ref attr → logged to error table
+    #   _exclude_from_master — row has an unresolved move_to_error attr → held back from master
+    # A keep_null failure sets _any_error only (logged AND kept in master, nulled).
+    # A move_to_error failure sets both (logged AND excluded from master).
+    # error_clauses is non-empty here: saw_ref_attr is True, so at least one ref
+    # attr was present and contributed an is_unresolved clause.
+    any_error = error_clauses[0]
+    for c in error_clauses[1:]:
+        any_error = any_error | c
+    enriched = enriched.withColumn("_any_error", any_error)
+
+    if exclude_clauses:
+        exclude_master = exclude_clauses[0]
+        for c in exclude_clauses[1:]:
+            exclude_master = exclude_master | c
     else:
-        # All ref attrs are keep_null → no row is ever routed to the error table
-        enriched = enriched.withColumn("_any_pending", F.lit(False))
-        approved_df = enriched
-        pending_df = enriched.filter(F.col("_any_pending"))
+        exclude_master = F.lit(False)
+    enriched = enriched.withColumn("_exclude_from_master", exclude_master)
+
+    approved_df = enriched.filter(~F.col("_exclude_from_master") | F.col("_exclude_from_master").isNull())
+    pending_df = enriched.filter(F.col("_any_error"))
 
     # In approved_df: replace REF column with its resolved ref_id and add a
     # __display column. For move_to_error attrs, approved rows are always
@@ -492,10 +512,8 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
         attr_name = cfg["attribute_name"]
         if attr_name not in batch_df.columns:
             continue
-        # Only move_to_error attrs can put a row in pending_df, so the reason
-        # string must describe those attrs only.
-        if (cfg.get("unresolved_action") or "keep_null") != "move_to_error":
-            continue
+        # Every unresolved ref attr (regardless of unresolved_action) can put a
+        # row in pending_df now, so describe all of them in the reason string.
         attr_str = F.col(attr_name).cast("string")
         is_blocking = (
             attr_str.isNotNull() & (attr_str != "") &
@@ -531,7 +549,7 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
         )
 
     # Drop intermediate cols (keep _rdm_pending_reason on pending_df)
-    drop_cols = ["_any_pending"]
+    drop_cols = ["_any_error", "_exclude_from_master"]
     for cfg in configs:
         attr_name = cfg["attribute_name"]
         drop_cols += [

@@ -543,6 +543,64 @@ if records_to_process == 0:
     logger.info("STEP 5: UPDATE PROCESSED UNIFIED FROM SCORING RESULTS")
     logger.info("=" * 80)
 
+    # ── Deterministic-only run: synthesize scoring_results before the rebuild ────
+    # When the only new ACTIVE records are deterministic hits, records_to_process
+    # is 0 — positive matches AND fully-filtered no-match records are both excluded
+    # from filter_query — so the main path (STEP 7 union_clause + STEP 9 skip-LLM
+    # synthesis) never runs and these records would exit here ACTIVE with empty
+    # scoring_results, never reaching processed_unified and never merging. Replicate
+    # both pieces here so they land in processed_unified below.
+    #   - Positive matches: keep MATCH/POTENTIAL_MATCH candidates, reclassify by the
+    #     same score bands STEP 8 uses (score is 1.0 → MATCH).
+    #   - Skip-LLM no-match: every-candidate-filtered records keep their det match.
+    if deteministic_unified_table_exists:
+        df_det_scoring = spark.sql(f"""
+            WITH det_rows AS (
+                SELECT
+                    d.{unified_id_key} AS {unified_id_key},
+                    named_struct(
+                        'id',            det.exploded_result.id,
+                        'match',         CASE
+                            WHEN det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH')
+                                 AND det.exploded_result.score BETWEEN {merge_min} AND {merge_max} THEN 'MATCH'
+                            WHEN det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH')
+                                 AND det.exploded_result.score BETWEEN {matches_min} AND {matches_max} THEN 'POTENTIAL_MATCH'
+                            ELSE det.exploded_result.match
+                        END,
+                        'score',         CAST(det.exploded_result.score AS DOUBLE),
+                        'reason',        det.exploded_result.reason,
+                        'lakefusion_id', det.exploded_result.lakefusion_id
+                    ) AS r
+                FROM _det_filter d
+                JOIN {unified_deteministic_table} det
+                  ON det.{unified_id_key} = d.{unified_id_key}
+                JOIN {unified_table} u
+                  ON u.{unified_id_key} = d.{unified_id_key}
+                WHERE u.record_status = 'ACTIVE'
+                  AND (u.scoring_results IS NULL OR u.scoring_results = '')
+                  AND (
+                        (d.has_positive_match = true
+                            AND det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH'))
+                     OR (d.has_positive_match = false
+                            AND d.filtered_search_results IS NULL
+                            AND det.exploded_result.match NOT IN ('MATCH', 'POTENTIAL_MATCH'))
+                  )
+            )
+            SELECT {unified_id_key}, to_json(collect_list(r)) AS scoring_results
+            FROM det_rows
+            GROUP BY {unified_id_key}
+        """)
+
+        _det_scoring_count = df_det_scoring.count()
+        if _det_scoring_count:
+            logger.info(f"  Synthesizing scoring_results for {_det_scoring_count} deterministic-only record(s)")
+            DeltaTable.forName(spark, unified_table).alias("target").merge(
+                source=df_det_scoring.alias("source"),
+                condition=f"target.{unified_id_key} = source.{unified_id_key}"
+            ).whenMatchedUpdate(
+                set={"scoring_results": "source.scoring_results"}
+            ).execute()
+
     active_with_scoring_count = spark.sql(f"""
         select count(*) as cnt
         from {unified_table}

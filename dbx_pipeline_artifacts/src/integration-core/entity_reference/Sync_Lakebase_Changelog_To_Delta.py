@@ -111,7 +111,7 @@ from pyspark.sql import functions as F
 unprocessed = changelog.filter(F.col("processed") == F.lit(False))
 
 if unprocessed.head(1) == []:
-    raise Exception("No unprocessed change-log rows. Skipping.")
+   dbutils.notebook.exit("No unprocessed change-log rows")
 
 max_seq = unprocessed.agg(F.max("seq").alias("m")).collect()[0]["m"]
 

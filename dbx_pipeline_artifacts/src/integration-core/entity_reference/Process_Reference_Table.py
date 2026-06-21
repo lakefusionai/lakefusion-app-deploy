@@ -81,6 +81,9 @@ generate_ref_key_udf = udf(
     lambda source_path, source_id: generate_ref_key(source_path, str(source_id)), 
     StringType()
 )
+table_fqn = f"{catalog_name}.gold.{entity}_reference_prod"
+audit_table_fqn = f"{catalog_name}.gold.{entity}_reference_audit_prod"
+conflict_table_fqn = f"{catalog_name}.gold.{entity}_reference_conflict_queue_prod"
 
 # COMMAND ----------
 

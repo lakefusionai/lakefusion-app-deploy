@@ -110,6 +110,39 @@ try:
 except Exception:
     attributes_mapping_full = []
 
+# REFERENCE_ENTITY config — resolve ref_lakefusion_id -> display value into
+# attributes_combined (raw {attr} stays a ref id). ref_lookup feeds the Python
+# master builder; the Spark unified builder joins the ref table directly.
+try:
+    reference_attribute_config = json.loads(
+        dbutils.jobs.taskValues.get(
+            "Parse_Entity_Model_JSON", "reference_attribute_config", default="{}"
+        )
+        or "{}"
+    )
+except Exception:
+    reference_attribute_config = {}
+
+ref_lookup = {}
+for _attr_name, _ref_cfg in (reference_attribute_config or {}).items():
+    _ref_table = (_ref_cfg or {}).get("ref_table")
+    _output_attr = (_ref_cfg or {}).get("output_attr")
+    if not _ref_table or not _output_attr:
+        continue
+    try:
+        _rdf = spark.read.table(_ref_table)
+        if "is_current" in _rdf.columns:
+            _rdf = _rdf.filter(F.col("is_current") == F.lit(True))
+        _rows = _rdf.select(
+            F.col("ref_lakefusion_id").cast("string").alias("_id"),
+            F.col(_output_attr).cast("string").alias("_disp"),
+        ).collect()
+        ref_lookup[_attr_name] = {
+            r["_id"]: r["_disp"] for r in _rows if r["_id"] is not None
+        }
+    except Exception:
+        continue
+
 _attr_records_by_name = {
     r["name"]: r for r in entity_attribute_records if isinstance(r, dict) and r.get("name")
 }
@@ -425,22 +458,12 @@ for source_table in dataset_tables:
     # entities keep the legacy concat_ws output byte-for-byte.
     available_match_attrs = [a for a in match_attributes if a in df_renamed.columns]
     if available_match_attrs:
-        if _has_complex_attrs:
-            df_renamed = df_renamed.withColumn(
-                "attributes_combined",
-                build_attributes_combined_column(
-                    df_renamed, available_match_attrs, entity_attribute_records
-                ),
-            )
-        else:
-            df_renamed = df_renamed.withColumn(
-                "attributes_combined",
-                F.concat_ws(
-                    " | ",
-                    *[F.regexp_replace(F.trim(F.col(a).cast("string")), r"\s+", " ")
-                      for a in available_match_attrs],
-                ),
-            )
+        # Resolve REFERENCE_ENTITY attrs (ref_lakefusion_id -> display) into
+        # attributes_combined; raw {attr} columns are left as ref ids.
+        df_renamed = add_attributes_combined(
+            df_renamed, available_match_attrs, entity_attribute_records,
+            reference_attribute_config=reference_attribute_config, spark=spark,
+        )
     else:
         df_renamed = df_renamed.withColumn("attributes_combined", F.lit(""))
 
@@ -647,9 +670,12 @@ if affected_master_ids:
         # survivorship. Survivorship runs in Python so we use the Python
         # variant (attributes_combined_from_dict) — same semantics as the
         # Spark builder used on unified rows.
-        if _has_complex_attrs:
+        # Resolve REFERENCE_ENTITY attrs (ref_lakefusion_id -> display) into the
+        # master's attributes_combined via ref_lookup; raw values stay ref ids.
+        if _has_complex_attrs or ref_lookup:
             master_record["attributes_combined"] = attributes_combined_from_dict(
-                golden, match_attributes, entity_attribute_records
+                golden, match_attributes, entity_attribute_records,
+                ref_lookup=ref_lookup or None,
             )
         else:
             golden_match_attrs = [

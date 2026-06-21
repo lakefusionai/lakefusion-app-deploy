@@ -453,23 +453,31 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
             spark, mapped_df, rdm_configs, source_id=secondary_source_id
         )
 
-        # Build concat list: use display value for REF attrs, raw otherwise
+        # Build concat list: use the resolver's <attr>__display value for REF
+        # attrs (never the raw ref_lakefusion_id baked back into {attr}).
         concat_cols = []
+        ref_display_map = {}
         for attr in combine_attrs:
             display_col = f"{attr}__display"
-            src = display_col if display_col in mapped_df.columns else attr
-            concat_cols.append(col(src))
+            if display_col in mapped_df.columns:
+                ref_display_map[attr] = display_col
+                concat_cols.append(col(display_col))
+            else:
+                concat_cols.append(col(attr))
 
         # complex-aware attributes_combined.
         if _has_complex_attrs:
             mapped_df = mapped_df.withColumn(
                 "attributes_combined",
-                build_attributes_combined_column(mapped_df, combine_attrs, entity_attribute_records),
+                build_attributes_combined_column(
+                    mapped_df, combine_attrs, entity_attribute_records,
+                    ref_display_cols=ref_display_map,
+                ),
             )
         else:
             mapped_df = mapped_df.withColumn(
                 "attributes_combined",
-                concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
+                concat_ws(" | ", *[coalesce(c.cast("string"), lit("")) for c in concat_cols])
             )
 
         # Drop the resolver's __display columns before downstream writes

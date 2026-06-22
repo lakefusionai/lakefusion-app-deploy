@@ -25,7 +25,7 @@ dbutils.library.restartPython()
 #
 # Run as the FIRST task of the entity pipeline (before matching/survivorship) so
 # downstream steps see reconciled Delta. Idempotent + resumable via the change-log
-# `processed` flag (watermark on `seq`).
+# `delta_sync` flag (watermark on `seq`).
 #
 # Replaces the old Lakebase CDF drain (Sync_Lakebase_CDF_To_Delta).
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -78,17 +78,33 @@ if write_mode != "lakebase":
 
 # COMMAND ----------
 
-# Delta source-of-truth tables (MERGE targets) and their grains.
+# Delta source-of-truth tables. Used for the provisioning guard below and as a
+# fallback router for legacy change-log rows (see _delta_target).
 MASTER_TABLE   = f"{catalog_name}.gold.{entity}_reference_prod"
 AUDIT_TABLE    = f"{catalog_name}.gold.{entity}_reference_audit_prod"
 CONFLICT_TABLE = f"{catalog_name}.gold.{entity}_reference_conflict_queue_prod"
 
-TARGETS = [
-    # (target_kind, delta_table, pk_cols)
-    ("master",   MASTER_TABLE,   ["ref_lakefusion_id"]),
-    ("audit",    AUDIT_TABLE,    ["ref_lakefusion_id", "version"]),
-    ("conflict", CONFLICT_TABLE, ["ref_lakefusion_id", "conflict_id"]),
-]
+# Grain registry: target_kind -> MERGE semantics. target_kind stays the *grain*
+# (not a table name), so this is reusable across pipelines — MDM golden/crosswalk
+# just add entries here. `pk` is the MERGE key; `soft_delete` flags the grain that
+# soft-deletes (when the soft_delete widget is on) instead of hard-deleting.
+GRAIN = {
+    "master":   {"pk": ["ref_lakefusion_id"],                "soft_delete": True},
+    "audit":    {"pk": ["ref_lakefusion_id", "version"],     "soft_delete": False},
+    "conflict": {"pk": ["ref_lakefusion_id", "conflict_id"], "soft_delete": False},
+}
+
+# Routing is on the PHYSICAL target table (change_log.source_table), so one
+# change-log can fan out to any number of tables — no hardcoded per-entity list.
+# The synced PG table is "<delta_table>_synced", so strip the suffix to recover
+# the Delta target. Legacy rows logged before the synced-name fix carry a bare
+# partition name (e.g. "partition_27422"); fall back to the grain's table for those.
+_LEGACY_GRAIN_TABLE = {"master": MASTER_TABLE, "audit": AUDIT_TABLE, "conflict": CONFLICT_TABLE}
+
+def _delta_target(source_table, target_kind):
+    if source_table and source_table.endswith("_synced"):
+        return f"{catalog_name}.gold.{source_table[: -len('_synced')]}"
+    return _LEGACY_GRAIN_TABLE.get(target_kind)
 
 # Change-log lives beside the synced tables: same DB (lakebase_database), schema `gold`.
 CHANGE_LOG_SCHEMA = "gold"
@@ -108,7 +124,7 @@ except Exception as e:
     raise Exception(f"Change-log {CHANGE_LOG_SCHEMA}.{CHANGE_LOG_TABLE} not readable ({e}); skipping.")
 
 from pyspark.sql import functions as F
-unprocessed = changelog.filter(F.col("processed") == F.lit(False))
+unprocessed = changelog.filter(F.col("delta_sync") == F.lit(False))
 
 if unprocessed.head(1) == []:
    dbutils.notebook.exit("No unprocessed change-log rows")
@@ -119,14 +135,25 @@ max_seq = unprocessed.agg(F.max("seq").alias("m")).collect()[0]["m"]
 
 reader = LakebaseChangeLogReader(spark)
 results = {}
-for target_kind, delta_table, pk_cols in TARGETS:
-    df_kind = unprocessed.filter(F.col("target_kind") == F.lit(target_kind)) \
-                         .select("seq", "operation", "row_data")
-    results[target_kind] = reader.merge_to_delta(
-        df_kind, delta_table, pk_cols,
-        soft_delete_set=(SOFT_DELETE_SET if target_kind == "master" else None),
+
+# One MERGE per (physical target table, grain) actually present in the log.
+routes = unprocessed.select("source_table", "target_kind").distinct().collect()
+for row in routes:
+    source_table, target_kind = row["source_table"], row["target_kind"]
+    grain = GRAIN.get(target_kind)
+    delta_table = _delta_target(source_table, target_kind)
+    if grain is None or delta_table is None:
+        print(f"skip: unroutable row source_table={source_table!r} target_kind={target_kind!r}")
+        continue
+    df_kind = unprocessed.filter(
+        (F.col("source_table") == F.lit(source_table))
+        & (F.col("target_kind") == F.lit(target_kind))
+    ).select("seq", "operation", "row_data")
+    results[source_table] = reader.merge_to_delta(
+        df_kind, delta_table, grain["pk"],
+        soft_delete_set=(SOFT_DELETE_SET if grain["soft_delete"] else None),
     )
-    print(f"{target_kind} merge:", results[target_kind])
+    print(f"{source_table} ({target_kind}) -> {delta_table}:", results[source_table])
 
 # COMMAND ----------
 
@@ -142,8 +169,8 @@ with LakebasePgClient(
 ) as pg:
     affected = pg.execute(
         f'UPDATE "{CHANGE_LOG_SCHEMA}"."{CHANGE_LOG_TABLE}" '
-        f'SET processed = TRUE, processed_at = now(), batch_id = %s '
-        f'WHERE seq <= %s AND processed = FALSE',
+        f'SET delta_sync = TRUE, delta_sync_at = now(), batch_id = %s '
+        f'WHERE seq <= %s AND delta_sync = FALSE',
         (batch_id, int(max_seq)),
     )
 print(f"Marked {affected} change-log rows processed (seq <= {max_seq}, batch={batch_id})")

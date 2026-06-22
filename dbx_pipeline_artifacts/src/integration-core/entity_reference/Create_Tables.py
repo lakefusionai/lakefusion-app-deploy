@@ -381,17 +381,20 @@ if write_mode == "lakebase":
         operation    TEXT NOT NULL,
         row_data     JSONB,
         changed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-        processed    BOOLEAN NOT NULL DEFAULT FALSE,
-        processed_at TIMESTAMPTZ,
+        delta_sync    BOOLEAN NOT NULL DEFAULT FALSE,
+        delta_sync_at TIMESTAMPTZ,
         batch_id     TEXT
     );
     '''
     index_ddl = (
         f'CREATE INDEX IF NOT EXISTS "idx_{change_log}_unprocessed" '
-        f'ON "{pg_schema}"."{change_log}" (processed, seq);'
+        f'ON "{pg_schema}"."{change_log}" (delta_sync, seq);'
     )
     # to_jsonb(NEW/OLD) captures the full post/pre-change row, including complex
     # (STRUCT/ARRAY) attrs — the workflow rehydrates them via the Delta schema.
+    # source_table comes from TG_ARGV[1] (the logical synced-table name), NOT
+    # TG_TABLE_NAME: Lakebase synced tables are partitioned, so TG_TABLE_NAME
+    # would log the leaf partition (e.g. "partition_27422") instead of the table.
     fn_ddl = f'''
     CREATE OR REPLACE FUNCTION "{pg_schema}"."{log_fn}"() RETURNS trigger AS $LF$
     DECLARE payload JSONB;
@@ -400,7 +403,7 @@ if write_mode == "lakebase":
         ELSE                     payload := to_jsonb(NEW);
         END IF;
         INSERT INTO "{pg_schema}"."{change_log}"(source_table, target_kind, operation, row_data)
-        VALUES (TG_TABLE_NAME, TG_ARGV[0], TG_OP, payload);
+        VALUES (TG_ARGV[1], TG_ARGV[0], TG_OP, payload);
         RETURN NULL;
     END;
     $LF$ LANGUAGE plpgsql;
@@ -425,7 +428,7 @@ if write_mode == "lakebase":
                 pg.execute(
                     f'CREATE TRIGGER "zz_changelog" '
                     f'AFTER INSERT OR UPDATE OR DELETE ON "{pg_schema}"."{synced_table}" '
-                    f"FOR EACH ROW EXECUTE FUNCTION \"{pg_schema}\".\"{log_fn}\"('{target_kind}');"
+                    f"FOR EACH ROW EXECUTE FUNCTION \"{pg_schema}\".\"{log_fn}\"('{target_kind}', '{synced_table}');"
                 )
                 logger.info(f"Installed change-log trigger on {pg_schema}.{synced_table} ({target_kind})")
             except Exception as e:

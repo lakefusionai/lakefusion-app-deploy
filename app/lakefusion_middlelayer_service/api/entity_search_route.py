@@ -349,13 +349,13 @@ async def resolve_conflict(
     conflict_id: str,
     warehouse_id: str = Query(..., description="SQL warehouse ID"),
     decision: str = Query(..., description="KEEP_RDM | USE_SOURCE | APPROVED | REJECTED"),
-    resolved_by: str = Query(..., description="User resolving the conflict"),
     check: dict = Depends(token_required_wrapper),
     db: Session = Depends(get_db),
 ):
     try:
         service = EntitySearchService(db)
         token = check.get("token")
+        resolved_by = check.get('decoded', {}).get('sub', '')
         return service.resolve_conflict(
             token=token,
             warehouse_id=warehouse_id,

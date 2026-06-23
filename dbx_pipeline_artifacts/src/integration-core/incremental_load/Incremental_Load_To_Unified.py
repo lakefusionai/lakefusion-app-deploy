@@ -159,6 +159,31 @@ def _is_complex_attr(name: str) -> bool:
     return bool(rec.get("is_array")) or (rec.get("type") or "").strip().upper() == "STRUCT"
 
 
+def _parse_engine_complex_value(value):
+    """Parse a survivorship-engine complex value back to native dict / list.
+
+    SurvivorshipEngine.apply_survivorship runs every value through safe_str(),
+    which JSON-serializes STRUCT / ARRAY values — so the golden record holds a
+    JSON string for each complex attribute, not a native dict / list. Parse it
+    back so (a) createDataFrame against the typed master schema accepts it as a
+    nested column and (b) attributes_combined_from_dict flattens field VALUES
+    instead of dumping the raw JSON. This is the driver-side equivalent of the
+    from_json(value, complex_ddl) round-trip the dedup / merge notebooks do via
+    merged_record_column. Already-native values and unparseable / empty strings
+    pass through (-> as-is / None)."""
+    if value is None or isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except (ValueError, TypeError):
+            return None
+    return value
+
+
 # Bootstrap sys.path so the shared `utils.*` modules are importable both in
 # Databricks repos and in local dev (no wheel install needed).
 import os as _pp_os
@@ -650,6 +675,14 @@ if affected_master_ids:
         golden       = result.resultant_record
         attr_mapping = result.resultant_master_attribute_source_mapping
 
+        # The engine JSON-serializes STRUCT / ARRAY values via safe_str(), so
+        # parse complex attrs back to native dict / list first. Scalars stay as
+        # strings (master scalar columns are StringType).
+        golden_native = dict(golden)
+        for attr in entity_attributes:
+            if attr != "lakefusion_id" and _is_complex_attr(attr):
+                golden_native[attr] = _parse_engine_complex_value(golden.get(attr))
+
         #only str()-cast scalar values. STRUCT (dict)
         # and ARRAY (list) values must stay native so the typed master schema
         # (Blocker E) can write them as nested Spark columns. str() on a dict
@@ -658,7 +691,7 @@ if affected_master_ids:
         for attr in entity_attributes:
             if attr == "lakefusion_id":
                 continue
-            value = golden.get(attr)
+            value = golden_native.get(attr)
             if value is None:
                 master_record[attr] = None
             elif _is_complex_attr(attr) or isinstance(value, (dict, list)):
@@ -674,7 +707,7 @@ if affected_master_ids:
         # master's attributes_combined via ref_lookup; raw values stay ref ids.
         if _has_complex_attrs or ref_lookup:
             master_record["attributes_combined"] = attributes_combined_from_dict(
-                golden, match_attributes, entity_attribute_records,
+                golden_native, match_attributes, entity_attribute_records,
                 ref_lookup=ref_lookup or None,
             )
         else:

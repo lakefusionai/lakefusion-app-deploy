@@ -84,6 +84,54 @@ def _spark_dtype_name(dt: DataType) -> str:
     return aliases.get(s, s)
 
 
+# Source-type aliases — Spark emits timezone-variant timestamps that are
+# mapping-equivalent to TIMESTAMP. Mirrors SOURCE_TYPE_ALIASES in the portal
+# (lakefusion-main-portal/.../mapDatasets/sourceTypeUtils.ts).
+_SOURCE_TYPE_ALIASES: Dict[str, str] = {
+    "TIMESTAMP_NTZ": "TIMESTAMP",
+    "TIMESTAMP_LTZ": "TIMESTAMP",
+}
+
+# Allowed SOURCE types per TARGET type for a SAFE (non-erroring) cast. Keyed by
+# TARGET field type -> set of SOURCE field types that may be cast into it. This
+# is the struct-field counterpart of the scalar rule the UI already enforces:
+# anything -> STRING is safe; widening numeric casts are safe; but e.g.
+# STRING -> TIMESTAMP is NOT (malformed rows would corrupt silently).
+#
+# Keep in sync with EntityAttributeTypeCompatibility (uppercase keys) in
+# lakefusion-main-portal/src/components/entities/details/constants.ts.
+_TYPE_COMPATIBILITY: Dict[str, set] = {
+    "STRING": {"STRING", "CHAR", "VARCHAR", "TEXT", "BOOLEAN", "BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "DOUBLE", "FLOAT", "DECIMAL", "NUMERIC", "DATE", "TIMESTAMP"},
+    "BOOLEAN": {"BOOLEAN", "BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE"},
+    "BIGINT": {"BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN"},
+    "LONG": {"BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN"},
+    "INT": {"INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN", "BIGINT", "LONG"},
+    "INTEGER": {"INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN", "BIGINT", "LONG"},
+    "SMALLINT": {"SMALLINT", "SHORT", "TINYINT", "BYTE", "BOOLEAN", "INT", "INTEGER", "BIGINT", "LONG"},
+    "SHORT": {"SHORT", "SMALLINT", "TINYINT", "BYTE", "BOOLEAN", "INT", "INTEGER", "BIGINT", "LONG"},
+    "TINYINT": {"TINYINT", "BYTE", "BOOLEAN", "SMALLINT", "SHORT", "INT", "INTEGER", "BIGINT", "LONG"},
+    "BYTE": {"BYTE", "TINYINT", "BOOLEAN", "SHORT", "SMALLINT", "INT", "INTEGER", "BIGINT", "LONG"},
+    "DOUBLE": {"DOUBLE", "FLOAT", "DECIMAL", "NUMERIC", "BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN"},
+    "FLOAT": {"FLOAT", "DOUBLE", "DECIMAL", "NUMERIC", "BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "BOOLEAN"},
+    "DATE": {"DATE", "TIMESTAMP"},
+    "TIMESTAMP": {"TIMESTAMP", "DATE"},
+    "REFERENCE_ENTITY": {"STRING", "CHAR", "VARCHAR", "TEXT", "BOOLEAN", "BIGINT", "LONG", "INT", "INTEGER", "SMALLINT", "TINYINT", "SHORT", "BYTE", "DOUBLE", "FLOAT", "DECIMAL", "NUMERIC", "DATE", "TIMESTAMP"},
+}
+
+
+def _scalar_compat(target_type: str, source_type: str) -> bool:
+    """Return True if a source field type may be SAFELY cast to the target field
+    type. Unknown target types are permissive (mirrors the UI), so nested
+    STRUCT/ARRAY fields — which don't appear in the scalar compat map — are not
+    rejected here. Precision is stripped from source ("decimal(10,2)" -> "DECIMAL").
+    """
+    compat = _TYPE_COMPATIBILITY.get((target_type or "").upper())
+    if not compat:
+        return True
+    src = (source_type or "").upper().split("(")[0].strip()
+    return (_SOURCE_TYPE_ALIASES.get(src, src)) in compat
+
+
 def _validate_struct_schema_match(
     source_struct_type: StructType,
     expected_fields: Sequence[Mapping[str, str]],
@@ -108,12 +156,14 @@ def _validate_struct_schema_match(
             f"{sorted(expected_by_name)}. Found: {sorted(source_by_name)}."
         )
 
+    # A field is a mismatch only when the source type CANNOT be safely cast to
+    # the target type (per _TYPE_COMPATIBILITY). Safe widening casts (e.g.
+    # INT -> BIGINT) are allowed — the source field is cast to the target type
+    # in _reorder() / _subfield_assembly_expr() — so they must not raise here.
     type_mismatches = [
         (name, expected_by_name[name], source_by_name[name])
         for name in expected_by_name
-        if expected_by_name[name] != source_by_name[name]
-        # STRING is allowed to absorb anything castable -> we treat string as a wildcard
-        and not (expected_by_name[name] == "STRING")
+        if not _scalar_compat(expected_by_name[name], source_by_name[name])
     ]
     if type_mismatches:
         details = ", ".join(

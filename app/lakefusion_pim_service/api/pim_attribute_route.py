@@ -19,41 +19,45 @@ pim_attribute_router = APIRouter(tags=["PIM Attributes"], prefix='/attributes')
 
 @pim_attribute_router.post("/", response_model=PimAttributeDefinitionResponse)
 def create_attribute(
+    entity_name: str,
     data: PimAttributeDefinitionCreate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.create_definition(data)
 
 
 @pim_attribute_router.post("/bulk", response_model=PimAttributeBulkCreateResponse)
 def bulk_create_attributes(
+    entity_name: str,
     data: List[PimAttributeDefinitionCreate],
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.bulk_create_definitions(data)
 
 
 @pim_attribute_router.post("/import", response_model=PimAttributeBulkImportResponse)
 def bulk_import_attributes(
+    entity_name: str,
     data: List[PimAttributeDefinitionCreate],
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Flat-file import (Specifications tab): skips existing codes, seeds SELECT/MULTISELECT options."""
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.bulk_import_definitions(data)
 
 
 @pim_attribute_router.get("/", response_model=List[PimAttributeDefinitionEnrichedResponse])
 def list_attributes(
+    entity_name: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.list_definitions()
 
 
@@ -70,125 +74,137 @@ class _ReorderBody(BaseModel):
 
 @pim_attribute_router.get("/{attr_id}/options", response_model=List[PimAttributeOptionResponse])
 def list_attribute_options(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.list_options(attr_id)
 
 
 @pim_attribute_router.post("/{attr_id}/options", response_model=PimAttributeOptionResponse)
 def add_attribute_option(
+    entity_name: str,
     attr_id: str,
     data: _AddOptionBody,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.add_option(attr_id, data.label)
 
 
 @pim_attribute_router.put("/{attr_id}/options/reorder", response_model=List[PimAttributeOptionResponse])
 def reorder_attribute_options(
+    entity_name: str,
     attr_id: str,
     data: _ReorderBody,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.reorder_options(attr_id, data.order)
 
 
 @pim_attribute_router.put("/options/{option_id}", response_model=PimAttributeOptionResponse)
 def update_attribute_option(
+    entity_name: str,
     option_id: str,
     data: PimAttributeOptionUpdate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.update_option(option_id, data)
 
 
 @pim_attribute_router.delete("/options/{option_id}")
 def delete_attribute_option(
+    entity_name: str,
     option_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.delete_option(option_id)
 
 
 @pim_attribute_router.get("/{attr_id}/usage")
 def get_attribute_usage(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.get_usage_stats(attr_id)
 
 
 @pim_attribute_router.get("/{attr_id}/usage-details")
 def get_attribute_usage_details(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.get_usage_details(attr_id)
 
 
 @pim_attribute_router.get("/{attr_id}", response_model=PimAttributeDefinitionResponse)
 def get_attribute(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.get_definition(attr_id)
 
 
 @pim_attribute_router.put("/{attr_id}", response_model=PimAttributeDefinitionResponse)
 def update_attribute(
+    entity_name: str,
     attr_id: str,
     data: PimAttributeDefinitionUpdate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.update_definition(attr_id, data)
 
 
 @pim_attribute_router.patch("/{attr_id}/toggle-identifier", response_model=PimAttributeDefinitionResponse)
 def toggle_identifier(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Toggle is_identifier on/off. Auto-swaps: only one attribute can be identifier at a time."""
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.toggle_identifier(attr_id)
 
 
 @pim_attribute_router.patch("/{attr_id}/toggle-label", response_model=PimAttributeDefinitionResponse)
 def toggle_label(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Toggle is_label on/off. Auto-swaps: only one attribute can be label at a time."""
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.toggle_label(attr_id)
 
 
 @pim_attribute_router.delete("/{attr_id}")
 def delete_attribute(
+    entity_name: str,
     attr_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimAttributeService(db)
+    service = PimAttributeService(db, entity_name)
     return service.delete_definition(attr_id)

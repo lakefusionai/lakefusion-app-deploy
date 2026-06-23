@@ -5,6 +5,7 @@ from app.lakefusion_pim_service.utils.app_db import (
     get_or_create_engine, dispose_entity_engine,
 )
 from app.lakefusion_pim_service.services.pim_entity_bridge_service import PimEntityBridgeService
+from app.lakefusion_pim_service.utils import pim_sql
 # from app.lakefusion_pim_service.config import deployment_env  # No longer needed — DB names don't use env suffix
 from lakefusion_utility.utils.logging_utils import get_logger
 
@@ -40,7 +41,7 @@ def list_product_entities(
             from sqlalchemy import text
             session_factory = get_or_create_engine(entity_name, db)
             test_session = session_factory()
-            test_session.execute(text("SELECT 1 FROM pim_entity_tier LIMIT 1"))
+            test_session.execute(text(f"SELECT 1 FROM {pim_sql.pim_tbl(entity_name, 'pim_entity_tier')} LIMIT 1"))
             test_session.close()
             initialized = True
         except Exception:
@@ -88,7 +89,7 @@ def get_active_product_entity(
         from sqlalchemy import text
         session_factory = get_or_create_engine(entity_name, db)
         test_session = session_factory()
-        test_session.execute(text("SELECT 1 FROM pim_entity_tier LIMIT 1"))
+        test_session.execute(text(f"SELECT 1 FROM {pim_sql.pim_tbl(entity_name, 'pim_entity_tier')} LIMIT 1"))
         test_session.close()
         initialized = True
     except Exception:
@@ -120,22 +121,21 @@ def get_global_attributes(
     return service.get_global_attributes(entity_id)
 
 
-@pim_entity_bridge_router.post("/entity-bridge/{entity_id}/initialize")
-def initialize_pim(
+@pim_entity_bridge_router.post("/entity-bridge/{entity_id}/initialize-local")
+def initialize_pim_local(
     entity_id: int,
     check: dict = Depends(token_required_wrapper),
     db: Session = Depends(get_db),
 ):
-    """
-    Initialize PIM for a product entity:
-    - Create entity-specific database
-    - Create pim_* tables
-    - Seed hierarchy tiers
-    - Bulk sync global attributes
+    """LOCAL DEV ONLY — create + seed the PIM tables in local Postgres.
+
+    Local counterpart of the Databricks init pipeline. Refuses unless
+    DATA_DB_TYPE=postgresql. Does not create Delta/synced tables or change-log
+    triggers (Databricks-only). The Integration Hub calls this automatically on
+    PIM task creation when running against local Postgres.
     """
     service = PimEntityBridgeService(db)
-    result = service.initialize_pim(entity_id)
-    return result
+    return service.init_local(entity_id)
 
 
 @pim_entity_bridge_router.post("/entity-bridge/{entity_id}/sync-attribute")

@@ -111,6 +111,14 @@ class TaskValueKey(str, Enum):
     RDM_CONFIGS="rdm_configs"
     REFERENCE_ATTRIBUTE_CONFIG="reference_attribute_config"
 
+    # PIM product entity (SCRUM-1929)
+    # PIM_TABLE_SCHEMAS: JSON manifest of the 16 pim_* table schemas, introspected
+    # from the SQLAlchemy models in Parse_PIM_Entity_JSON. Format:
+    #   { table_name: { "columns": [{name, type, nullable}, ...], "primary_key": [...] } }
+    # PIM_ENTITY_SUBTYPE: raw entity_subtype string used by Seed to create tiers.
+    PIM_TABLE_SCHEMAS = "pim_table_schemas"
+    PIM_ENTITY_SUBTYPE = "pim_entity_subtype"
+
 
     #Lakebase
 

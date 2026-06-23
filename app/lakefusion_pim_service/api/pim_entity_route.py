@@ -29,38 +29,72 @@ pim_entity_router = APIRouter(
 
 @pim_entity_router.post("/", response_model=PimEntityResponse)
 def create_product(
+    entity_name: str,
     data: PimEntityCreate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.create_product(data)
 
 
 @pim_entity_router.post("/import", response_model=PimBulkImportResponse)
 def bulk_import(
+    entity_name: str,
     data: PimBulkImportRequest,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Bulk import a full N-tier product hierarchy in a single transaction."""
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.bulk_import_hierarchy(data)
 
 
 @pim_entity_router.post("/flat-import", response_model=PimFlatImportResponse)
 def flat_import(
+    entity_name: str,
     data: PimFlatImportRequest,
     db: Session = Depends(get_data_db),
+    mysql_db: Session = Depends(get_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    """Flat-file import: item-grain rows upserted by SKU with per-field Add/Overwrite modes."""
-    service = PimEntityService(db)
-    return service.flat_import(data)
+    """Flat-file import: item-grain rows upserted by SKU with per-field Add/Overwrite modes.
+
+    On success, if the caller included the original file (file_name + file_content),
+    it is archived to a UC Volume as part of this call (best-effort — archival
+    failure does not fail the import)."""
+    service = PimEntityService(db, entity_name)
+    result = service.flat_import(data)
+    # Archive the source file to a UC Volume only when the import succeeded (any rows
+    # inserted/updated and not a total failure). Best-effort: never fail the import.
+    if data.file_name and data.file_content and (result.get("inserted", 0) or result.get("updated", 0)):
+        _archive_import_file(entity_name, data.file_name, data.file_content,
+                             check.get("token", ""), mysql_db)
+    return result
+
+
+def _archive_import_file(entity_name: str, file_name: str, file_content: str, token: str, mysql_db: Session):
+    """Upload the original import file to a UC Volume (PIM imports archive). Best-effort."""
+    try:
+        from io import BytesIO
+        from datetime import datetime
+        from lakefusion_utility.utils.databricks_util import CatalogService
+        cat = CatalogService(token, mysql_db)
+        # Timestamped path so re-imports don't clobber prior archives.
+        stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        volume_path = (
+            f"/Volumes/{cat.catalog_name}/metadata/metadata_files/"
+            f"pim_imports/{entity_name}/{stamp}_{file_name}"
+        )
+        cat.w.files.upload(volume_path, BytesIO(file_content.encode("utf-8")), overwrite=True)
+        app_logger.info(f"Archived PIM import file to {volume_path}")
+    except Exception as e:
+        app_logger.warning(f"PIM import file archival skipped (non-fatal): {e}")
 
 
 @pim_entity_router.get("/", response_model=PimEntityEnrichedListResponse)
 def list_products(
+    entity_name: str,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     entity_type_id: Optional[str] = Query(None, description="Filter by entity type"),
@@ -75,7 +109,7 @@ def list_products(
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.list_products(
         page=page, page_size=page_size,
         entity_type_id=entity_type_id, status=status,
@@ -92,21 +126,23 @@ def list_products(
 
 @pim_entity_router.post("/publish")
 def publish_products(
+    entity_name: str,
     data: PimPublishRequest,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.publish_products(data.product_ids)
 
 
 @pim_entity_router.post("/unpublish")
 def unpublish_products(
+    entity_name: str,
     data: PimPublishRequest,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.unpublish_products(data.product_ids)
 
 
@@ -116,19 +152,21 @@ def unpublish_products(
 
 @pim_entity_router.get("/dashboard/stats")
 def dashboard_stats(
+    entity_name: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.get_dashboard_stats()
 
 
 @pim_entity_router.get("/dashboard/category-health")
 def category_health(
+    entity_name: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.get_category_health()
 
 
@@ -202,11 +240,12 @@ def dashboard_recent_activity(
 
 @pim_entity_router.patch("/bulk-values")
 def bulk_update_values(
+    entity_name: str,
     data: dict,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.bulk_update_values(data)
 
 
@@ -216,6 +255,7 @@ def bulk_update_values(
 
 @pim_entity_router.get("/export")
 def export_products(
+    entity_name: str,
     format: str = Query("csv", description="Export format: csv"),
     entity_type_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
@@ -223,7 +263,7 @@ def export_products(
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.export_products_csv(
         entity_type_id=entity_type_id,
         status=status,
@@ -233,32 +273,35 @@ def export_products(
 
 @pim_entity_router.get("/{product_id}", response_model=PimEntityDetailResponse)
 def get_product(
+    entity_name: str,
     product_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.get_product(product_id)
 
 
 @pim_entity_router.patch("/{product_id}", response_model=PimEntityResponse)
 def update_product(
+    entity_name: str,
     product_id: str,
     data: PimEntityUpdate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.update_product(product_id, data)
 
 
 @pim_entity_router.delete("/{product_id}")
 def delete_product(
+    entity_name: str,
     product_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.delete_product(product_id)
 
 
@@ -268,45 +311,49 @@ def delete_product(
 
 @pim_entity_router.post("/{product_id}/items", response_model=PimEntityResponse)
 def create_item(
+    entity_name: str,
     product_id: str,
     data: PimEntityCreate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.create_item(product_id, data)
 
 
 @pim_entity_router.get("/{product_id}/items", response_model=List[PimEntityResponse])
 def list_items(
+    entity_name: str,
     product_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.list_items(product_id)
 
 
 @pim_entity_router.patch("/{product_id}/items/{item_id}", response_model=PimEntityResponse)
 def update_item(
+    entity_name: str,
     product_id: str,
     item_id: str,
     data: PimEntityUpdate,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.update_item(product_id, item_id, data)
 
 
 @pim_entity_router.delete("/{product_id}/items/{item_id}")
 def delete_item(
+    entity_name: str,
     product_id: str,
     item_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.delete_item(product_id, item_id)
 
 
@@ -316,34 +363,37 @@ def delete_item(
 
 @pim_entity_router.get("/{product_id}/values")
 def get_values(
+    entity_name: str,
     product_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.get_values_for_product(product_id)
 
 
 @pim_entity_router.put("/{product_id}/values")
 def batch_write_values(
+    entity_name: str,
     product_id: str,
     data: PimBatchValueWriteRequest,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.batch_write_values(product_id, data)
 
 
 @pim_entity_router.post("/{product_id}/values/delete-price-record")
 def delete_price_record(
+    entity_name: str,
     product_id: str,
     body: dict,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Delete a specific price record by composite key."""
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.delete_price_record(
         product_id,
         body.get("attribute_id", ""),
@@ -355,24 +405,26 @@ def delete_price_record(
 
 @pim_entity_router.post("/{product_id}/values/delete-locale")
 def delete_locale_values(
+    entity_name: str,
     product_id: str,
     body: dict,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
     """Delete all values for a product in a specific locale."""
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.delete_locale_values(product_id, body.get("locale", ""))
 
 
 @pim_entity_router.delete("/{product_id}/values/{attribute_id}")
 def delete_value(
+    entity_name: str,
     product_id: str,
     attribute_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimValueService(db)
+    service = PimValueService(db, entity_name)
     return service.delete_value(product_id, attribute_id)
 
 
@@ -382,6 +434,7 @@ def delete_value(
 
 @pim_entity_router.post("/{product_id}/translate")
 def translate_values(
+    entity_name: str,
     product_id: str,
     data: dict,
     db: Session = Depends(get_data_db),
@@ -411,8 +464,11 @@ def translate_values(
         raise HTTPException(status_code=400, detail="target_locale and fields are required")
 
     # Get language names for better prompts
-    from lakefusion_utility.models.pim import PimLanguageRef
-    lang_map = {l.id: l.language_name for l in db.query(PimLanguageRef).all()}
+    from app.lakefusion_pim_service.utils import pim_sql
+    lang_map = {
+        l["id"]: l["language_name"]
+        for l in pim_sql.fetch_all(db, f'SELECT "id", "language_name" FROM {pim_sql.pim_tbl(entity_name, "pim_language_ref")}')
+    }
     source_lang = lang_map.get(source_locale, source_locale)
     target_lang = lang_map.get(target_locale, target_locale)
 
@@ -491,9 +547,10 @@ def translate_values(
 
 @pim_entity_router.get("/{product_id}/completeness")
 def get_completeness(
+    entity_name: str,
     product_id: str,
     db: Session = Depends(get_data_db),
     check: dict = Depends(token_required_wrapper),
 ):
-    service = PimEntityService(db)
+    service = PimEntityService(db, entity_name)
     return service.compute_completeness(product_id)

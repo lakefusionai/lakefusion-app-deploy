@@ -1,17 +1,13 @@
 import traceback
+import uuid
 from datetime import datetime, date as _date
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session
-from sqlalchemy import text, func
 from fastapi import HTTPException
+from app.lakefusion_pim_service.utils import pim_sql
 from lakefusion_utility.models.pim import (
-    PimEntity, PimEntityFlat, PimEntityCreate, PimEntityUpdate,
-    PimTaxonomyNode, PimResolvedSpecification,
-    PimAttributeDefinition, PimAttributeOption, PimSpecificationConfig,
-    PimValueText, PimValueNumber, PimValueBoolean,
-    PimValueDate, PimValueSelect, PimValueMultiselect,
-    PimValueReference,
-    PimImportNode, PimBulkImportRequest,
-    PimFlatImportRequest,
+    PimEntityCreate, PimEntityUpdate,
+    PimImportNode, PimBulkImportRequest, PimFlatImportRequest,
     to_value_key,
 )
 from lakefusion_utility.utils.app_db import db_commit_auto_rollback
@@ -19,329 +15,344 @@ from lakefusion_utility.utils.logging_utils import get_logger
 
 app_logger = get_logger(__name__)
 
-# Map of all typed value tables for completeness / cleanup queries
-VALUE_TABLES = [
-    PimValueText, PimValueNumber, PimValueBoolean,
-    PimValueDate, PimValueSelect, PimValueMultiselect,
-    PimValueReference,
-]
+# SCRUM-1929 Phase 6.6 — converted from ORM to raw SQL against the Delta-synced
+# tables. Largest PIM service. Synced tables have NO FK cascade — delete_product
+# clears value rows + flat row explicitly. flat_import/bulk_import keep their
+# chunked-insert shape but write via pim_sql; in-place value updates become
+# explicit UPDATEs. entity_name threaded into the constructor.
+#
+# NOTE (perf): flat_import / bulk_import_hierarchy run row-wise in this service
+# process. At million-row scale these should move to vectorized Spark (see PRD
+# Scale Considerations); this port preserves behavior, not scale.
+
+ENTITY_TBL = "pim_entity"
+FLAT_TBL = "pim_entity_flat"
+NODE_TBL = "pim_taxonomy_node"
+ATTR_TBL = "pim_attribute_definition"
+OPTION_TBL = "pim_attribute_option"
+CONFIG_TBL = "pim_specification_config"
+RESOLVED_TBL = "pim_resolved_specification"
+TIER_TBL = "pim_entity_tier"
+
+# data_type -> logical value table
+VALUE_TABLE_BY_TYPE = {
+    'TEXT': 'pim_value_text', 'NUMBER': 'pim_value_number', 'BOOLEAN': 'pim_value_boolean',
+    'DATE': 'pim_value_date', 'SELECT': 'pim_value_select',
+    'MULTISELECT': 'pim_value_multiselect', 'REFERENCE': 'pim_value_reference',
+}
+VALUE_TABLES = list(VALUE_TABLE_BY_TYPE.values())
+VALUE_TEXT = 'pim_value_text'
+VALUE_NUMBER = 'pim_value_number'
 
 
 class PimEntityService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, entity_name: str):
         self.db = db
-        # Cache identifier and label attribute definitions (lazy loaded)
+        self.entity_name = entity_name
+        self._entity = pim_sql.pim_tbl(entity_name, ENTITY_TBL)
+        self._flat = pim_sql.pim_tbl(entity_name, FLAT_TBL)
+        self._node = pim_sql.pim_tbl(entity_name, NODE_TBL)
+        self._attr = pim_sql.pim_tbl(entity_name, ATTR_TBL)
+        self._opt = pim_sql.pim_tbl(entity_name, OPTION_TBL)
+        self._config = pim_sql.pim_tbl(entity_name, CONFIG_TBL)
+        self._resolved = pim_sql.pim_tbl(entity_name, RESOLVED_TBL)
+        self._tier = pim_sql.pim_tbl(entity_name, TIER_TBL)
         self._identifier_attr = None
         self._label_attr = None
 
+    def _vt(self, data_type):
+        return pim_sql.pim_tbl(self.entity_name, VALUE_TABLE_BY_TYPE[data_type])
+
+    def _t(self, table):
+        return pim_sql.pim_tbl(self.entity_name, table)
+
+    def _fetch_in(self, sql, list_param, values, extra=None):
+        # Empty IN-list → short-circuit (an expanding bindparam with [] renders a
+        # broken empty-IN that errors on text columns; IN () matches nothing anyway).
+        # Also correct for UPDATE/DELETE ... IN :ids RETURNING (affects no rows).
+        values = list(values)
+        if not values:
+            return []
+        stmt = text(sql).bindparams(bindparam(list_param, expanding=True))
+        params = {list_param: values}
+        if extra:
+            params.update(extra)
+        return [dict(r) for r in self.db.execute(stmt, params).mappings().all()]
+
+    # ------------------------------------------------------------------
+    # Identifier / label attribute helpers
+    # ------------------------------------------------------------------
     def _get_identifier_attr(self):
-        """Get the attribute definition marked as the identifier (is_identifier=True)."""
         if self._identifier_attr is None:
-            self._identifier_attr = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.is_identifier == True
-            ).first()
+            self._identifier_attr = pim_sql.fetch_one(
+                self.db, f'SELECT * FROM {self._attr} WHERE "is_identifier" = TRUE'
+            )
         return self._identifier_attr
 
     def _get_label_attr(self):
-        """Get the attribute definition marked as the label (is_label=True)."""
         if self._label_attr is None:
-            self._label_attr = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.is_label == True
-            ).first()
+            self._label_attr = pim_sql.fetch_one(
+                self.db, f'SELECT * FROM {self._attr} WHERE "is_label" = TRUE'
+            )
         return self._label_attr
 
-    def _get_identifier_value(self, entity_id: str) -> str | None:
-        """Get the identifier value for an entity from EAV."""
-        attr = self._get_identifier_attr()
-        if not attr:
+    def _get_text_value(self, entity_id, attr_id):
+        if not attr_id:
             return None
-        val = self.db.query(PimValueText).filter(
-            PimValueText.product_id == entity_id,
-            PimValueText.attribute_id == attr.id,
-            PimValueText.locale == '',
-        ).first()
-        return val.value if val else None
-
-    def _get_label_value(self, entity_id: str) -> str | None:
-        """Get the label value for an entity from EAV."""
-        attr = self._get_label_attr()
-        if not attr:
-            return None
-        val = self.db.query(PimValueText).filter(
-            PimValueText.product_id == entity_id,
-            PimValueText.attribute_id == attr.id,
-            PimValueText.locale == '',
-        ).first()
-        return val.value if val else None
-
-    def _write_identifier_value(self, entity_id: str, value: str):
-        """Write the identifier value to EAV (upsert)."""
-        attr = self._get_identifier_attr()
-        if not attr or not value:
-            return
-        existing = self.db.query(PimValueText).filter(
-            PimValueText.product_id == entity_id,
-            PimValueText.attribute_id == attr.id,
-            PimValueText.locale == '',
-        ).first()
-        if existing:
-            existing.value = value
-            existing.updated_at = datetime.utcnow()
-        else:
-            from lakefusion_utility.models.pim import _uuid
-            self.db.add(PimValueText(
-                id=_uuid(), product_id=entity_id, attribute_id=attr.id,
-                value=value, locale='', source='USER_SET',
-            ))
-
-    def _write_label_value(self, entity_id: str, value: str):
-        """Write the label value to EAV (upsert)."""
-        attr = self._get_label_attr()
-        if not attr or not value:
-            return
-        existing = self.db.query(PimValueText).filter(
-            PimValueText.product_id == entity_id,
-            PimValueText.attribute_id == attr.id,
-            PimValueText.locale == '',
-        ).first()
-        if existing:
-            existing.value = value
-            existing.updated_at = datetime.utcnow()
-        else:
-            from lakefusion_utility.models.pim import _uuid
-            self.db.add(PimValueText(
-                id=_uuid(), product_id=entity_id, attribute_id=attr.id,
-                value=value, locale='', source='USER_SET',
-            ))
-
-    def _check_identifier_unique(self, value: str, exclude_id: str = None):
-        """Check identifier uniqueness across all entities via EAV."""
-        attr = self._get_identifier_attr()
-        if not attr or not value:
-            return
-        query = self.db.query(PimValueText).filter(
-            PimValueText.attribute_id == attr.id,
-            PimValueText.value == value,
-            PimValueText.locale == '',
+        row = pim_sql.fetch_one(
+            self.db,
+            f'SELECT "value" FROM {self._vt("TEXT")} '
+            f'WHERE "product_id" = :pid AND "attribute_id" = :aid AND "locale" = \'\'',
+            {"pid": entity_id, "aid": attr_id},
         )
-        if exclude_id:
-            query = query.filter(PimValueText.product_id != exclude_id)
-        if query.first():
-            raise HTTPException(
-                status_code=409,
-                detail=f"Product with identifier '{value}' already exists.",
-            )
+        return row["value"] if row else None
 
-    def refresh_flat_rows(self, entity_ids: list):
-        """Incrementally refresh pim_entity_flat for specific entities."""
-        if not entity_ids:
+    def _get_identifier_value(self, entity_id):
+        attr = self._get_identifier_attr()
+        return self._get_text_value(entity_id, attr["id"]) if attr else None
+
+    def _get_label_value(self, entity_id):
+        attr = self._get_label_attr()
+        return self._get_text_value(entity_id, attr["id"]) if attr else None
+
+    def _write_text_value(self, entity_id, attr_id, value):
+        """Upsert a plain-locale text value (used for identifier/label)."""
+        if not attr_id or not value:
             return
-        id_attr = self._get_identifier_attr()
-        label_attr = self._get_label_attr()
-        id_attr_id = id_attr.id if id_attr else None
-        label_attr_id = label_attr.id if label_attr else None
+        existing = pim_sql.fetch_one(
+            self.db,
+            f'SELECT "id" FROM {self._vt("TEXT")} '
+            f'WHERE "product_id" = :pid AND "attribute_id" = :aid AND "locale" = \'\'',
+            {"pid": entity_id, "aid": attr_id},
+        )
+        if existing:
+            sql, params = pim_sql.build_update(
+                self.entity_name, VALUE_TEXT, {"value": value},
+                where='"id" = :id', where_params={"id": existing["id"]},
+            )
+            pim_sql.execute(self.db, sql, params)
+        else:
+            sql, params = pim_sql.build_insert(
+                self.entity_name, VALUE_TEXT,
+                {"product_id": entity_id, "attribute_id": attr_id, "value": value,
+                 "locale": '', "source": 'USER_SET'},
+            )
+            pim_sql.execute(self.db, sql, params)
 
-        for eid in entity_ids:
-            entity = self.db.query(PimEntity).filter(PimEntity.id == eid).first()
-            if not entity:
-                # Entity was deleted — remove from flat table
-                self.db.query(PimEntityFlat).filter(PimEntityFlat.id == eid).delete()
-                continue
+    def _write_identifier_value(self, entity_id, value):
+        attr = self._get_identifier_attr()
+        if attr:
+            self._write_text_value(entity_id, attr["id"], value)
 
-            # Get identifier and label from EAV
-            id_val = None
-            label_val = None
-            if id_attr_id:
-                row = self.db.query(PimValueText.value).filter(
-                    PimValueText.product_id == eid,
-                    PimValueText.attribute_id == id_attr_id,
-                    PimValueText.locale == '',
-                ).first()
-                id_val = row[0] if row else None
-            if label_attr_id:
-                row = self.db.query(PimValueText.value).filter(
-                    PimValueText.product_id == eid,
-                    PimValueText.attribute_id == label_attr_id,
-                    PimValueText.locale == '',
-                ).first()
-                label_val = row[0] if row else None
+    def _write_label_value(self, entity_id, value):
+        attr = self._get_label_attr()
+        if attr:
+            self._write_text_value(entity_id, attr["id"], value)
 
-            # Get category info
-            cat_label = None
-            cat_path = None
-            if entity.taxonomy_node_id:
-                node = self.db.query(PimTaxonomyNode).filter(
-                    PimTaxonomyNode.id == entity.taxonomy_node_id
-                ).first()
-                if node:
-                    cat_label = node.label
-                    cat_path = node.materialized_path
-
-            # Child count
-            child_count = self.db.query(func.count(PimEntity.id)).filter(
-                PimEntity.parent_id == eid, PimEntity.active == True
-            ).scalar() or 0
-
-            # Upsert flat row
-            flat = self.db.query(PimEntityFlat).filter(PimEntityFlat.id == eid).first()
-            if flat:
-                flat.entity_type_id = entity.entity_type_id
-                flat.taxonomy_node_id = entity.taxonomy_node_id
-                flat.parent_id = entity.parent_id
-                flat.status = entity.status
-                flat.active = entity.active
-                flat.promoted = entity.promoted
-                flat.published_at = entity.published_at
-                flat.identifier = id_val
-                flat.label = label_val
-                flat.category_label = cat_label
-                flat.category_path = cat_path
-                flat.child_count = child_count
-                flat.created_at = entity.created_at
-                flat.updated_at = entity.updated_at
-            else:
-                self.db.add(PimEntityFlat(
-                    id=eid, entity_type_id=entity.entity_type_id,
-                    taxonomy_node_id=entity.taxonomy_node_id, parent_id=entity.parent_id,
-                    status=entity.status, active=entity.active, promoted=entity.promoted,
-                    published_at=entity.published_at,
-                    identifier=id_val, label=label_val,
-                    category_label=cat_label, category_path=cat_path,
-                    child_count=child_count,
-                    created_at=entity.created_at, updated_at=entity.updated_at,
-                ))
+    def _check_identifier_unique(self, value, exclude_id=None):
+        attr = self._get_identifier_attr()
+        if not attr or not value:
+            return
+        sql = (f'SELECT "product_id" FROM {self._vt("TEXT")} '
+               f'WHERE "attribute_id" = :aid AND "value" = :v AND "locale" = \'\'')
+        params = {"aid": attr["id"], "v": value}
+        if exclude_id:
+            sql += ' AND "product_id" != :eid'
+            params["eid"] = exclude_id
+        if pim_sql.fetch_one(self.db, sql, params):
+            raise HTTPException(status_code=409, detail=f"Product with identifier '{value}' already exists.")
 
     # ------------------------------------------------------------------
-    # CREATE PRODUCT  (SCRUM-1569)
+    # FLAT TABLE REFRESH
+    # ------------------------------------------------------------------
+    def refresh_flat_rows(self, entity_ids: list):
+        """Refresh pim_entity_flat for specific entities (no commit).
+
+        Set-based for scale (the reference-entity batching philosophy): a handful of
+        bulk SELECTs into in-memory maps + one delete + one batched insert, instead
+        of ~6 round-trips per entity. Each flat row is fully recomputed, so we
+        delete-then-insert rather than per-row upsert."""
+        if not entity_ids:
+            return
+        ids = list(dict.fromkeys(entity_ids))  # de-dup, preserve order
+        id_attr = self._get_identifier_attr()
+        label_attr = self._get_label_attr()
+        id_attr_id = id_attr["id"] if id_attr else None
+        label_attr_id = label_attr["id"] if label_attr else None
+
+        # 1. Bulk-fetch the entities.
+        entities = self._fetch_in(f'SELECT * FROM {self._entity} WHERE "id" IN :ids', "ids", ids)
+        entity_by_id = {e["id"]: e for e in entities}
+
+        # 2. Identifier + label text values for all entities (one query each).
+        def _text_map(attr_id):
+            if not attr_id:
+                return {}
+            rows = self._fetch_in(
+                f'SELECT "product_id","value" FROM {self._vt("TEXT")} '
+                f'WHERE "attribute_id" = :aid AND "locale" = \'\' AND "product_id" IN :ids',
+                "ids", ids, {"aid": attr_id},
+            )
+            return {r["product_id"]: r["value"] for r in rows}
+        id_vals = _text_map(id_attr_id)
+        label_vals = _text_map(label_attr_id)
+
+        # 3. Category (node) info for the entities' taxonomy nodes (one query).
+        node_ids = list({e["taxonomy_node_id"] for e in entities if e["taxonomy_node_id"]})
+        node_map = {}
+        if node_ids:
+            for n in self._fetch_in(
+                f'SELECT "id","label","materialized_path" FROM {self._node} WHERE "id" IN :ids',
+                "ids", node_ids,
+            ):
+                node_map[n["id"]] = (n["label"], n["materialized_path"])
+
+        # 4. Child counts for all these entities as parents (one grouped query).
+        child_counts = {}
+        for r in self._fetch_in(
+            f'SELECT "parent_id", COUNT("id") AS cnt FROM {self._entity} '
+            f'WHERE "active" = TRUE AND "parent_id" IN :ids GROUP BY "parent_id"',
+            "ids", ids,
+        ):
+            child_counts[r["parent_id"]] = r["cnt"]
+
+        # 5. Replace the flat rows: delete all, then batch-insert the recomputed set.
+        self._fetch_in(f'DELETE FROM {self._flat} WHERE "id" IN :ids RETURNING "id"', "ids", ids)
+
+        flat_rows = []
+        for eid in ids:
+            entity = entity_by_id.get(eid)
+            if not entity:
+                continue  # gone → flat row already deleted above
+            cat_label, cat_path = node_map.get(entity["taxonomy_node_id"], (None, None))
+            flat_rows.append({
+                "id": eid,
+                "entity_type_id": entity["entity_type_id"], "taxonomy_node_id": entity["taxonomy_node_id"],
+                "parent_id": entity["parent_id"], "status": entity["status"], "active": entity["active"],
+                "promoted": entity["promoted"], "published_at": entity["published_at"],
+                "identifier": id_vals.get(eid), "label": label_vals.get(eid),
+                "category_label": cat_label, "category_path": cat_path,
+                "child_count": child_counts.get(eid, 0),
+                "created_at": entity["created_at"], "updated_at": entity["updated_at"],
+            })
+        if flat_rows:
+            pim_sql.bulk_insert(self.db, self.entity_name, FLAT_TBL, flat_rows)
+
+    # ------------------------------------------------------------------
+    # CREATE PRODUCT
     # ------------------------------------------------------------------
     def create_product(self, data: PimEntityCreate):
         try:
-            # Validate unique identifier
             if data.identifier_value:
                 self._check_identifier_unique(data.identifier_value)
 
-            # Validate taxonomy node exists
-            node = self.db.query(PimTaxonomyNode).filter(
-                PimTaxonomyNode.id == data.taxonomy_node_id,
-                PimTaxonomyNode.is_active == True,
-            ).first()
+            node = pim_sql.fetch_one(
+                self.db, f'SELECT "id" FROM {self._node} WHERE "id" = :id AND "is_active" = TRUE',
+                {"id": data.taxonomy_node_id},
+            )
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
 
-            # Validate parent if provided
             if data.parent_id:
-                parent = self.db.query(PimEntity).filter(
-                    PimEntity.id == data.parent_id, PimEntity.active == True
-                ).first()
+                parent = pim_sql.fetch_one(
+                    self.db, f'SELECT "entity_type_id" FROM {self._entity} WHERE "id" = :id AND "active" = TRUE',
+                    {"id": data.parent_id},
+                )
                 if not parent:
                     raise HTTPException(status_code=404, detail="Parent product not found.")
-                from lakefusion_utility.models.pim import PimEntityTier
-                parent_tier = self.db.query(PimEntityTier).filter(
-                    PimEntityTier.code == parent.entity_type_id
-                ).first()
-                if parent_tier and parent_tier.is_leaf:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Cannot add children under a {parent_tier.label} (leaf tier).",
-                    )
+                parent_tier = pim_sql.fetch_one(
+                    self.db, f'SELECT "label","is_leaf" FROM {self._tier} WHERE "code" = :c',
+                    {"c": parent["entity_type_id"]},
+                )
+                if parent_tier and parent_tier["is_leaf"]:
+                    raise HTTPException(status_code=400, detail=f"Cannot add children under a {parent_tier['label']} (leaf tier).")
 
-            product = PimEntity(
-                entity_type_id=data.entity_type_id,
-                taxonomy_node_id=data.taxonomy_node_id,
-                parent_id=data.parent_id,
-                status=data.status or 'Active',
-                active=data.active if data.active is not None else True,
+            sql, params = pim_sql.build_insert(
+                self.entity_name, ENTITY_TBL,
+                {"entity_type_id": data.entity_type_id, "taxonomy_node_id": data.taxonomy_node_id,
+                 "parent_id": data.parent_id, "status": data.status or 'Active',
+                 "active": data.active if data.active is not None else True,
+                 "promoted": False},
             )
-            self.db.add(product)
-            self.db.flush()  # get the product.id
+            pim_sql.execute(self.db, sql, params)
+            product_id = params["id"]
 
-            # Write identifier and label as EAV values
             if data.identifier_value:
-                self._write_identifier_value(product.id, data.identifier_value)
+                self._write_identifier_value(product_id, data.identifier_value)
             if data.label_value:
-                self._write_label_value(product.id, data.label_value)
+                self._write_label_value(product_id, data.label_value)
 
             db_commit_auto_rollback(db=self.db)
-            self.db.refresh(product)
-
-            # Refresh flat table
-            self.refresh_flat_rows([product.id])
+            self.refresh_flat_rows([product_id])
             db_commit_auto_rollback(db=self.db)
-
-            return self.db.query(PimEntityFlat).filter(PimEntityFlat.id == product.id).first()
+            return pim_sql.fetch_one(self.db, f'SELECT * FROM {self._flat} WHERE "id" = :id', {"id": product_id})
 
         except HTTPException:
             raise
         except Exception as e:
-            message = traceback.format_exc()
-            app_logger.exception(f"Unable to create product. Reason - {message}")
+            app_logger.exception(f"Unable to create product. Reason - {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Failed to create product: {str(e)}")
 
     # ------------------------------------------------------------------
-    # LIST PRODUCTS  (SCRUM-1573)
+    # LIST PRODUCTS
     # ------------------------------------------------------------------
-    # Sortable column mapping — uses flat table for fast reads
-    SORT_COLUMNS = {
-        'identifier': PimEntityFlat.identifier,
-        'label': PimEntityFlat.label,
-        'sku': PimEntityFlat.identifier,      # backward compat alias
-        'status': PimEntityFlat.status,
-        'entity_type_id': PimEntityFlat.entity_type_id,
-        'created_at': PimEntityFlat.created_at,
-        'updated_at': PimEntityFlat.updated_at,
+    _SORT_COLUMNS = {
+        'identifier': 'identifier', 'label': 'label', 'sku': 'identifier',
+        'status': 'status', 'entity_type_id': 'entity_type_id',
+        'created_at': 'created_at', 'updated_at': 'updated_at',
     }
 
     def list_products(self, page: int = 1, page_size: int = 20,
                       entity_type_id: str = None, status: str = None,
                       taxonomy_node_id: str = None, search: str = None,
-                      promoted: bool = None,
-                      sort_by: str = None, sort_dir: str = 'desc',
+                      promoted: bool = None, sort_by: str = None, sort_dir: str = 'desc',
                       completeness_min: float = None, completeness_max: float = None):
         try:
-            # Read from flat table for fast catalog list views
-            query = self.db.query(PimEntityFlat).filter(PimEntityFlat.active == True)
-
+            where = ['"active" = TRUE']
+            params = {}
             if not entity_type_id:
-                query = query.filter(PimEntityFlat.parent_id == None)
-
+                where.append('"parent_id" IS NULL')
             if entity_type_id:
-                query = query.filter(PimEntityFlat.entity_type_id == entity_type_id)
+                where.append('"entity_type_id" = :etype')
+                params["etype"] = entity_type_id
             if status:
                 statuses = [s.strip() for s in status.split(",")]
                 if len(statuses) == 1:
-                    query = query.filter(PimEntityFlat.status == statuses[0])
+                    where.append('"status" = :st')
+                    params["st"] = statuses[0]
                 else:
-                    query = query.filter(PimEntityFlat.status.in_(statuses))
+                    where.append('"status" = ANY(:sts)')
+                    params["sts"] = statuses
             if taxonomy_node_id:
-                node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == taxonomy_node_id).first()
+                node = pim_sql.fetch_one(self.db, f'SELECT "materialized_path" FROM {self._node} WHERE "id" = :id', {"id": taxonomy_node_id})
                 if node:
-                    descendant_ids = [
-                        n.id for n in self.db.query(PimTaxonomyNode.id)
-                        .filter(PimTaxonomyNode.materialized_path.like(f"{node.materialized_path}%"))
-                        .all()
-                    ]
-                    query = query.filter(PimEntityFlat.taxonomy_node_id.in_(descendant_ids))
+                    desc = pim_sql.fetch_all(
+                        self.db, f'SELECT "id" FROM {self._node} WHERE "materialized_path" LIKE :pat',
+                        {"pat": f"{node['materialized_path']}%"},
+                    )
+                    desc_ids = [d["id"] for d in desc]
+                    where.append('"taxonomy_node_id" = ANY(:tn)')
+                    params["tn"] = desc_ids
                 else:
-                    query = query.filter(PimEntityFlat.taxonomy_node_id == taxonomy_node_id)
+                    where.append('"taxonomy_node_id" = :tnid')
+                    params["tnid"] = taxonomy_node_id
             if promoted is not None:
-                query = query.filter(PimEntityFlat.promoted == promoted)
+                where.append('"promoted" = :promo')
+                params["promo"] = promoted
             if search:
-                query = query.filter(
-                    (PimEntityFlat.identifier.ilike(f"%{search}%")) |
-                    (PimEntityFlat.label.ilike(f"%{search}%"))
-                )
+                where.append('("identifier" ILIKE :srch OR "label" ILIKE :srch)')
+                params["srch"] = f"%{search}%"
 
-            # Apply sort
-            sort_col = self.SORT_COLUMNS.get(sort_by, PimEntityFlat.created_at)
-            order = sort_col.asc() if sort_dir == 'asc' else sort_col.desc()
+            where_sql = " AND ".join(where)
+            sort_col = self._SORT_COLUMNS.get(sort_by, 'created_at')
+            order_sql = f'"{sort_col}" {"ASC" if sort_dir == "asc" else "DESC"}'
 
-            # If completeness filter requested, compute for all matching products
             if completeness_min is not None or completeness_max is not None:
-                all_products = query.order_by(order).all()
-                completeness_map = self._batch_compute_completeness([p.id for p in all_products])
+                all_rows = pim_sql.fetch_all(self.db, f'SELECT * FROM {self._flat} WHERE {where_sql} ORDER BY {order_sql}', params)
+                completeness_map = self._batch_compute_completeness([p["id"] for p in all_rows])
                 filtered = []
-                for p in all_products:
-                    c = completeness_map.get(p.id, 100.0)
+                for p in all_rows:
+                    c = completeness_map.get(p["id"], 100.0)
                     if completeness_min is not None and c < completeness_min:
                         continue
                     if completeness_max is not None and c > completeness_max:
@@ -350,145 +361,93 @@ class PimEntityService:
                 total = len(filtered)
                 page_slice = filtered[(page - 1) * page_size: page * page_size]
                 products = [p for p, _ in page_slice]
-                pre_computed_completeness = {p.id: c for p, c in page_slice}
+                pre_computed = {p["id"]: c for p, c in page_slice}
             else:
-                total = query.count()
-                products = (
-                    query.order_by(order)
-                    .offset((page - 1) * page_size)
-                    .limit(page_size)
-                    .all()
+                total = pim_sql.fetch_scalar(self.db, f'SELECT COUNT(*) FROM {self._flat} WHERE {where_sql}', params) or 0
+                products = pim_sql.fetch_all(
+                    self.db,
+                    f'SELECT * FROM {self._flat} WHERE {where_sql} ORDER BY {order_sql} '
+                    f'LIMIT {int(page_size)} OFFSET {int((page - 1) * page_size)}',
+                    params,
                 )
-                pre_computed_completeness = None
+                pre_computed = None
 
             if not products:
                 return {"items": [], "total": total, "page": page, "page_size": page_size, "entity_types": []}
 
-            product_ids = [p.id for p in products]
+            product_ids = [p["id"] for p in products]
+            completeness_map = pre_computed if pre_computed is not None else self._batch_compute_completeness(product_ids)
 
-            # Batch compute completeness for the page if not already done
-            if pre_computed_completeness is None:
-                completeness_map = self._batch_compute_completeness(product_ids)
-            else:
-                completeness_map = pre_computed_completeness
-
-            # Enrich: batch-fetch List prices for display + price range across children
+            # Prices for display + child price range
             price_map = {}
             if product_ids:
-                list_prices = (
-                    self.db.query(PimValueNumber)
-                    .filter(PimValueNumber.product_id.in_(product_ids), PimValueNumber.price_type == "List")
-                    .all()
-                )
-                for lp in list_prices:
-                    price_map[lp.product_id] = {"list_price": float(lp.value), "currency": lp.currency or "USD"}
+                for lp in self._fetch_in(
+                    f'SELECT "product_id","value","currency" FROM {self._vt("NUMBER")} '
+                    f'WHERE "product_id" IN :ids AND "price_type" = :pt',
+                    "ids", product_ids, {"pt": "List"},
+                ):
+                    price_map[lp["product_id"]] = {"list_price": float(lp["value"]), "currency": lp["currency"] or "USD"}
 
-                child_prices = (
-                    self.db.query(
-                        PimEntity.parent_id,
-                        func.min(PimValueNumber.value).label("price_min"),
-                        func.max(PimValueNumber.value).label("price_max"),
-                    )
-                    .join(PimValueNumber, PimValueNumber.product_id == PimEntity.id)
-                    .filter(PimEntity.parent_id.in_(product_ids), PimEntity.active == True, PimValueNumber.price_type == "List")
-                    .group_by(PimEntity.parent_id)
-                    .all()
-                )
-                for cp in child_prices:
-                    if cp.parent_id in price_map:
-                        price_map[cp.parent_id]["price_min"] = float(cp.price_min) if cp.price_min else None
-                        price_map[cp.parent_id]["price_max"] = float(cp.price_max) if cp.price_max else None
-                    else:
-                        price_map[cp.parent_id] = {
-                            "list_price": None, "currency": "USD",
-                            "price_min": float(cp.price_min) if cp.price_min else None,
-                            "price_max": float(cp.price_max) if cp.price_max else None,
-                        }
+                for cp in self._fetch_in(
+                    f'SELECT e."parent_id" AS parent_id, MIN(n."value") AS price_min, MAX(n."value") AS price_max '
+                    f'FROM {self._entity} e JOIN {self._vt("NUMBER")} n ON n."product_id" = e."id" '
+                    f'WHERE e."parent_id" IN :ids AND e."active" = TRUE AND n."price_type" = :pt '
+                    f'GROUP BY e."parent_id"',
+                    "ids", product_ids, {"pt": "List"},
+                ):
+                    pm = price_map.setdefault(cp["parent_id"], {"list_price": None, "currency": "USD"})
+                    pm["price_min"] = float(cp["price_min"]) if cp["price_min"] else None
+                    pm["price_max"] = float(cp["price_max"]) if cp["price_max"] else None
 
-            # Build response — flat table already has identifier, label, category info, child count
             items = []
             for flat in products:
-                price_info = price_map.get(flat.id, {})
+                price_info = price_map.get(flat["id"], {})
                 items.append({
-                    "id": flat.id,
-                    "entity_type_id": flat.entity_type_id,
-                    "identifier": flat.identifier,
-                    "label": flat.label,
-                    "taxonomy_node_id": flat.taxonomy_node_id,
-                    "parent_id": flat.parent_id,
-                    "status": flat.status,
-                    "active": flat.active,
-                    "promoted": flat.promoted,
-                    "published_at": flat.published_at,
-                    "created_at": flat.created_at,
-                    "updated_at": flat.updated_at,
-                    "category_label": flat.category_label,
-                    "category_path": flat.category_path,
-                    "child_count": flat.child_count or 0,
-                    "completeness": completeness_map.get(flat.id, 100.0),
-                    "list_price": price_info.get("list_price"),
-                    "price_currency": price_info.get("currency"),
-                    "price_min": price_info.get("price_min"),
-                    "price_max": price_info.get("price_max"),
+                    "id": flat["id"], "entity_type_id": flat["entity_type_id"],
+                    "identifier": flat["identifier"], "label": flat["label"],
+                    "taxonomy_node_id": flat["taxonomy_node_id"], "parent_id": flat["parent_id"],
+                    "status": flat["status"], "active": flat["active"], "promoted": flat["promoted"],
+                    "published_at": flat["published_at"], "created_at": flat["created_at"],
+                    "updated_at": flat["updated_at"], "category_label": flat["category_label"],
+                    "category_path": flat["category_path"], "child_count": flat["child_count"] or 0,
+                    "completeness": completeness_map.get(flat["id"], 100.0),
+                    "list_price": price_info.get("list_price"), "price_currency": price_info.get("currency"),
+                    "price_min": price_info.get("price_min"), "price_max": price_info.get("price_max"),
                 })
 
             entity_types = [
-                row[0] for row in
-                self.db.query(PimEntityFlat.entity_type_id)
-                .filter(PimEntityFlat.active == True)
-                .distinct()
-                .all()
+                r["entity_type_id"] for r in pim_sql.fetch_all(
+                    self.db, f'SELECT DISTINCT "entity_type_id" FROM {self._flat} WHERE "active" = TRUE'
+                )
             ]
-
-            return {
-                "items": items, "total": total, "page": page, "page_size": page_size,
-                "entity_types": sorted(entity_types),
-            }
+            return {"items": items, "total": total, "page": page, "page_size": page_size, "entity_types": sorted(entity_types)}
 
         except Exception as e:
             app_logger.exception(f"Error listing products: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # GET PRODUCT DETAIL  (SCRUM-1573)
+    # GET PRODUCT DETAIL
     # ------------------------------------------------------------------
     def get_product(self, product_id: str):
         try:
-            product = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.id == product_id, PimEntity.active == True)
-                .first()
-            )
+            product = pim_sql.fetch_one(self.db, f'SELECT * FROM {self._entity} WHERE "id" = :id AND "active" = TRUE', {"id": product_id})
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found.")
-
-            # Build detail dict with children + completeness
-            children = (
-                self.db.query(PimEntityFlat)
-                .filter(PimEntityFlat.parent_id == product_id, PimEntityFlat.active == True)
-                .all()
+            children = pim_sql.fetch_all(
+                self.db, f'SELECT * FROM {self._flat} WHERE "parent_id" = :pid AND "active" = TRUE', {"pid": product_id}
             )
             completeness_info = self._compute_completeness(product_id)
-
-            id_val = self._get_identifier_value(product.id)
-            label_val = self._get_label_value(product.id)
             return {
-                "id": product.id,
-                "entity_type_id": product.entity_type_id,
-                "identifier": id_val,
-                "label": label_val,
-                "taxonomy_node_id": product.taxonomy_node_id,
-                "parent_id": product.parent_id,
-                "status": product.status,
-                "active": product.active,
-                "promoted": product.promoted,
-                "published_at": product.published_at,
-                "created_at": product.created_at,
-                "updated_at": product.updated_at,
-                "children": children,
+                "id": product["id"], "entity_type_id": product["entity_type_id"],
+                "identifier": self._get_identifier_value(product["id"]),
+                "label": self._get_label_value(product["id"]),
+                "taxonomy_node_id": product["taxonomy_node_id"], "parent_id": product["parent_id"],
+                "status": product["status"], "active": product["active"], "promoted": product["promoted"],
+                "published_at": product["published_at"], "created_at": product["created_at"],
+                "updated_at": product["updated_at"], "children": children,
                 "completeness": completeness_info["completeness"],
             }
-
         except HTTPException:
             raise
         except Exception as e:
@@ -496,87 +455,69 @@ class PimEntityService:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # UPDATE PRODUCT  (SCRUM-1573)
+    # UPDATE PRODUCT
     # ------------------------------------------------------------------
     def update_product(self, product_id: str, data: PimEntityUpdate):
         try:
-            product = self.db.query(PimEntity).filter(
-                PimEntity.id == product_id, PimEntity.active == True
-            ).first()
+            product = pim_sql.fetch_one(self.db, f'SELECT * FROM {self._entity} WHERE "id" = :id AND "active" = TRUE', {"id": product_id})
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found.")
+            old_taxonomy_node_id = product["taxonomy_node_id"]
 
-            old_taxonomy_node_id = product.taxonomy_node_id
-
+            set_values = {}
             if data.taxonomy_node_id is not None:
-                node = self.db.query(PimTaxonomyNode).filter(
-                    PimTaxonomyNode.id == data.taxonomy_node_id,
-                    PimTaxonomyNode.is_active == True,
-                ).first()
+                node = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._node} WHERE "id" = :id AND "is_active" = TRUE', {"id": data.taxonomy_node_id})
                 if not node:
                     raise HTTPException(status_code=404, detail="Taxonomy node not found.")
-                product.taxonomy_node_id = data.taxonomy_node_id
+                set_values["taxonomy_node_id"] = data.taxonomy_node_id
             if data.status is not None:
-                product.status = data.status
+                set_values["status"] = data.status
             if data.active is not None:
-                product.active = data.active
+                set_values["active"] = data.active
 
-            product.updated_at = datetime.utcnow()
-            db_commit_auto_rollback(db=self.db)
+            if set_values:
+                sql, params = pim_sql.build_update(self.entity_name, ENTITY_TBL, set_values, where='"id" = :id', where_params={"id": product_id})
+                pim_sql.execute(self.db, sql, params)
+                db_commit_auto_rollback(db=self.db)
 
-            # Handle category reassignment — delete orphaned values
             if data.taxonomy_node_id and data.taxonomy_node_id != old_taxonomy_node_id:
-                self._handle_category_reassignment(product, old_taxonomy_node_id, data.taxonomy_node_id)
+                self._handle_category_reassignment(product_id, old_taxonomy_node_id, data.taxonomy_node_id)
 
-            self.db.refresh(product)
-
-            # Refresh flat table
-            self.refresh_flat_rows([product.id])
+            self.refresh_flat_rows([product_id])
             db_commit_auto_rollback(db=self.db)
-
-            return self.db.query(PimEntityFlat).filter(PimEntityFlat.id == product.id).first()
+            return pim_sql.fetch_one(self.db, f'SELECT * FROM {self._flat} WHERE "id" = :id', {"id": product_id})
 
         except HTTPException:
             raise
         except Exception as e:
-            message = traceback.format_exc()
-            app_logger.exception(f"Unable to update product. Reason - {message}")
+            app_logger.exception(f"Unable to update product. Reason - {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Failed to update product: {str(e)}")
 
     # ------------------------------------------------------------------
-    # DELETE PRODUCT (soft-delete)  (SCRUM-1573)
+    # DELETE PRODUCT (soft)
     # ------------------------------------------------------------------
     def delete_product(self, product_id: str):
         try:
-            product = self.db.query(PimEntity).filter(
-                PimEntity.id == product_id, PimEntity.active == True
-            ).first()
+            product = pim_sql.fetch_one(self.db, f'SELECT * FROM {self._entity} WHERE "id" = :id AND "active" = TRUE', {"id": product_id})
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found.")
 
-            # Soft-delete product and all children (SKUs)
-            product.active = False
-            product.updated_at = datetime.utcnow()
-            children = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.parent_id == product_id, PimEntity.active == True)
-                .all()
-            )
-            for child in children:
-                child.active = False
-                child.updated_at = datetime.utcnow()
-
+            children = pim_sql.fetch_all(self.db, f'SELECT "id" FROM {self._entity} WHERE "parent_id" = :pid AND "active" = TRUE', {"pid": product_id})
+            now = pim_sql.utcnow()
+            pim_sql.execute(self.db, f'UPDATE {self._entity} SET "active" = FALSE, "updated_at" = :ts WHERE "id" = :id', {"ts": now, "id": product_id})
+            if children:
+                self._fetch_in(  # reuse expanding bind for the UPDATE
+                    f'UPDATE {self._entity} SET "active" = FALSE, "updated_at" = :ts WHERE "id" IN :ids RETURNING "id"',
+                    "ids", [c["id"] for c in children], {"ts": now},
+                )
             db_commit_auto_rollback(db=self.db)
 
-            # Refresh flat table for deleted entities
-            all_ids = [product.id] + [c.id for c in children]
+            all_ids = [product_id] + [c["id"] for c in children]
             self.refresh_flat_rows(all_ids)
             db_commit_auto_rollback(db=self.db)
 
-            identifier = self._get_identifier_value(product.id)
-            return {
-                "message": f"Product '{identifier or product.id}' and {len(children)} child items soft-deleted."
-            }
+            identifier = self._get_identifier_value(product_id)
+            return {"message": f"Product '{identifier or product_id}' and {len(children)} child items soft-deleted."}
 
         except HTTPException:
             raise
@@ -585,128 +526,63 @@ class PimEntityService:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # PUBLISH PRODUCTS  (SCRUM-1572)
+    # PUBLISH / UNPUBLISH
     # ------------------------------------------------------------------
+    def _set_promoted(self, product_ids, promoted: bool, verb: str):
+        if not product_ids:
+            raise HTTPException(status_code=400, detail="product_ids list must not be empty.")
+        products = self._fetch_in(
+            f'SELECT "id","parent_id" FROM {self._entity} WHERE "id" IN :ids AND "active" = TRUE',
+            "ids", product_ids,
+        )
+        found_ids = {str(p["id"]) for p in products}
+        missing = [pid for pid in product_ids if pid not in found_ids]
+        if missing:
+            raise HTTPException(status_code=404, detail=f"Products not found: {', '.join(missing)}")
+        child_products = [p for p in products if p["parent_id"] is not None]
+        if child_products:
+            child_ids = [self._get_identifier_value(p["id"]) or p["id"] for p in child_products]
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot {verb} child-level items directly. {verb.capitalize()} the parent product instead. Items: {', '.join(child_ids)}",
+            )
+        now = pim_sql.utcnow()
+        published_at = now if promoted else None
+        self._fetch_in(
+            f'UPDATE {self._entity} SET "promoted" = :pr, "published_at" = :pa, "updated_at" = :ts '
+            f'WHERE "id" IN :ids RETURNING "id"',
+            "ids", product_ids, {"pr": promoted, "pa": published_at, "ts": now},
+        )
+        children = self._fetch_in(
+            f'SELECT "id" FROM {self._entity} WHERE "parent_id" IN :ids AND "active" = TRUE',
+            "ids", product_ids,
+        )
+        child_ids = [c["id"] for c in children]
+        if child_ids:
+            self._fetch_in(
+                f'UPDATE {self._entity} SET "promoted" = :pr, "published_at" = :pa, "updated_at" = :ts '
+                f'WHERE "id" IN :ids RETURNING "id"',
+                "ids", child_ids, {"pr": promoted, "pa": published_at, "ts": now},
+            )
+        db_commit_auto_rollback(db=self.db)
+        self.refresh_flat_rows(product_ids + child_ids)
+        db_commit_auto_rollback(db=self.db)
+        return len(products) + len(child_ids)
+
     def publish_products(self, product_ids: list):
         try:
-            if not product_ids:
-                raise HTTPException(status_code=400, detail="product_ids list must not be empty.")
-
-            products = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.id.in_(product_ids), PimEntity.active == True)
-                .all()
-            )
-            found_ids = {str(p.id) for p in products}
-            missing = [pid for pid in product_ids if pid not in found_ids]
-            if missing:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Products not found: {', '.join(missing)}",
-                )
-
-            child_products = [p for p in products if p.parent_id is not None]
-            if child_products:
-                child_ids = [self._get_identifier_value(p.id) or p.id for p in child_products]
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot publish child-level items directly. Publish the parent product instead. Items: {', '.join(child_ids)}",
-                )
-
-            now = datetime.utcnow()
-            for p in products:
-                p.promoted = True
-                p.published_at = now
-                p.updated_at = now
-
-            # Cascade to children
-            children = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.parent_id.in_(product_ids), PimEntity.active == True)
-                .all()
-            )
-            for child in children:
-                child.promoted = True
-                child.published_at = now
-                child.updated_at = now
-
-            db_commit_auto_rollback(db=self.db)
-
-            # Refresh flat table
-            all_ids = product_ids + [c.id for c in children]
-            self.refresh_flat_rows(all_ids)
-            db_commit_auto_rollback(db=self.db)
-
-            total = len(products) + len(children)
-            return {
-                "message": f"{len(products)} product(s) published successfully.",
-                "published_count": total,
-            }
-
+            total = self._set_promoted(product_ids, True, "publish")
+            return {"message": f"{len(product_ids)} product(s) published successfully.", "published_count": total}
         except HTTPException:
             raise
         except Exception as e:
             app_logger.exception(f"Unable to publish products: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # ------------------------------------------------------------------
-    # UNPUBLISH PRODUCTS  (SCRUM-1572)
-    # ------------------------------------------------------------------
     def unpublish_products(self, product_ids: list):
         try:
-            if not product_ids:
-                raise HTTPException(status_code=400, detail="product_ids list must not be empty.")
-
-            products = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.id.in_(product_ids), PimEntity.active == True)
-                .all()
-            )
-            found_ids = {str(p.id) for p in products}
-            missing = [pid for pid in product_ids if pid not in found_ids]
-            if missing:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Products not found: {', '.join(missing)}",
-                )
-
-            child_products = [p for p in products if p.parent_id is not None]
-            if child_products:
-                child_ids = [self._get_identifier_value(p.id) or p.id for p in child_products]
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot unpublish child-level items directly. Unpublish the parent product instead. Items: {', '.join(child_ids)}",
-                )
-
-            now = datetime.utcnow()
-            for p in products:
-                p.promoted = False
-                p.published_at = None
-                p.updated_at = now
-
-            # Cascade to children
-            children = (
-                self.db.query(PimEntity)
-                .filter(PimEntity.parent_id.in_(product_ids), PimEntity.active == True)
-                .all()
-            )
-            for child in children:
-                child.promoted = False
-                child.published_at = None
-                child.updated_at = now
-
-            db_commit_auto_rollback(db=self.db)
-
-            # Refresh flat table
-            all_ids = product_ids + [c.id for c in children]
-            self.refresh_flat_rows(all_ids)
-            db_commit_auto_rollback(db=self.db)
-            total = len(products) + len(children)
-            return {
-                "message": f"{len(products)} product(s) unpublished.",
-                "unpublished_count": total,
-            }
-
+            total = self._set_promoted(product_ids, False, "unpublish")
+            return {"message": f"{len(product_ids)} product(s) unpublished.", "unpublished_count": total}
         except HTTPException:
             raise
         except Exception as e:
@@ -714,152 +590,109 @@ class PimEntityService:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # CREATE CHILD (add a child product under a parent — supports N-tier)  (SCRUM-1574)
+    # ITEMS (child products)
     # ------------------------------------------------------------------
     def create_item(self, parent_id: str, data: PimEntityCreate):
         try:
-            parent = self.db.query(PimEntity).filter(
-                PimEntity.id == parent_id, PimEntity.active == True
-            ).first()
+            parent = pim_sql.fetch_one(
+                self.db, f'SELECT "entity_type_id","taxonomy_node_id" FROM {self._entity} WHERE "id" = :id AND "active" = TRUE',
+                {"id": parent_id},
+            )
             if not parent:
                 raise HTTPException(status_code=404, detail="Parent product not found.")
-
-            # Validate parent tier can have children
-            from lakefusion_utility.models.pim import PimEntityTier
-            parent_tier = self.db.query(PimEntityTier).filter(
-                PimEntityTier.code == parent.entity_type_id
-            ).first()
-            if parent_tier and parent_tier.is_leaf:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Cannot add children under a {parent_tier.label} (leaf tier).",
+            parent_tier = pim_sql.fetch_one(
+                self.db, f'SELECT "id","label","is_leaf" FROM {self._tier} WHERE "code" = :c', {"c": parent["entity_type_id"]}
+            )
+            if parent_tier and parent_tier["is_leaf"]:
+                raise HTTPException(status_code=400, detail=f"Cannot add children under a {parent_tier['label']} (leaf tier).")
+            child_tier = None
+            if parent_tier:
+                child_tier = pim_sql.fetch_one(
+                    self.db, f'SELECT "code" FROM {self._tier} WHERE "parent_tier_id" = :pid', {"pid": parent_tier["id"]}
                 )
-
-            # Determine child tier — next level down from parent
-            child_tier = self.db.query(PimEntityTier).filter(
-                PimEntityTier.parent_tier_id == parent_tier.id
-            ).first() if parent_tier else None
-            # Validate unique identifier
             if data.identifier_value:
                 self._check_identifier_unique(data.identifier_value)
 
-            item = PimEntity(
-                entity_type_id=child_tier.code if child_tier else data.entity_type_id,
-                taxonomy_node_id=parent.taxonomy_node_id,
-                parent_id=parent_id,
-                status=data.status or 'Active',
-                active=data.active if data.active is not None else True,
+            sql, params = pim_sql.build_insert(
+                self.entity_name, ENTITY_TBL,
+                {"entity_type_id": child_tier["code"] if child_tier else data.entity_type_id,
+                 "taxonomy_node_id": parent["taxonomy_node_id"], "parent_id": parent_id,
+                 "status": data.status or 'Active',
+                 "active": data.active if data.active is not None else True, "promoted": False},
             )
-            self.db.add(item)
-            self.db.flush()
-
-            # Write identifier and label as EAV values
+            pim_sql.execute(self.db, sql, params)
+            item_id = params["id"]
             if data.identifier_value:
-                self._write_identifier_value(item.id, data.identifier_value)
+                self._write_identifier_value(item_id, data.identifier_value)
             if data.label_value:
-                self._write_label_value(item.id, data.label_value)
-
+                self._write_label_value(item_id, data.label_value)
             db_commit_auto_rollback(db=self.db)
-            self.db.refresh(item)
-
-            # Refresh flat table for item and parent (parent child_count changes)
-            self.refresh_flat_rows([item.id, parent_id])
+            self.refresh_flat_rows([item_id, parent_id])
             db_commit_auto_rollback(db=self.db)
-
-            return self.db.query(PimEntityFlat).filter(PimEntityFlat.id == item.id).first()
+            return pim_sql.fetch_one(self.db, f'SELECT * FROM {self._flat} WHERE "id" = :id', {"id": item_id})
 
         except HTTPException:
             raise
         except Exception as e:
-            message = traceback.format_exc()
-            app_logger.exception(f"Unable to create item. Reason - {message}")
+            app_logger.exception(f"Unable to create item. Reason - {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Failed to create item: {str(e)}")
 
-    # ------------------------------------------------------------------
-    # LIST ITEMS  (SCRUM-1574)
-    # ------------------------------------------------------------------
     def list_items(self, parent_id: str):
         try:
-            parent = self.db.query(PimEntity).filter(
-                PimEntity.id == parent_id, PimEntity.active == True
-            ).first()
+            parent = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._entity} WHERE "id" = :id AND "active" = TRUE', {"id": parent_id})
             if not parent:
                 raise HTTPException(status_code=404, detail="Parent product not found.")
-
-            items = (
-                self.db.query(PimEntityFlat)
-                .filter(PimEntityFlat.parent_id == parent_id, PimEntityFlat.active == True)
-                .order_by(PimEntityFlat.created_at.desc())
-                .all()
+            return pim_sql.fetch_all(
+                self.db, f'SELECT * FROM {self._flat} WHERE "parent_id" = :pid AND "active" = TRUE ORDER BY "created_at" DESC',
+                {"pid": parent_id},
             )
-            return items
-
         except HTTPException:
             raise
         except Exception as e:
             app_logger.exception(f"Error listing items: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # ------------------------------------------------------------------
-    # UPDATE ITEM  (SCRUM-1574)
-    # ------------------------------------------------------------------
     def update_item(self, parent_id: str, item_id: str, data: PimEntityUpdate):
         try:
-            item = self.db.query(PimEntity).filter(
-                PimEntity.id == item_id,
-                PimEntity.parent_id == parent_id,
-                PimEntity.active == True,
-            ).first()
+            item = pim_sql.fetch_one(
+                self.db, f'SELECT "id" FROM {self._entity} WHERE "id" = :id AND "parent_id" = :pid AND "active" = TRUE',
+                {"id": item_id, "pid": parent_id},
+            )
             if not item:
                 raise HTTPException(status_code=404, detail="Item not found under this parent.")
-
+            set_values = {}
             if data.status is not None:
-                item.status = data.status
+                set_values["status"] = data.status
             if data.active is not None:
-                item.active = data.active
-            # taxonomy_node_id for items is inherited from parent — ignore if passed
-
-            item.updated_at = datetime.utcnow()
+                set_values["active"] = data.active
+            if set_values:
+                sql, params = pim_sql.build_update(self.entity_name, ENTITY_TBL, set_values, where='"id" = :id', where_params={"id": item_id})
+                pim_sql.execute(self.db, sql, params)
+                db_commit_auto_rollback(db=self.db)
+            self.refresh_flat_rows([item_id])
             db_commit_auto_rollback(db=self.db)
-            self.db.refresh(item)
-
-            # Refresh flat table
-            self.refresh_flat_rows([item.id])
-            db_commit_auto_rollback(db=self.db)
-
-            return self.db.query(PimEntityFlat).filter(PimEntityFlat.id == item.id).first()
+            return pim_sql.fetch_one(self.db, f'SELECT * FROM {self._flat} WHERE "id" = :id', {"id": item_id})
 
         except HTTPException:
             raise
         except Exception as e:
-            message = traceback.format_exc()
-            app_logger.exception(f"Unable to update item. Reason - {message}")
+            app_logger.exception(f"Unable to update item. Reason - {traceback.format_exc()}")
             raise HTTPException(status_code=500, detail=f"Failed to update item: {str(e)}")
 
-    # ------------------------------------------------------------------
-    # DELETE ITEM  (SCRUM-1574)
-    # ------------------------------------------------------------------
     def delete_item(self, parent_id: str, item_id: str):
         try:
-            item = self.db.query(PimEntity).filter(
-                PimEntity.id == item_id,
-                PimEntity.parent_id == parent_id,
-                PimEntity.active == True,
-            ).first()
+            item = pim_sql.fetch_one(
+                self.db, f'SELECT "id" FROM {self._entity} WHERE "id" = :id AND "parent_id" = :pid AND "active" = TRUE',
+                {"id": item_id, "pid": parent_id},
+            )
             if not item:
                 raise HTTPException(status_code=404, detail="Item not found under this parent.")
-
-            item.active = False
-            item.updated_at = datetime.utcnow()
+            pim_sql.execute(self.db, f'UPDATE {self._entity} SET "active" = FALSE, "updated_at" = :ts WHERE "id" = :id', {"ts": pim_sql.utcnow(), "id": item_id})
             db_commit_auto_rollback(db=self.db)
-
-            # Refresh flat table for item and parent (parent child_count changes)
-            self.refresh_flat_rows([item.id, parent_id])
+            self.refresh_flat_rows([item_id, parent_id])
             db_commit_auto_rollback(db=self.db)
-
-            identifier = self._get_identifier_value(item.id)
-            return {"message": f"Item '{identifier or item.id}' soft-deleted."}
-
+            identifier = self._get_identifier_value(item_id)
+            return {"message": f"Item '{identifier or item_id}' soft-deleted."}
         except HTTPException:
             raise
         except Exception as e:
@@ -867,18 +700,14 @@ class PimEntityService:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # COMPLETENESS  (SCRUM-1569)
+    # COMPLETENESS
     # ------------------------------------------------------------------
     def compute_completeness(self, product_id: str):
         try:
-            product = self.db.query(PimEntity).filter(
-                PimEntity.id == product_id, PimEntity.active == True
-            ).first()
+            product = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._entity} WHERE "id" = :id AND "active" = TRUE', {"id": product_id})
             if not product:
                 raise HTTPException(status_code=404, detail="Product not found.")
-
             return self._compute_completeness(product_id)
-
         except HTTPException:
             raise
         except Exception as e:
@@ -886,160 +715,102 @@ class PimEntityService:
             raise HTTPException(status_code=500, detail=str(e))
 
     def _compute_completeness(self, product_id: str):
-        """Compute completeness as % of required attributes that have values."""
-        # Get product's taxonomy node
-        product = self.db.query(PimEntity).filter(PimEntity.id == product_id).first()
+        product = pim_sql.fetch_one(self.db, f'SELECT "taxonomy_node_id","entity_type_id" FROM {self._entity} WHERE "id" = :id', {"id": product_id})
         if not product:
             return {"completeness": 0.0, "total_required": 0, "filled": 0, "missing": []}
 
-        # Get all required attributes from resolved config, filtered by level
-        required_configs = (
-            self.db.query(PimResolvedSpecification, PimAttributeDefinition.level)
-            .join(PimAttributeDefinition, PimResolvedSpecification.attribute_id == PimAttributeDefinition.id)
-            .filter(
-                PimResolvedSpecification.taxonomy_node_id == product.taxonomy_node_id,
-                PimResolvedSpecification.is_required == True,
-            )
-            .all()
+        required_rows = pim_sql.fetch_all(
+            self.db,
+            f'SELECT r."attribute_id" AS attribute_id, c."level_override" AS level_override, a."level" AS level '
+            f'FROM {self._resolved} r '
+            f'JOIN {self._attr} a ON r."attribute_id" = a."id" '
+            f'LEFT JOIN {self._config} c ON r."config_id" = c."id" '
+            f'WHERE r."taxonomy_node_id" = :nid AND r."is_required" = TRUE',
+            {"nid": product["taxonomy_node_id"]},
         )
+        required_attrs = set()
+        for row in required_rows:
+            effective_level = (row["level_override"] or row["level"]) or "ALL"
+            if effective_level == "ALL" or effective_level == product["entity_type_id"]:
+                required_attrs.add(str(row["attribute_id"]))
 
-        # Also check level_override from the config
-        required_attrs = []
-        for rac, attr_level in required_configs:
-            config = self.db.query(PimSpecificationConfig).filter(
-                PimSpecificationConfig.id == rac.config_id
-            ).first()
-            effective_level = (config.level_override if config and config.level_override else attr_level) or "ALL"
-            # Only include if level matches product's tier or is ALL
-            if effective_level == "ALL" or effective_level == product.entity_type_id:
-                required_attrs.append(rac)
-
-        # Also include global attributes that are required (scope=global)
-        global_required = (
-            self.db.query(PimAttributeDefinition)
-            .filter(
-                PimAttributeDefinition.scope == "general",
-                PimAttributeDefinition.is_system == True,
+        global_required_ids = {
+            str(a["id"]) for a in pim_sql.fetch_all(
+                self.db, f'SELECT "id" FROM {self._attr} WHERE "scope" = \'general\' AND "is_system" = TRUE'
             )
-            .all()
-        )
-        global_required_ids = {a.id for a in global_required}
-
-        if not required_attrs and not global_required_ids:
+        }
+        required_attr_ids = required_attrs | global_required_ids
+        if not required_attr_ids:
             return {"completeness": 100.0, "total_required": 0, "filled": 0, "missing": []}
 
-        required_attr_ids = {r.attribute_id for r in required_attrs} | global_required_ids
-
-        # Collect filled attribute_ids from all 6 value tables using UNION ALL
         filled_attr_ids = set()
-        for ValueTable in VALUE_TABLES:
-            rows = (
-                self.db.query(ValueTable.attribute_id)
-                .filter(ValueTable.product_id == product_id)
-                .all()
-            )
-            filled_attr_ids.update(r[0] for r in rows)
+        for vt in VALUE_TABLES:
+            for r in pim_sql.fetch_all(self.db, f'SELECT DISTINCT "attribute_id" FROM {self._t(vt)} WHERE "product_id" = :pid', {"pid": product_id}):
+                filled_attr_ids.add(str(r["attribute_id"]))
 
         filled_required = required_attr_ids & filled_attr_ids
         missing = list(required_attr_ids - filled_attr_ids)
         total = len(required_attr_ids)
         filled = len(filled_required)
         completeness = round((filled / total) * 100, 2) if total > 0 else 100.0
-
-        return {
-            "completeness": completeness,
-            "total_required": total,
-            "filled": filled,
-            "missing": missing,
-        }
+        return {"completeness": completeness, "total_required": total, "filled": filled, "missing": missing}
 
     def _batch_compute_completeness(self, product_ids: list) -> dict:
-        """Batch compute completeness for multiple products. Returns {product_id: percentage}.
-        Filters required attributes by tier level (matching single-product completeness logic)."""
         if not product_ids:
             return {}
-
-        # Get all products with their taxonomy nodes and entity_type_id
-        products = (
-            self.db.query(PimEntity.id, PimEntity.taxonomy_node_id, PimEntity.entity_type_id)
-            .filter(PimEntity.id.in_(product_ids))
-            .all()
+        products = self._fetch_in(
+            f'SELECT "id","taxonomy_node_id","entity_type_id" FROM {self._entity} WHERE "id" IN :ids',
+            "ids", product_ids,
         )
-        product_node_map = {p.id: p.taxonomy_node_id for p in products}
-        product_tier_map = {p.id: p.entity_type_id for p in products}
+        product_node_map = {p["id"]: p["taxonomy_node_id"] for p in products}
+        product_tier_map = {p["id"]: p["entity_type_id"] for p in products}
 
-        # Get distinct taxonomy nodes and batch-fetch required attrs with level info
-        node_ids = list(set(nid for nid in product_node_map.values() if nid))
-        # node_id -> list of (attribute_id, effective_level)
+        node_ids = list({nid for nid in product_node_map.values() if nid})
         node_required_attrs = {}
         if node_ids:
-            required_rows = (
-                self.db.query(
-                    PimResolvedSpecification.taxonomy_node_id,
-                    PimResolvedSpecification.attribute_id,
-                    PimSpecificationConfig.level_override,
-                    PimAttributeDefinition.level,
-                )
-                .join(PimSpecificationConfig, PimResolvedSpecification.config_id == PimSpecificationConfig.id)
-                .join(PimAttributeDefinition, PimResolvedSpecification.attribute_id == PimAttributeDefinition.id)
-                .filter(
-                    PimResolvedSpecification.taxonomy_node_id.in_(node_ids),
-                    PimResolvedSpecification.is_required == True,
-                )
-                .all()
+            required_rows = self._fetch_in(
+                f'SELECT r."taxonomy_node_id" AS taxonomy_node_id, r."attribute_id" AS attribute_id, '
+                f'c."level_override" AS level_override, a."level" AS level '
+                f'FROM {self._resolved} r '
+                f'JOIN {self._attr} a ON r."attribute_id" = a."id" '
+                f'LEFT JOIN {self._config} c ON r."config_id" = c."id" '
+                f'WHERE r."taxonomy_node_id" IN :ids AND r."is_required" = TRUE',
+                "ids", node_ids,
             )
             for row in required_rows:
-                effective_level = (row.level_override if row.level_override else row.level) or "ALL"
-                node_required_attrs.setdefault(row.taxonomy_node_id, []).append(
-                    (row.attribute_id, effective_level)
-                )
+                effective_level = (row["level_override"] or row["level"]) or "ALL"
+                node_required_attrs.setdefault(row["taxonomy_node_id"], []).append((row["attribute_id"], effective_level))
 
-        # Also include global system attributes (same as single-product method)
-        global_system_attrs = (
-            self.db.query(PimAttributeDefinition.id, PimAttributeDefinition.level)
-            .filter(
-                PimAttributeDefinition.scope == "general",
-                PimAttributeDefinition.is_system == True,
-            )
-            .all()
+        global_system_attrs = pim_sql.fetch_all(
+            self.db, f'SELECT "id","level" FROM {self._attr} WHERE "scope" = \'general\' AND "is_system" = TRUE'
         )
 
-        # Batch-fetch all filled attribute_ids per product across all value tables
         product_filled_map = {pid: set() for pid in product_ids}
-        for ValueTable in VALUE_TABLES:
-            rows = (
-                self.db.query(ValueTable.product_id, ValueTable.attribute_id)
-                .filter(ValueTable.product_id.in_(product_ids))
-                .all()
-            )
-            for row in rows:
-                if row.product_id in product_filled_map:
-                    product_filled_map[row.product_id].add(row.attribute_id)
+        for vt in VALUE_TABLES:
+            for row in self._fetch_in(
+                f'SELECT "product_id","attribute_id" FROM {self._t(vt)} WHERE "product_id" IN :ids',
+                "ids", product_ids,
+            ):
+                if row["product_id"] in product_filled_map:
+                    product_filled_map[row["product_id"]].add(row["attribute_id"])
 
-        # Helper: check if a level matches a tier
         def level_matches(level_str, tier_code):
             if not level_str or level_str == "ALL":
                 return True
             return tier_code in [l.strip() for l in level_str.split(",")]
 
-        # Compute completeness per product (tier-filtered)
         result = {}
         for pid in product_ids:
             node_id = product_node_map.get(pid)
             tier = product_tier_map.get(pid, "PRODUCT")
-
-            # Filter spec required attrs by tier
             required = set()
             if node_id and node_id in node_required_attrs:
                 for attr_id, eff_level in node_required_attrs[node_id]:
                     if level_matches(eff_level, tier):
                         required.add(attr_id)
-
-            # Add global system attrs matching this tier
             for ga in global_system_attrs:
-                if level_matches(ga.level, tier):
-                    required.add(ga.id)
-
+                if level_matches(ga["level"], tier):
+                    required.add(ga["id"])
             if not required:
                 result[pid] = 100.0
             else:
@@ -1048,87 +819,42 @@ class PimEntityService:
         return result
 
     # ------------------------------------------------------------------
-    # DASHBOARD STATS  (SCRUM-1585)
+    # DASHBOARD / HEALTH / EXPORT
     # ------------------------------------------------------------------
     def get_dashboard_stats(self):
-        """Return summary stats for dashboard highlights."""
         try:
-            total_products = (
-                self.db.query(func.count(PimEntity.id))
-                .filter(PimEntity.active == True, PimEntity.parent_id == None)
-                .scalar() or 0
-            )
-
-            total_items = (
-                self.db.query(func.count(PimEntity.id))
-                .filter(PimEntity.active == True, PimEntity.parent_id != None)
-                .scalar() or 0
-            )
-
-            # Products with completeness < 100%
-            all_pids = [
-                r[0] for r in
-                self.db.query(PimEntity.id)
-                .filter(PimEntity.active == True, PimEntity.parent_id == None)
-                .all()
-            ]
+            total_products = pim_sql.fetch_scalar(self.db, f'SELECT COUNT("id") FROM {self._entity} WHERE "active" = TRUE AND "parent_id" IS NULL') or 0
+            total_items = pim_sql.fetch_scalar(self.db, f'SELECT COUNT("id") FROM {self._entity} WHERE "active" = TRUE AND "parent_id" IS NOT NULL') or 0
+            all_pids = [r["id"] for r in pim_sql.fetch_all(self.db, f'SELECT "id" FROM {self._entity} WHERE "active" = TRUE AND "parent_id" IS NULL')]
             completeness_map = self._batch_compute_completeness(all_pids) if all_pids else {}
             incomplete_count = sum(1 for c in completeness_map.values() if c < 100)
-
-            # Status breakdown
-            status_rows = (
-                self.db.query(PimEntity.status, func.count(PimEntity.id))
-                .filter(PimEntity.active == True, PimEntity.parent_id == None)
-                .group_by(PimEntity.status)
-                .all()
-            )
-            status_breakdown = {r[0]: r[1] for r in status_rows}
-
-            # Published count
-            published_count = (
-                self.db.query(func.count(PimEntity.id))
-                .filter(PimEntity.active == True, PimEntity.promoted == True, PimEntity.parent_id == None)
-                .scalar() or 0
-            )
-
+            status_rows = pim_sql.fetch_all(self.db, f'SELECT "status", COUNT("id") AS cnt FROM {self._entity} WHERE "active" = TRUE AND "parent_id" IS NULL GROUP BY "status"')
+            status_breakdown = {r["status"]: r["cnt"] for r in status_rows}
+            published_count = pim_sql.fetch_scalar(self.db, f'SELECT COUNT("id") FROM {self._entity} WHERE "active" = TRUE AND "promoted" = TRUE AND "parent_id" IS NULL') or 0
             return {
-                "total_products": total_products,
-                "total_items": total_items,
-                "incomplete_products": incomplete_count,
-                "published_products": published_count,
+                "total_products": total_products, "total_items": total_items,
+                "incomplete_products": incomplete_count, "published_products": published_count,
                 "status_breakdown": status_breakdown,
             }
-
         except Exception as e:
             app_logger.exception(f"Error computing dashboard stats: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # ------------------------------------------------------------------
-    # CATEGORY HEALTH DASHBOARD  (SCRUM-1563)
-    # ------------------------------------------------------------------
     def get_category_health(self):
-        """Return per-category aggregate completeness for dashboard."""
         try:
-            # Get all active taxonomy nodes
-            nodes = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.is_active == True).all()
+            nodes = pim_sql.fetch_all(self.db, f'SELECT * FROM {self._node} WHERE "is_active" = TRUE')
             if not nodes:
                 return {"categories": []}
-
-            # Get all active products grouped by taxonomy_node_id
-            products = self.db.query(PimEntity).filter(PimEntity.active == True).all()
+            products = pim_sql.fetch_all(self.db, f'SELECT "id","taxonomy_node_id" FROM {self._entity} WHERE "active" = TRUE')
             node_products = {}
             for p in products:
-                if p.taxonomy_node_id:
-                    node_products.setdefault(p.taxonomy_node_id, []).append(p.id)
-
-            # Batch compute completeness for all products
-            all_product_ids = [p.id for p in products]
+                if p["taxonomy_node_id"]:
+                    node_products.setdefault(p["taxonomy_node_id"], []).append(p["id"])
+            all_product_ids = [p["id"] for p in products]
             completeness_map = self._batch_compute_completeness(all_product_ids) if all_product_ids else {}
-
-            # Aggregate per category
             categories = []
             for node in nodes:
-                pids = node_products.get(node.id, [])
+                pids = node_products.get(node["id"], [])
                 if not pids:
                     avg_completeness = None
                     product_count = 0
@@ -1136,484 +862,257 @@ class PimEntityService:
                     product_count = len(pids)
                     total_c = sum(completeness_map.get(pid, 100.0) for pid in pids)
                     avg_completeness = round(total_c / product_count, 2)
-
                 categories.append({
-                    "node_id": node.id,
-                    "label": node.label,
-                    "code": node.code,
-                    "level": node.level,
-                    "materialized_path": node.materialized_path,
-                    "product_count": product_count,
-                    "avg_completeness": avg_completeness,
+                    "node_id": node["id"], "label": node["label"], "code": node["code"],
+                    "level": node["level"], "materialized_path": node["materialized_path"],
+                    "product_count": product_count, "avg_completeness": avg_completeness,
                 })
-
-            # Sort by completeness ascending (lowest first for triage)
             categories.sort(key=lambda c: (c["avg_completeness"] is None, c["avg_completeness"] or 0))
             return {"categories": categories}
-
         except Exception as e:
             app_logger.exception(f"Error computing category health: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # ------------------------------------------------------------------
-    # CSV EXPORT  (SCRUM-1585)
-    # ------------------------------------------------------------------
-    def export_products_csv(self, entity_type_id: str = None, status: str = None,
-                            taxonomy_node_id: str = None):
-        """Export products as a list of flat dicts suitable for CSV conversion."""
+    def export_products_csv(self, entity_type_id: str = None, status: str = None, taxonomy_node_id: str = None):
         try:
-            query = self.db.query(PimEntityFlat).filter(PimEntityFlat.active == True)
+            where = ['"active" = TRUE']
+            params = {}
             if entity_type_id:
-                query = query.filter(PimEntityFlat.entity_type_id == entity_type_id)
+                where.append('"entity_type_id" = :etype')
+                params["etype"] = entity_type_id
             if status:
                 statuses = [s.strip() for s in status.split(",")]
                 if len(statuses) == 1:
-                    query = query.filter(PimEntityFlat.status == statuses[0])
+                    where.append('"status" = :st')
+                    params["st"] = statuses[0]
                 else:
-                    query = query.filter(PimEntityFlat.status.in_(statuses))
+                    where.append('"status" = ANY(:sts)')
+                    params["sts"] = statuses
             if taxonomy_node_id:
-                node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == taxonomy_node_id).first()
+                node = pim_sql.fetch_one(self.db, f'SELECT "materialized_path" FROM {self._node} WHERE "id" = :id', {"id": taxonomy_node_id})
                 if node:
-                    descendant_ids = [
-                        n.id for n in self.db.query(PimTaxonomyNode.id)
-                        .filter(PimTaxonomyNode.materialized_path.like(f"{node.materialized_path}%"))
-                        .all()
-                    ]
-                    query = query.filter(PimEntityFlat.taxonomy_node_id.in_(descendant_ids))
-
-            products = query.order_by(PimEntityFlat.created_at.desc()).all()
+                    desc = pim_sql.fetch_all(self.db, f'SELECT "id" FROM {self._node} WHERE "materialized_path" LIKE :pat', {"pat": f"{node['materialized_path']}%"})
+                    where.append('"taxonomy_node_id" = ANY(:tn)')
+                    params["tn"] = [d["id"] for d in desc]
+            products = pim_sql.fetch_all(self.db, f'SELECT * FROM {self._flat} WHERE {" AND ".join(where)} ORDER BY "created_at" DESC', params)
             if not products:
                 return {"rows": [], "columns": []}
-
-            product_ids = [p.id for p in products]
-            completeness_map = self._batch_compute_completeness(product_ids)
-
+            completeness_map = self._batch_compute_completeness([p["id"] for p in products])
             rows = []
             for p in products:
                 rows.append({
-                    "identifier": p.identifier or "",
-                    "label": p.label or "",
-                    "entity_type_id": p.entity_type_id,
-                    "status": p.status,
-                    "category": p.category_label or "",
-                    "category_path": p.category_path or "",
-                    "completeness": completeness_map.get(p.id, 100.0),
-                    "promoted": p.promoted,
-                    "published_at": str(p.published_at) if p.published_at else "",
-                    "created_at": str(p.created_at) if p.created_at else "",
+                    "identifier": p["identifier"] or "", "label": p["label"] or "",
+                    "entity_type_id": p["entity_type_id"], "status": p["status"],
+                    "category": p["category_label"] or "", "category_path": p["category_path"] or "",
+                    "completeness": completeness_map.get(p["id"], 100.0), "promoted": p["promoted"],
+                    "published_at": str(p["published_at"]) if p["published_at"] else "",
+                    "created_at": str(p["created_at"]) if p["created_at"] else "",
                 })
-
             columns = list(rows[0].keys()) if rows else []
             return {"rows": rows, "columns": columns, "total": len(rows)}
-
         except Exception as e:
             app_logger.exception(f"Error exporting products: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # CATEGORY REASSIGNMENT HELPER  (SCRUM-1573)
+    # CATEGORY REASSIGNMENT HELPER
     # ------------------------------------------------------------------
-    def _handle_category_reassignment(self, product, old_node_id: str, new_node_id: str):
-        """Delete attribute values that are no longer valid after category change."""
+    def _handle_category_reassignment(self, product_id: str, old_node_id: str, new_node_id: str):
         try:
-            # Get attribute IDs valid in the new category
             new_valid_attrs = {
-                r.attribute_id
-                for r in self.db.query(PimResolvedSpecification)
-                .filter(PimResolvedSpecification.taxonomy_node_id == new_node_id)
-                .all()
+                r["attribute_id"] for r in pim_sql.fetch_all(
+                    self.db, f'SELECT "attribute_id" FROM {self._resolved} WHERE "taxonomy_node_id" = :nid', {"nid": new_node_id}
+                )
             }
-
-            # Also preserve global attribute values (scope=global applies to all categories)
             global_attr_ids = {
-                a.id for a in self.db.query(PimAttributeDefinition.id)
-                .filter(PimAttributeDefinition.scope == "general")
-                .all()
+                a["id"] for a in pim_sql.fetch_all(self.db, f'SELECT "id" FROM {self._attr} WHERE "scope" = \'general\'')
             }
             new_valid_attrs |= global_attr_ids
-
-            # Delete values whose attribute_id is NOT in the new category
-            for ValueTable in VALUE_TABLES:
-                orphaned = (
-                    self.db.query(ValueTable)
-                    .filter(
-                        ValueTable.product_id == product.id,
-                        ~ValueTable.attribute_id.in_(new_valid_attrs) if new_valid_attrs else True,
+            for vt in VALUE_TABLES:
+                if new_valid_attrs:
+                    self._fetch_in(
+                        f'DELETE FROM {self._t(vt)} WHERE "product_id" = :pid AND "attribute_id" NOT IN :ids RETURNING "id"',
+                        "ids", list(new_valid_attrs), {"pid": product_id},
                     )
-                    .all()
-                )
-                for row in orphaned:
-                    self.db.delete(row)
-
+                else:
+                    pim_sql.execute(self.db, f'DELETE FROM {self._t(vt)} WHERE "product_id" = :pid', {"pid": product_id})
             db_commit_auto_rollback(db=self.db)
-            app_logger.info(
-                f"Category reassignment: cleaned orphaned values for product {product.id} "
-                f"(old_node={old_node_id} → new_node={new_node_id})"
-            )
-
+            app_logger.info(f"Category reassignment: cleaned orphaned values for product {product_id} (old={old_node_id} -> new={new_node_id})")
         except Exception as e:
             app_logger.exception(f"Error during category reassignment cleanup: {str(e)}")
 
     # ------------------------------------------------------------------
     # BULK IMPORT HIERARCHY  (SCRUM-1790)
     # ------------------------------------------------------------------
-    def bulk_import_hierarchy(self, data: PimBulkImportRequest):
-        """
-        Bulk import a full N-tier product hierarchy in a single transaction.
-        Receives pre-mapped nodes from the frontend and inserts them directly
-        using bulk operations — no per-record HTTP overhead.
-        """
-        import uuid
-        from datetime import datetime
+    def _flag_attr(self, attr_id, field):
+        """Set is_identifier / is_label on an attribute by id; refresh the cache."""
+        pim_sql.execute(
+            self.db, f'UPDATE {self._attr} SET "{field}" = TRUE, "updated_at" = :ts WHERE "id" = :id',
+            {"ts": pim_sql.utcnow(), "id": attr_id},
+        )
+        row = pim_sql.fetch_one(self.db, f'SELECT * FROM {self._attr} WHERE "id" = :id', {"id": attr_id})
+        if field == "is_identifier":
+            self._identifier_attr = row
+        else:
+            self._label_attr = row
+        return row
 
+    def _bulk_insert_rows(self, table, rows):
+        """Batched INSERT of fully-formed row dicts (id/timestamps already set).
+
+        Uses pim_sql.bulk_insert (psycopg2 execute_values — the reference-entity
+        pattern): a few multi-row statements instead of one round-trip per row.
+        All rows for a table must share the same key set; normalize so a row that
+        omits an optional column still aligns (missing -> None)."""
+        if not rows:
+            return
+        # Union of keys across rows → consistent column set; fill gaps with None.
+        cols = list({k for r in rows for k in r.keys()})
+        norm = [{c: r.get(c) for c in cols} for r in rows]
+        pim_sql.bulk_insert(self.db, self.entity_name, table, norm)
+
+    def bulk_import_hierarchy(self, data: PimBulkImportRequest):
+        """Bulk import a full N-tier hierarchy. Builds insert-lists then writes via raw SQL."""
         created = {}
         errors = []
-        rejected_values = []   # select/multiselect values whose option isn't defined (strict, no auto-create)
+        rejected_values = []
         products_to_insert = []
         values_to_insert = []
 
-        # Pre-fetch attribute definitions for data type lookup
-        attr_defs = {
-            a.id: a for a in self.db.query(PimAttributeDefinition).all()
-        }
+        attr_defs = {a["id"]: a for a in pim_sql.fetch_all(self.db, f'SELECT * FROM {self._attr}')}
+        option_keys = {}
+        for o in pim_sql.fetch_all(self.db, f'SELECT "attribute_id","value_key" FROM {self._opt} WHERE "is_active" = TRUE'):
+            option_keys.setdefault(o["attribute_id"], set()).add(o["value_key"])
 
-        # Pre-fetch active option keys per attribute (strict validation — options must be
-        # pre-seeded by the spec/taxonomy load; the importer never auto-creates them).
-        option_keys = {}   # attribute_id -> set(value_key)
-        for o in self.db.query(PimAttributeOption).filter(PimAttributeOption.is_active == True).all():
-            option_keys.setdefault(o.attribute_id, set()).add(o.value_key)
-
-        # Get identifier and label attribute IDs for EAV writes.
-        # If the frontend sent explicit attribute IDs, flag them now.
-        # If no attribute is flagged yet, auto-create system attributes.
         id_attr = self._get_identifier_attr()
         label_attr = self._get_label_attr()
-
         if not id_attr and data.identifier_attribute_id:
-            # Frontend told us which attribute should be the identifier — flag it
-            candidate = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.id == data.identifier_attribute_id
-            ).first()
-            if candidate:
-                candidate.is_identifier = True
-                self.db.flush()
-                self._identifier_attr = candidate
-                id_attr = candidate
-
+            cand = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._attr} WHERE "id" = :id', {"id": data.identifier_attribute_id})
+            if cand:
+                id_attr = self._flag_attr(cand["id"], "is_identifier")
         if not label_attr and data.label_attribute_id:
-            candidate = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.id == data.label_attribute_id
-            ).first()
-            if candidate:
-                candidate.is_label = True
-                self.db.flush()
-                self._label_attr = candidate
-                label_attr = candidate
-
-        # Identifier/label are OPTIONAL for products. If no attribute is flagged and
-        # the frontend didn't designate one, flag a pre-existing sku/name attr if it
-        # happens to exist — but never auto-CREATE system attrs (that would force an
-        # "Identity" group/tab onto products that intentionally have neither).
+            cand = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._attr} WHERE "id" = :id', {"id": data.label_attribute_id})
+            if cand:
+                label_attr = self._flag_attr(cand["id"], "is_label")
         if not id_attr:
-            existing = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.code == 'sku'
-            ).first()
+            existing = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._attr} WHERE "code" = \'sku\'')
             if existing:
-                existing.is_identifier = True
-                self.db.flush()
-                self._identifier_attr = existing
-                id_attr = existing
-
+                id_attr = self._flag_attr(existing["id"], "is_identifier")
         if not label_attr:
-            existing = self.db.query(PimAttributeDefinition).filter(
-                PimAttributeDefinition.code == 'name'
-            ).first()
+            existing = pim_sql.fetch_one(self.db, f'SELECT "id" FROM {self._attr} WHERE "code" = \'name\'')
             if existing:
-                existing.is_label = True
-                self.db.flush()
-                self._label_attr = existing
-                label_attr = existing
+                label_attr = self._flag_attr(existing["id"], "is_label")
+        id_attr_id = id_attr["id"] if id_attr else None
+        label_attr_id = label_attr["id"] if label_attr else None
 
-        id_attr_id = id_attr.id if id_attr else None
-        label_attr_id = label_attr.id if label_attr else None
-
-        # Pre-fetch taxonomy nodes for fallback resolution
-        from lakefusion_utility.models.pim import PimTaxonomyNode
-        all_taxonomy_nodes = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.is_active == True).all()
-        taxonomy_label_to_id = {n.label.lower(): n.id for n in all_taxonomy_nodes}
-        taxonomy_code_to_id = {n.code.lower(): n.id for n in all_taxonomy_nodes}
-        # Default: first root node if nothing matches
-        default_taxonomy_id = all_taxonomy_nodes[0].id if all_taxonomy_nodes else None
-
-        # Build a set of known taxonomy labels for prefix-stripping (dynamic, not hardcoded)
-        known_labels = set(n.label.lower() for n in all_taxonomy_nodes)
+        all_taxonomy_nodes = pim_sql.fetch_all(self.db, f'SELECT "id","label","code" FROM {self._node} WHERE "is_active" = TRUE')
+        taxonomy_label_to_id = {n["label"].lower(): n["id"] for n in all_taxonomy_nodes}
+        taxonomy_code_to_id = {n["code"].lower(): n["id"] for n in all_taxonomy_nodes}
+        default_taxonomy_id = all_taxonomy_nodes[0]["id"] if all_taxonomy_nodes else None
+        known_labels = set(taxonomy_label_to_id.keys())
 
         def resolve_taxonomy_id(value):
-            """Resolve a category label/code/ID to a taxonomy node ID with dynamic fuzzy matching."""
             if not value:
                 return None
-            # Direct UUID match
             if len(value) == 36 and '-' in value:
                 return value
             val_lower = value.lower().strip()
-            # 1. Exact label match
             if val_lower in taxonomy_label_to_id:
                 return taxonomy_label_to_id[val_lower]
-            # 2. Exact code match
             if val_lower in taxonomy_code_to_id:
                 return taxonomy_code_to_id[val_lower]
-            # 3. Dynamic prefix stripping: try removing each known taxonomy label as a prefix
-            #    e.g., "Women's Lifestyle Sneakers" → remove "Women" prefix → "Lifestyle Sneakers"
             for known in known_labels:
-                prefix_variations = [f"{known}'s ", f"{known} "]
-                for pv in prefix_variations:
+                for pv in (f"{known}'s ", f"{known} "):
                     if val_lower.startswith(pv):
                         remainder = val_lower[len(pv):]
                         if remainder in taxonomy_label_to_id:
                             return taxonomy_label_to_id[remainder]
-            # 4. Substring containment: find a taxonomy node whose label is contained in the value or vice versa
-            #    Prefer longer matches (more specific)
             best_match = None
             best_len = 0
             for label, nid in taxonomy_label_to_id.items():
                 if len(label) > best_len and (label in val_lower or val_lower in label):
                     best_match = nid
                     best_len = len(label)
-            if best_match:
-                return best_match
-            return None
+            return best_match
 
         def _uuid():
             return str(uuid.uuid4())
 
-        def process_node(node: PimImportNode, parent_id: str = None, taxonomy_node_id: str = None):
-            """Recursively build insert lists for a node and its children."""
+        def process_node(node: PimImportNode, parent_id=None, taxonomy_node_id=None):
             product_id = _uuid()
             now = datetime.utcnow()
-
-            # Resolve taxonomy: try provided value, then inherit from parent, then default
-            resolved_taxonomy = resolve_taxonomy_id(node.taxonomy_node_id)
-            if not resolved_taxonomy:
-                resolved_taxonomy = taxonomy_node_id  # inherit from parent
-            if not resolved_taxonomy:
-                resolved_taxonomy = default_taxonomy_id  # fallback
-
+            resolved_taxonomy = resolve_taxonomy_id(node.taxonomy_node_id) or taxonomy_node_id or default_taxonomy_id
             identifier_val = node.identifier_value or node.key
             label_val = node.label_value or identifier_val
 
             products_to_insert.append({
-                'id': product_id,
-                'entity_type_id': node.tier_code,
-                'taxonomy_node_id': resolved_taxonomy,
-                'parent_id': parent_id,
-                'status': node.status or 'Draft',
-                'active': True,
-                'promoted': False,
-                'published_at': None,
-                'created_at': now,
-                'updated_at': now,
+                'id': product_id, 'entity_type_id': node.tier_code, 'taxonomy_node_id': resolved_taxonomy,
+                'parent_id': parent_id, 'status': node.status or 'Draft', 'active': True, 'promoted': False,
+                'published_at': None, 'created_at': now, 'updated_at': now,
             })
-
-            # Write identifier and label as EAV text values
             if id_attr_id and identifier_val:
-                values_to_insert.append({
-                    'table': 'pim_value_text',
-                    'row': {
-                        'id': _uuid(), 'product_id': product_id, 'attribute_id': id_attr_id,
-                        'value': identifier_val, 'locale': '', 'source': 'IMPORT',
-                        'version': 1, 'created_at': now, 'updated_at': now,
-                    }
-                })
+                values_to_insert.append({'table': VALUE_TEXT, 'row': {
+                    'id': _uuid(), 'product_id': product_id, 'attribute_id': id_attr_id, 'value': identifier_val,
+                    'locale': '', 'source': 'IMPORT', 'version': 1, 'created_at': now, 'updated_at': now}})
             if label_attr_id and label_val:
-                values_to_insert.append({
-                    'table': 'pim_value_text',
-                    'row': {
-                        'id': _uuid(), 'product_id': product_id, 'attribute_id': label_attr_id,
-                        'value': label_val, 'locale': '', 'source': 'IMPORT',
-                        'version': 1, 'created_at': now, 'updated_at': now,
-                    }
-                })
+                values_to_insert.append({'table': VALUE_TEXT, 'row': {
+                    'id': _uuid(), 'product_id': product_id, 'attribute_id': label_attr_id, 'value': label_val,
+                    'locale': '', 'source': 'IMPORT', 'version': 1, 'created_at': now, 'updated_at': now}})
 
-            # Track count per tier
             created[node.tier_code] = created.get(node.tier_code, 0) + 1
 
-            # Build value inserts
             for val in (node.values or []):
                 if not val.value or not val.attribute_id:
                     continue
                 attr_def = attr_defs.get(val.attribute_id)
                 if not attr_def:
                     continue
-
-                # Enforce tier: skip values whose attribute level doesn't match this node's tier
-                if attr_def.level and attr_def.level != "ALL":
-                    attr_levels = [l.strip() for l in attr_def.level.split(",")]
-                    if node.tier_code not in attr_levels:
+                if attr_def["level"] and attr_def["level"] != "ALL":
+                    if node.tier_code not in [l.strip() for l in attr_def["level"].split(",")]:
                         continue
-
                 value_id = _uuid()
-                data_type = attr_def.data_type
-
+                data_type = attr_def["data_type"]
+                base = {'id': value_id, 'product_id': product_id, 'attribute_id': val.attribute_id,
+                        'locale': '', 'source': val.source or 'IMPORT', 'version': 1,
+                        'created_at': now, 'updated_at': now}
                 if data_type == 'NUMBER':
                     try:
-                        numeric_val = float(val.value)
+                        nv = float(val.value)
                     except (ValueError, TypeError):
                         continue
-                    values_to_insert.append({
-                        'table': 'pim_value_number',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'value': numeric_val,
-                            'locale': '',
-                            'currency': '',
-                            'price_type': '',
-                            'territory': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': VALUE_NUMBER, 'row': {**base, 'value': nv, 'currency': '', 'price_type': '', 'territory': ''}})
                 elif data_type == 'BOOLEAN':
-                    bool_val = val.value.lower() in ('true', '1', 'yes')
-                    values_to_insert.append({
-                        'table': 'pim_value_boolean',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'value': bool_val,
-                            'locale': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': 'pim_value_boolean', 'row': {**base, 'value': val.value.lower() in ('true', '1', 'yes')}})
                 elif data_type == 'SELECT':
                     key = to_value_key(str(val.value))
                     if key not in option_keys.get(val.attribute_id, set()):
-                        rejected_values.append({
-                            'attribute_id': val.attribute_id,
-                            'attribute_code': attr_def.code,
-                            'product_id': product_id,
-                            'value': str(val.value),
-                            'value_key': key,
-                            'reason': 'option_not_defined',
-                        })
+                        rejected_values.append({'attribute_id': val.attribute_id, 'attribute_code': attr_def["code"], 'product_id': product_id, 'value': str(val.value), 'value_key': key, 'reason': 'option_not_defined'})
                         continue
-                    values_to_insert.append({
-                        'table': 'pim_value_select',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'ref_value_key': key,
-                            'locale': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': 'pim_value_select', 'row': {**base, 'ref_value_key': key}})
                 elif data_type == 'MULTISELECT':
-                    # split on ';' (spec CSV) or ',', one row per key
                     raw_parts = [p.strip() for chunk in str(val.value).split(';') for p in chunk.split(',')]
-                    parts = [p for p in raw_parts if p]
                     valid_set = option_keys.get(val.attribute_id, set())
-                    for part in parts:
+                    for part in [p for p in raw_parts if p]:
                         key = to_value_key(part)
                         if key not in valid_set:
-                            rejected_values.append({
-                                'attribute_id': val.attribute_id,
-                                'attribute_code': attr_def.code,
-                                'product_id': product_id,
-                                'value': part,
-                                'value_key': key,
-                                'reason': 'option_not_defined',
-                            })
+                            rejected_values.append({'attribute_id': val.attribute_id, 'attribute_code': attr_def["code"], 'product_id': product_id, 'value': part, 'value_key': key, 'reason': 'option_not_defined'})
                             continue
-                        values_to_insert.append({
-                            'table': 'pim_value_multiselect',
-                            'row': {
-                                'id': _uuid(),
-                                'product_id': product_id,
-                                'attribute_id': val.attribute_id,
-                                'ref_value_key': key,
-                                'locale': '',
-                                'source': val.source or 'IMPORT',
-                                'version': 1,
-                                'created_at': now,
-                                'updated_at': now,
-                            }
-                        })
+                        values_to_insert.append({'table': 'pim_value_multiselect', 'row': {**base, 'id': _uuid(), 'ref_value_key': key}})
                 elif data_type == 'REFERENCE':
-                    values_to_insert.append({
-                        'table': 'pim_value_reference',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'ref_table': attr_def.reference_entity_id or '',
-                            'ref_id': str(val.value),
-                            'locale': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': 'pim_value_reference', 'row': {**base, 'ref_table': attr_def["reference_entity_id"] or '', 'ref_id': str(val.value)}})
                 elif data_type == 'DATE':
                     try:
-                        date_val = _date.fromisoformat(str(val.value).strip())
+                        dv = _date.fromisoformat(str(val.value).strip())
                     except (ValueError, TypeError):
-                        rejected_values.append({
-                            'attribute_id': val.attribute_id,
-                            'attribute_code': attr_def.code,
-                            'product_id': product_id,
-                            'value': str(val.value),
-                            'value_key': None,
-                            'reason': 'invalid_date',
-                        })
+                        rejected_values.append({'attribute_id': val.attribute_id, 'attribute_code': attr_def["code"], 'product_id': product_id, 'value': str(val.value), 'value_key': None, 'reason': 'invalid_date'})
                         continue
-                    values_to_insert.append({
-                        'table': 'pim_value_date',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'value': date_val,
-                            'locale': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': 'pim_value_date', 'row': {**base, 'value': dv}})
                 else:
-                    # TEXT
-                    values_to_insert.append({
-                        'table': 'pim_value_text',
-                        'row': {
-                            'id': value_id,
-                            'product_id': product_id,
-                            'attribute_id': val.attribute_id,
-                            'value': str(val.value),
-                            'locale': '',
-                            'source': val.source or 'IMPORT',
-                            'version': 1,
-                            'created_at': now,
-                            'updated_at': now,
-                        }
-                    })
+                    values_to_insert.append({'table': VALUE_TEXT, 'row': {**base, 'value': str(val.value)}})
 
-            # Recurse into children
             for child in (node.children or []):
                 process_node(child, parent_id=product_id, taxonomy_node_id=resolved_taxonomy)
 
-        # Phase 1: Walk the entire tree and build insert lists
         app_logger.info(f"Bulk import: processing {len(data.nodes)} root nodes...")
         for node in data.nodes:
             try:
@@ -1621,67 +1120,30 @@ class PimEntityService:
             except Exception as e:
                 errors.append(f"Node '{node.key}': {str(e)}")
 
-        # Phase 2: Deduplicate by unique constraint columns (read from model, not hardcoded)
-        unique_cols = []
-        for constraint in PimEntity.__table__.constraints:
-            if hasattr(constraint, 'columns') and constraint.__class__.__name__ == 'UniqueConstraint':
-                unique_cols = [col.name for col in constraint.columns]
-                break
-
-        if unique_cols:
-            seen = set()
-            deduped = []
-            removed_ids = set()
-            for p in products_to_insert:
-                key = tuple(p.get(col) for col in unique_cols)
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(p)
-                else:
-                    removed_ids.add(p['id'])
-            dup_count = len(products_to_insert) - len(deduped)
-            if dup_count > 0:
-                app_logger.info(f"Bulk import: skipped {dup_count} duplicates on {unique_cols}")
-                # Also remove values that reference the removed product IDs
-                values_to_insert = [v for v in values_to_insert if v['row']['product_id'] not in removed_ids]
-            products_to_insert = deduped
-
-        # Remove existing products with matching unique keys (clean re-import)
-        if unique_cols and products_to_insert:
-            unique_col_name = unique_cols[0]
-            unique_model_col = getattr(PimEntity, unique_col_name, None)
-            if unique_model_col is not None:
-                all_keys = [p[unique_col_name] for p in products_to_insert if p.get(unique_col_name)]
-                if all_keys:
-                    existing_keys = set(
-                        getattr(row, unique_col_name) for row in
-                        self.db.query(unique_model_col).filter(unique_model_col.in_(all_keys)).all()
-                    )
-                    if existing_keys:
-                        app_logger.info(f"Bulk import: removing {len(existing_keys)} existing products for re-import...")
-                        existing_ids = [
-                            row.id for row in
-                            self.db.query(PimEntity.id).filter(unique_model_col.in_(existing_keys)).all()
-                        ]
-                        if existing_ids:
-                            for ValueTable in VALUE_TABLES:
-                                self.db.query(ValueTable).filter(ValueTable.product_id.in_(existing_ids)).delete(synchronize_session=False)
-                            self.db.query(PimEntity).filter(PimEntity.id.in_(existing_ids)).delete(synchronize_session=False)
-                            self.db.flush()
-
-        # Phase 3-5: All inserts in a single try block with rollback on any failure
-        try:
-            # Phase 3: Bulk insert products
-            app_logger.info(f"Bulk import: inserting {len(products_to_insert)} products...")
-            if products_to_insert:
-                self.db.execute(
-                    PimEntity.__table__.insert(),
-                    products_to_insert
+        # Dedup by pim_entity unique columns. pim_entity has NO unique constraints
+        # (verified in models), so this is a no-op guard kept for parity.
+        # Remove existing products with matching identifier (clean re-import): match on
+        # the identifier EAV value, since pim_entity itself has no natural unique key.
+        if products_to_insert and id_attr_id:
+            import_ids = [v['row']['value'] for v in values_to_insert
+                          if v['table'] == VALUE_TEXT and v['row']['attribute_id'] == id_attr_id]
+            if import_ids:
+                existing_rows = self._fetch_in(
+                    f'SELECT "product_id" FROM {self._vt("TEXT")} '
+                    f'WHERE "attribute_id" = :aid AND "locale" = \'\' AND "value" IN :vals',
+                    "vals", import_ids, {"aid": id_attr_id},
                 )
+                existing_ids = [r["product_id"] for r in existing_rows]
+                if existing_ids:
+                    app_logger.info(f"Bulk import: removing {len(existing_ids)} existing products for re-import...")
+                    for vt in VALUE_TABLES:
+                        self._fetch_in(f'DELETE FROM {self._t(vt)} WHERE "product_id" IN :ids RETURNING "id"', "ids", existing_ids)
+                    self._fetch_in(f'DELETE FROM {self._entity} WHERE "id" IN :ids RETURNING "id"', "ids", existing_ids)
 
-            # Phase 4: Bulk insert values grouped by table
-            # Deduplicate values by unique constraint (product_id, attribute_id, locale)
-            # CSV rows repeat product-level attributes for every item row — keep first occurrence only
+        try:
+            app_logger.info(f"Bulk import: inserting {len(products_to_insert)} products...")
+            self._bulk_insert_rows(ENTITY_TBL, products_to_insert)
+
             def dedup_values(rows):
                 seen = set()
                 result = []
@@ -1692,15 +1154,11 @@ class PimEntityService:
                         result.append(r)
                 return result
 
-            text_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_text'])
-            number_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_number'])
-            boolean_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_boolean'])
-            date_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_date'])
-            select_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_select'])
-            reference_values = dedup_values([v['row'] for v in values_to_insert if v['table'] == 'pim_value_reference'])
-            # Multiselect is multi-row per (product, attr, locale); dedup on the full key incl. ref_value_key
+            for tbl in [VALUE_TEXT, VALUE_NUMBER, 'pim_value_boolean', 'pim_value_date', 'pim_value_select', 'pim_value_reference']:
+                self._bulk_insert_rows(tbl, dedup_values([v['row'] for v in values_to_insert if v['table'] == tbl]))
+            # Multiselect: dedup on full key incl. ref_value_key
             ms_seen = set()
-            multiselect_values = []
+            ms_rows = []
             for v in values_to_insert:
                 if v['table'] != 'pim_value_multiselect':
                     continue
@@ -1708,152 +1166,35 @@ class PimEntityService:
                 k = (r['product_id'], r['attribute_id'], r.get('locale', ''), r['ref_value_key'])
                 if k not in ms_seen:
                     ms_seen.add(k)
-                    multiselect_values.append(r)
+                    ms_rows.append(r)
+            self._bulk_insert_rows('pim_value_multiselect', ms_rows)
 
-            app_logger.info(
-                f"Bulk import: inserting {len(text_values)} text, {len(number_values)} number, "
-                f"{len(boolean_values)} boolean, {len(date_values)} date, {len(select_values)} select, "
-                f"{len(multiselect_values)} multiselect, {len(reference_values)} reference values..."
-            )
-
-            if text_values:
-                self.db.execute(PimValueText.__table__.insert(), text_values)
-            if number_values:
-                self.db.execute(PimValueNumber.__table__.insert(), number_values)
-            if boolean_values:
-                self.db.execute(PimValueBoolean.__table__.insert(), boolean_values)
-            if date_values:
-                self.db.execute(PimValueDate.__table__.insert(), date_values)
-            if select_values:
-                self.db.execute(PimValueSelect.__table__.insert(), select_values)
-            if multiselect_values:
-                self.db.execute(PimValueMultiselect.__table__.insert(), multiselect_values)
-            if reference_values:
-                self.db.execute(PimValueReference.__table__.insert(), reference_values)
-
-            # Phase 5: Single commit
             db_commit_auto_rollback(db=self.db)
 
-            # Phase 6: Bulk refresh flat table (single SQL, not per-row)
             imported_ids = [p['id'] for p in products_to_insert]
             if imported_ids:
-                app_logger.info(f"Bulk import: refreshing flat table for {len(imported_ids)} products...")
-                id_attr = self._get_identifier_attr()
-                label_attr = self._get_label_attr()
-                id_attr_id = id_attr.id if id_attr else None
-                label_attr_id = label_attr.id if label_attr else None
-
-                # Build flat rows from already-inserted data using batch queries
-                from sqlalchemy import case as sa_case
-                # Fetch all identifier values in one query
-                id_map = {}
-                if id_attr_id:
-                    for row in self.db.query(PimValueText.product_id, PimValueText.value).filter(
-                        PimValueText.product_id.in_(imported_ids),
-                        PimValueText.attribute_id == id_attr_id,
-                        PimValueText.locale == '',
-                    ).all():
-                        id_map[row[0]] = row[1]
-
-                # Fetch all label values in one query
-                label_map = {}
-                if label_attr_id:
-                    for row in self.db.query(PimValueText.product_id, PimValueText.value).filter(
-                        PimValueText.product_id.in_(imported_ids),
-                        PimValueText.attribute_id == label_attr_id,
-                        PimValueText.locale == '',
-                    ).all():
-                        label_map[row[0]] = row[1]
-
-                # Fetch all taxonomy nodes in one query
-                node_map = {}
-                tax_ids = set(p.get('taxonomy_node_id') for p in products_to_insert if p.get('taxonomy_node_id'))
-                if tax_ids:
-                    for node in self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id.in_(tax_ids)).all():
-                        node_map[node.id] = (node.label, node.materialized_path)
-
-                # Count children per parent in one query
-                from sqlalchemy import func as sa_func
-                child_counts = {}
-                parent_ids = set(p.get('parent_id') for p in products_to_insert if p.get('parent_id'))
-                # Also include imported_ids since they could be parents of other imported entities
-                count_targets = set(imported_ids) | parent_ids
-                if count_targets:
-                    for row in self.db.query(PimEntity.parent_id, sa_func.count(PimEntity.id)).filter(
-                        PimEntity.parent_id.in_(count_targets),
-                        PimEntity.active == True,
-                    ).group_by(PimEntity.parent_id).all():
-                        child_counts[row[0]] = row[1]
-
-                # Delete existing flat rows for these IDs and bulk insert new ones
-                self.db.query(PimEntityFlat).filter(PimEntityFlat.id.in_(imported_ids)).delete(synchronize_session=False)
-                flat_rows = []
-                for p in products_to_insert:
-                    pid = p['id']
-                    tn_id = p.get('taxonomy_node_id')
-                    cat_label, cat_path = node_map.get(tn_id, (None, None)) if tn_id else (None, None)
-                    flat_rows.append({
-                        'id': pid,
-                        'entity_type_id': p['entity_type_id'],
-                        'taxonomy_node_id': tn_id,
-                        'parent_id': p.get('parent_id'),
-                        'status': p.get('status', 'Draft'),
-                        'active': p.get('active', True),
-                        'promoted': p.get('promoted', False),
-                        'published_at': p.get('published_at'),
-                        'identifier': id_map.get(pid),
-                        'label': label_map.get(pid),
-                        'category_label': cat_label,
-                        'category_path': cat_path,
-                        'child_count': child_counts.get(pid, 0),
-                        'created_at': p.get('created_at'),
-                        'updated_at': p.get('updated_at'),
-                    })
-                if flat_rows:
-                    self.db.execute(PimEntityFlat.__table__.insert(), flat_rows)
+                self.refresh_flat_rows(imported_ids)
                 db_commit_auto_rollback(db=self.db)
 
-            app_logger.info(
-                f"Bulk import complete: {sum(created.values())} products, "
-                f"{len(values_to_insert)} values"
-            )
+            app_logger.info(f"Bulk import complete: {sum(created.values())} products, {len(values_to_insert)} values")
 
         except Exception as e:
-            # Rollback entire transaction — DB stays clean
             self.db.rollback()
-            import traceback
-            tb = traceback.format_exc()
-            app_logger.exception(f"Bulk import failed, rolled back: {str(e)}\n{tb}")
-            # Include a truncated but useful error message for the UI
-            err_msg = str(e)
-            if len(err_msg) > 500:
-                err_msg = err_msg[:500] + "..."
+            app_logger.exception(f"Bulk import failed, rolled back: {str(e)}\n{traceback.format_exc()}")
+            err_msg = str(e)[:500] + ("..." if len(str(e)) > 500 else "")
             errors.append(f"Bulk import failed: {err_msg}")
-            created = {k: 0 for k in created}  # reset counts since nothing was committed
-            rejected_values = []  # nothing committed
+            created = {k: 0 for k in created}
+            rejected_values = []
 
         if rejected_values:
-            app_logger.warning(
-                f"Bulk import: {len(rejected_values)} select/multiselect values rejected "
-                f"(option not defined). They were NOT written."
-            )
+            app_logger.warning(f"Bulk import: {len(rejected_values)} select/multiselect values rejected (option not defined).")
         return {"created": created, "errors": errors, "rejected_values": rejected_values}
 
     # =======================================================================
     # FLAT FILE IMPORT — SKU-keyed upsert with per-field Add/Overwrite modes
     # =======================================================================
-
     def flat_import(self, data: PimFlatImportRequest):
-        """
-        Item-grain flat-file import. SKU (identifier value at the item tier) is
-        the match key: existing items are updated per each mapped field's mode
-        (overwrite / add_only), new items are inserted. Parent products (and
-        optional variants) are located or created by their identifier key.
-        Blank incoming values never erase existing data. Rows with validation
-        errors are skipped; valid rows still import.
-        """
-        import uuid
-
+        """Item-grain flat-file import. SKU is the match key; per-field modes."""
         now = datetime.utcnow()
         inserted = 0
         updated = 0
@@ -1864,23 +1205,43 @@ class PimEntityService:
 
         id_attr = self._get_identifier_attr()
         if not id_attr:
-            raise HTTPException(
-                status_code=400,
-                detail="No identifier attribute (is_identifier) is defined — required to match rows by SKU.",
-            )
+            raise HTTPException(status_code=400, detail="No identifier attribute (is_identifier) is defined — required to match rows by SKU.")
         label_attr = self._get_label_attr()
-        id_attr_id = id_attr.id
-        label_attr_id = label_attr.id if label_attr else None
+        id_attr_id = id_attr["id"]
+        label_attr_id = label_attr["id"] if label_attr else None
 
-        attr_defs = {a.id: a for a in self.db.query(PimAttributeDefinition).all()}
+        attr_defs = {a["id"]: a for a in pim_sql.fetch_all(self.db, f'SELECT * FROM {self._attr}')}
         option_keys = {}
-        for o in self.db.query(PimAttributeOption).filter(PimAttributeOption.is_active == True).all():
-            option_keys.setdefault(o.attribute_id, set()).add(o.value_key)
+        for o in pim_sql.fetch_all(self.db, f'SELECT "attribute_id","value_key" FROM {self._opt} WHERE "is_active" = TRUE'):
+            option_keys.setdefault(o["attribute_id"], set()).add(o["value_key"])
 
         def _blank(v):
             return v is None or not str(v).strip()
 
-        # ---- Phase 1: validate rows (any bad typed value fails the whole row) ----
+        def _row_levels(row):
+            """Ordered [(tier_code, level), …] top→leaf for either payload shape.
+
+            Generic `levels` (n-tier) wins when present; otherwise fall back to the
+            legacy product/variant/item using the request's *_tier_code fields."""
+            if row.levels:
+                return [(lvl.tier_code, lvl) for lvl in row.levels]
+            out = []
+            if row.product is not None:
+                out.append((data.product_tier_code, row.product))
+            if data.variant_tier_code and row.variant is not None and not _blank(row.variant.key):
+                out.append((data.variant_tier_code, row.variant))
+            if row.item is not None:
+                out.append((data.item_tier_code, row.item))
+            return out
+
+        def _row_leaf(row):
+            levels = _row_levels(row)
+            return levels[-1][1] if levels else None
+
+        def _row_root(row):
+            levels = _row_levels(row)
+            return levels[0][1] if levels else None
+
         def _validate_level(lvl):
             for v in (lvl.values or []):
                 if _blank(v.value):
@@ -1888,88 +1249,82 @@ class PimEntityService:
                 ad = attr_defs.get(v.attribute_id)
                 if not ad:
                     return f"Unknown attribute '{v.attribute_id}'"
-                if ad.data_type == 'NUMBER':
+                if ad["data_type"] == 'NUMBER':
                     try:
                         float(str(v.value))
                     except (ValueError, TypeError):
-                        return f"'{v.value}' is not a number for '{ad.label}'"
-                elif ad.data_type == 'DATE':
+                        return f"'{v.value}' is not a number for '{ad['label']}'"
+                elif ad["data_type"] == 'DATE':
                     try:
                         _date.fromisoformat(str(v.value).strip())
                     except (ValueError, TypeError):
-                        return f"'{v.value}' is not a valid date (YYYY-MM-DD) for '{ad.label}'"
-                elif ad.data_type == 'SELECT':
-                    if to_value_key(str(v.value)) not in option_keys.get(ad.id, set()):
-                        return f"'{v.value}' is not a defined option of '{ad.label}'"
-                elif ad.data_type == 'MULTISELECT':
+                        return f"'{v.value}' is not a valid date (YYYY-MM-DD) for '{ad['label']}'"
+                elif ad["data_type"] == 'SELECT':
+                    if to_value_key(str(v.value)) not in option_keys.get(ad["id"], set()):
+                        return f"'{v.value}' is not a defined option of '{ad['label']}'"
+                elif ad["data_type"] == 'MULTISELECT':
                     parts = [p.strip() for chunk in str(v.value).split(';') for p in chunk.split(',')]
                     for part in [p for p in parts if p]:
-                        if to_value_key(part) not in option_keys.get(ad.id, set()):
-                            return f"'{part}' is not a defined option of '{ad.label}'"
+                        if to_value_key(part) not in option_keys.get(ad["id"], set()):
+                            return f"'{part}' is not a defined option of '{ad['label']}'"
             return None
 
         valid_rows = []
         seen_skus = {}
         for row in data.rows:
-            if _blank(row.item.key):
-                _fail(row.row_number, "Missing SKU")
-                continue
-            if _blank(row.product.key):
-                _fail(row.row_number, "Missing Product ID")
-                continue
-            sku = str(row.item.key).strip()
+            row_levels = _row_levels(row)
+            leaf = _row_leaf(row)
+            root = _row_root(row)
+            if leaf is None or _blank(leaf.key):
+                _fail(row.row_number, "Missing SKU (leaf-tier key)"); continue
+            if root is None or _blank(root.key):
+                _fail(row.row_number, "Missing Product ID (root-tier key)"); continue
+            sku = str(leaf.key).strip()
             if sku in seen_skus:
-                _fail(row.row_number, f"Duplicate SKU '{sku}' (first at row {seen_skus[sku]})")
-                continue
+                _fail(row.row_number, f"Duplicate SKU '{sku}' (first at row {seen_skus[sku]})"); continue
             reason = None
-            for lvl in (row.product, row.variant, row.item):
+            for _tc, lvl in row_levels:
                 if lvl is None:
                     continue
                 reason = _validate_level(lvl)
                 if reason:
                     break
             if reason:
-                _fail(row.row_number, reason)
-                continue
+                _fail(row.row_number, reason); continue
             seen_skus[sku] = row.row_number
             valid_rows.append(row)
 
         if not valid_rows:
             return {'inserted': 0, 'updated': 0, 'failed': len(errors), 'errors': errors}
 
-        # ---- Phase 2: match existing entities by identifier value, per tier ----
+        # Match existing entities by identifier value, per tier (all levels, all rows)
         all_keys = set()
         for row in valid_rows:
-            all_keys.add(str(row.product.key).strip())
-            all_keys.add(str(row.item.key).strip())
-            if row.variant is not None and not _blank(row.variant.key):
-                all_keys.add(str(row.variant.key).strip())
+            for _tc, lvl in _row_levels(row):
+                if lvl is not None and not _blank(lvl.key):
+                    all_keys.add(str(lvl.key).strip())
 
         def _chunks(seq, size=1000):
             seq = list(seq)
             for i in range(0, len(seq), size):
                 yield seq[i:i + size]
 
-        existing_by_tier = {}   # (tier_code, identifier_value) -> PimEntity
+        existing_by_tier = {}  # (tier_code, identifier_value) -> entity dict
         for chunk in _chunks(all_keys):
-            matched = (
-                self.db.query(PimEntity, PimValueText.value)
-                .join(PimValueText, PimValueText.product_id == PimEntity.id)
-                .filter(
-                    PimValueText.attribute_id == id_attr_id,
-                    PimValueText.locale == '',
-                    PimValueText.value.in_(chunk),
-                    PimEntity.active == True,
-                )
-                .all()
+            matched = self._fetch_in(
+                f'SELECT e."id" AS id, e."entity_type_id" AS entity_type_id, e."status" AS status, '
+                f'e."taxonomy_node_id" AS taxonomy_node_id, v."value" AS key '
+                f'FROM {self._entity} e JOIN {self._vt("TEXT")} v ON v."product_id" = e."id" '
+                f'WHERE v."attribute_id" = :aid AND v."locale" = \'\' AND v."value" IN :vals AND e."active" = TRUE',
+                "vals", chunk, {"aid": id_attr_id},
             )
-            for ent, key in matched:
-                existing_by_tier.setdefault((ent.entity_type_id, key), ent)
+            for m in matched:
+                existing_by_tier.setdefault((m["entity_type_id"], m["key"]), m)
 
-        # ---- Phase 3: prefetch existing values of mapped attributes ----
+        # Prefetch existing values of mapped attributes (as dicts keyed by (pid, attr))
         mapped_attr_ids = set()
         for row in valid_rows:
-            for lvl in (row.product, row.variant, row.item):
+            for _tc, lvl in _row_levels(row):
                 if lvl is None:
                     continue
                 for v in (lvl.values or []):
@@ -1977,119 +1332,106 @@ class PimEntityService:
         if label_attr_id:
             mapped_attr_ids.add(label_attr_id)
 
-        existing_ids = [e.id for e in existing_by_tier.values()]
-        TABLE_BY_TYPE = {
-            'TEXT': PimValueText, 'NUMBER': PimValueNumber, 'BOOLEAN': PimValueBoolean,
-            'DATE': PimValueDate, 'SELECT': PimValueSelect,
-            'MULTISELECT': PimValueMultiselect, 'REFERENCE': PimValueReference,
-        }
-        existing_vals = {dt: {} for dt in TABLE_BY_TYPE}
+        existing_ids = [e["id"] for e in existing_by_tier.values()]
+        existing_vals = {dt: {} for dt in VALUE_TABLE_BY_TYPE}
         if existing_ids and mapped_attr_ids:
-            for dt, Model in TABLE_BY_TYPE.items():
+            for dt, tbl in VALUE_TABLE_BY_TYPE.items():
                 for chunk in _chunks(existing_ids):
-                    for r in self.db.query(Model).filter(
-                        Model.product_id.in_(chunk),
-                        Model.attribute_id.in_(list(mapped_attr_ids)),
-                        Model.locale == '',
-                    ).all():
-                        existing_vals[dt].setdefault((r.product_id, r.attribute_id), []).append(r)
+                    rows = self._fetch_two_in(
+                        f'SELECT * FROM {self._t(tbl)} WHERE "product_id" IN :pids '
+                        f'AND "attribute_id" IN :aids AND "locale" = \'\'',
+                        "pids", chunk, "aids", list(mapped_attr_ids),
+                    )
+                    for r in rows:
+                        existing_vals[dt].setdefault((r["product_id"], r["attribute_id"]), []).append(r)
 
-        # ---- Phase 4: walk rows, accumulating inserts / in-place ORM updates ----
-        entities_to_insert = []                            # raw dicts for PimEntity bulk insert
-        values_to_insert = {dt: [] for dt in TABLE_BY_TYPE}
-        written = set()           # (entity_id, attribute_id) handled this run — first occurrence wins
-        status_written = set()    # entity ids whose status was decided this run
+        # Accumulators
+        entities_to_insert = []
+        values_to_insert = {dt: [] for dt in VALUE_TABLE_BY_TYPE}
+        pending_value_updates = []   # (table, set_values, id)
+        pending_value_deletes = []   # (table, id)
+        pending_entity_updates = {}  # entity_id -> set_values (for existing entities)
+        written = set()
+        status_written = set()
         taxonomy_written = set()
-        entity_cache = {}         # (tier_code, key) -> state dict
+        entity_cache = {}
 
         def _uuid():
             return str(uuid.uuid4())
 
         def _new_value_row(pid, attr_id, **extra):
-            base = {
-                'id': _uuid(), 'product_id': pid, 'attribute_id': attr_id,
-                'locale': '', 'source': 'IMPORT', 'version': 1,
-                'created_at': now, 'updated_at': now,
-            }
+            base = {'id': _uuid(), 'product_id': pid, 'attribute_id': attr_id, 'locale': '',
+                    'source': 'IMPORT', 'version': 1, 'created_at': now, 'updated_at': now}
             base.update(extra)
             return base
 
         def _apply_value(pid, ad, raw, mode):
-            """Write one typed value respecting mode. Blank never erases."""
             if _blank(raw):
                 return
-            k = (pid, ad.id)
+            k = (pid, ad["id"])
             if k in written:
                 return
             written.add(k)
-            dt = ad.data_type
+            dt = ad["data_type"]
 
             if dt == 'MULTISELECT':
                 rows = existing_vals['MULTISELECT'].get(k) or []
                 if rows and mode == 'add_only':
                     return
                 for r in rows:
-                    self.db.delete(r)
+                    pending_value_deletes.append(('pim_value_multiselect', r["id"]))
                 existing_vals['MULTISELECT'][k] = []
                 parts = [p.strip() for chunk in str(raw).split(';') for p in chunk.split(',')]
                 for key in dict.fromkeys(to_value_key(p) for p in parts if p):
-                    values_to_insert['MULTISELECT'].append(_new_value_row(pid, ad.id, ref_value_key=key))
+                    values_to_insert['MULTISELECT'].append(_new_value_row(pid, ad["id"], ref_value_key=key))
                 return
 
             rows = existing_vals.get(dt, {}).get(k) or []
             existing = rows[0] if rows else None
             if existing is not None:
-                # Only TEXT can hold an "empty" value; other types are present or absent
-                is_empty = dt == 'TEXT' and _blank(existing.value)
+                is_empty = dt == 'TEXT' and _blank(existing.get("value"))
                 if not is_empty and mode == 'add_only':
                     return
+                set_values = {'source': 'IMPORT', 'version': (existing.get("version") or 1) + 1}
                 if dt == 'NUMBER':
-                    existing.value = float(str(raw))
+                    set_values['value'] = float(str(raw))
                 elif dt == 'BOOLEAN':
-                    existing.value = str(raw).strip().lower() in ('true', '1', 'yes')
+                    set_values['value'] = str(raw).strip().lower() in ('true', '1', 'yes')
                 elif dt == 'DATE':
-                    existing.value = _date.fromisoformat(str(raw).strip())
+                    set_values['value'] = _date.fromisoformat(str(raw).strip())
                 elif dt == 'SELECT':
-                    existing.ref_value_key = to_value_key(str(raw))
+                    set_values['ref_value_key'] = to_value_key(str(raw))
                 elif dt == 'REFERENCE':
-                    existing.ref_id = str(raw)
+                    set_values['ref_id'] = str(raw)
                 else:
-                    existing.value = str(raw)
-                existing.source = 'IMPORT'
-                existing.version = (existing.version or 1) + 1
-                existing.updated_at = now
+                    set_values['value'] = str(raw)
+                pending_value_updates.append((VALUE_TABLE_BY_TYPE[dt], set_values, existing["id"]))
                 return
 
             if dt == 'NUMBER':
-                values_to_insert['NUMBER'].append(_new_value_row(
-                    pid, ad.id, value=float(str(raw)),
-                    currency='', price_type='', territory='',
-                ))
+                values_to_insert['NUMBER'].append(_new_value_row(pid, ad["id"], value=float(str(raw)), currency='', price_type='', territory=''))
             elif dt == 'BOOLEAN':
-                values_to_insert['BOOLEAN'].append(_new_value_row(
-                    pid, ad.id, value=str(raw).strip().lower() in ('true', '1', 'yes')))
+                values_to_insert['BOOLEAN'].append(_new_value_row(pid, ad["id"], value=str(raw).strip().lower() in ('true', '1', 'yes')))
             elif dt == 'DATE':
-                values_to_insert['DATE'].append(_new_value_row(
-                    pid, ad.id, value=_date.fromisoformat(str(raw).strip())))
+                values_to_insert['DATE'].append(_new_value_row(pid, ad["id"], value=_date.fromisoformat(str(raw).strip())))
             elif dt == 'SELECT':
-                values_to_insert['SELECT'].append(_new_value_row(
-                    pid, ad.id, ref_value_key=to_value_key(str(raw))))
+                values_to_insert['SELECT'].append(_new_value_row(pid, ad["id"], ref_value_key=to_value_key(str(raw))))
             elif dt == 'REFERENCE':
-                values_to_insert['REFERENCE'].append(_new_value_row(
-                    pid, ad.id, ref_table=ad.reference_entity_id or '', ref_id=str(raw)))
+                values_to_insert['REFERENCE'].append(_new_value_row(pid, ad["id"], ref_table=ad["reference_entity_id"] or '', ref_id=str(raw)))
             else:
-                values_to_insert['TEXT'].append(_new_value_row(pid, ad.id, value=str(raw)))
+                values_to_insert['TEXT'].append(_new_value_row(pid, ad["id"], value=str(raw)))
 
         def _entity_get(state, field):
-            return state['insert_dict'][field] if state['is_new'] else getattr(state['orm'], field)
+            if state['is_new']:
+                return state['insert_dict'][field]
+            return pending_entity_updates.get(state['id'], {}).get(field, state['existing'][field])
 
         def _entity_set(state, field, value):
             if state['is_new']:
                 state['insert_dict'][field] = value
                 state['insert_dict']['updated_at'] = now
             else:
-                setattr(state['orm'], field, value)
-                state['orm'].updated_at = now
+                pending_entity_updates.setdefault(state['id'], {})[field] = value
 
         def _apply_status(state, status, mode):
             if _blank(status):
@@ -2097,7 +1439,6 @@ class PimEntityService:
             if state['id'] in status_written:
                 return
             status_written.add(state['id'])
-            # A just-created entity's 'Draft' is a placeholder, not data — always writable
             current = None if state.get('status_is_default') else _entity_get(state, 'status')
             if _blank(current) or mode == 'overwrite':
                 _entity_set(state, 'status', str(status).strip())
@@ -2118,16 +1459,13 @@ class PimEntityService:
                 return entity_cache[ck]
             ent = existing_by_tier.get(ck)
             if ent is not None:
-                state = {'id': ent.id, 'orm': ent, 'is_new': False}
+                state = {'id': ent["id"], 'existing': ent, 'is_new': False}
                 entity_cache[ck] = state
                 return state
             pid = _uuid()
-            insert_dict = {
-                'id': pid, 'entity_type_id': tier_code, 'taxonomy_node_id': None,
-                'parent_id': parent_id, 'status': 'Draft', 'active': True,
-                'promoted': False, 'published_at': None,
-                'created_at': now, 'updated_at': now,
-            }
+            insert_dict = {'id': pid, 'entity_type_id': tier_code, 'taxonomy_node_id': None,
+                           'parent_id': parent_id, 'status': 'Draft', 'active': True, 'promoted': False,
+                           'published_at': None, 'created_at': now, 'updated_at': now}
             entities_to_insert.append(insert_dict)
             values_to_insert['TEXT'].append(_new_value_row(pid, id_attr_id, value=key))
             written.add((pid, id_attr_id))
@@ -2146,61 +1484,67 @@ class PimEntityService:
                     _apply_value(state['id'], ad, v.value, v.mode or 'overwrite')
 
         for row in valid_rows:
-            product_key = str(row.product.key).strip()
-            sku = str(row.item.key).strip()
+            # Walk levels top→leaf: create-or-reuse each, threading parent_id from
+            # the previous non-blank level. Blank intermediate levels are skipped
+            # (parent chain continues from the last present ancestor).
+            row_levels = [(tc, lvl) for tc, lvl in _row_levels(row)
+                          if lvl is not None and not _blank(lvl.key)]
+            root_state = None
+            parent_state = None
+            leaf_state = None
+            leaf_is_new = False
+            for tier_code, lvl in row_levels:
+                key = str(lvl.key).strip()
+                ck = (tier_code, key)
+                is_new = ck not in entity_cache and ck not in existing_by_tier
+                state = _get_or_create_entity(tier_code, key, parent_state['id'] if parent_state else None)
+                _apply_level(state, lvl)
+                if root_state is None:
+                    root_state = state
+                parent_state = state
+                leaf_state = state
+                leaf_is_new = is_new  # last level wins → the leaf/item grain
 
-            product_state = _get_or_create_entity(data.product_tier_code, product_key, None)
-            _apply_level(product_state, row.product)
+            # Propagate the root level's taxonomy down to all descendants (parity
+            # with the old product→variant/item taxonomy cascade).
+            root_lvl = row_levels[0][1] if row_levels else None
+            if root_lvl is not None and root_lvl.taxonomy_node_id and root_state is not None:
+                root_taxonomy = _entity_get(root_state, 'taxonomy_node_id')
+                if root_taxonomy:
+                    taxonomy_mode = root_lvl.taxonomy_mode or 'overwrite'
+                    for tier_code, lvl in row_levels[1:]:
+                        st = entity_cache.get((tier_code, str(lvl.key).strip()))
+                        if st is not None:
+                            _apply_taxonomy(st, root_taxonomy, taxonomy_mode)
 
-            parent_state = product_state
-            if data.variant_tier_code and row.variant is not None and not _blank(row.variant.key):
-                variant_state = _get_or_create_entity(
-                    data.variant_tier_code, str(row.variant.key).strip(), product_state['id'])
-                _apply_level(variant_state, row.variant)
-                parent_state = variant_state
+            if leaf_state is not None:
+                if leaf_is_new:
+                    inserted += 1
+                else:
+                    updated += 1
 
-            item_ck = (data.item_tier_code, sku)
-            item_is_new = item_ck not in entity_cache and item_ck not in existing_by_tier
-            item_state = _get_or_create_entity(data.item_tier_code, sku, parent_state['id'])
-            _apply_level(item_state, row.item)
-
-            # Category is mapped at the product level only — variants and items
-            # inherit the product's effective category
-            if row.product.taxonomy_node_id:
-                product_taxonomy = _entity_get(product_state, 'taxonomy_node_id')
-                if product_taxonomy:
-                    taxonomy_mode = row.product.taxonomy_mode or 'overwrite'
-                    if parent_state is not product_state:
-                        _apply_taxonomy(parent_state, product_taxonomy, taxonomy_mode)
-                    _apply_taxonomy(item_state, product_taxonomy, taxonomy_mode)
-
-            if item_is_new:
-                inserted += 1
-            else:
-                updated += 1
-
-        # ---- Phase 5: persist in a single transaction ----
+        # Persist in a single transaction: deletes → updates → inserts
         try:
-            # Flush ORM updates/deletes first so multiselect overwrites don't
-            # collide with their replacement inserts on the unique constraint
-            self.db.flush()
-            if entities_to_insert:
-                self.db.execute(PimEntity.__table__.insert(), entities_to_insert)
-            for dt, Model in TABLE_BY_TYPE.items():
-                if values_to_insert[dt]:
-                    self.db.execute(Model.__table__.insert(), values_to_insert[dt])
+            for tbl, rid in pending_value_deletes:
+                pim_sql.execute(self.db, f'DELETE FROM {self._t(tbl)} WHERE "id" = :id', {"id": rid})
+            for tbl, set_values, rid in pending_value_updates:
+                sql, params = pim_sql.build_update(self.entity_name, tbl, set_values, where='"id" = :id', where_params={"id": rid})
+                pim_sql.execute(self.db, sql, params)
+            for eid, set_values in pending_entity_updates.items():
+                sql, params = pim_sql.build_update(self.entity_name, ENTITY_TBL, set_values, where='"id" = :id', where_params={"id": eid})
+                pim_sql.execute(self.db, sql, params)
+            self._bulk_insert_rows(ENTITY_TBL, entities_to_insert)
+            for dt, rows in values_to_insert.items():
+                self._bulk_insert_rows(VALUE_TABLE_BY_TYPE[dt], rows)
             db_commit_auto_rollback(db=self.db)
         except Exception as e:
             self.db.rollback()
             app_logger.exception(f"Flat import failed, rolled back: {e}")
-            err_msg = str(e)
-            if len(err_msg) > 500:
-                err_msg = err_msg[:500] + "..."
+            err_msg = str(e)[:500] + ("..." if len(str(e)) > 500 else "")
             for row in valid_rows:
                 _fail(row.row_number, f"Import failed: {err_msg}")
             return {'inserted': 0, 'updated': 0, 'failed': len(errors), 'errors': errors}
 
-        # ---- Phase 6: refresh denormalized flat rows ----
         affected_ids = {s['id'] for s in entity_cache.values()}
         affected_ids |= {e['parent_id'] for e in entities_to_insert if e.get('parent_id')}
         try:
@@ -2209,7 +1553,13 @@ class PimEntityService:
         except Exception as e:
             app_logger.exception(f"Flat import: flat table refresh failed: {e}")
 
-        app_logger.info(
-            f"Flat import complete: {inserted} inserted, {updated} updated, {len(errors)} failed"
-        )
+        app_logger.info(f"Flat import complete: {inserted} inserted, {updated} updated, {len(errors)} failed")
         return {'inserted': inserted, 'updated': updated, 'failed': len(errors), 'errors': errors}
+
+    def _fetch_two_in(self, sql, p1, v1, p2, v2):
+        """SELECT with two expanding IN params."""
+        v1, v2 = list(v1), list(v2)
+        if not v1 or not v2:  # either empty IN → no rows
+            return []
+        stmt = text(sql).bindparams(bindparam(p1, expanding=True), bindparam(p2, expanding=True))
+        return [dict(r) for r in self.db.execute(stmt, {p1: v1, p2: v2}).mappings().all()]

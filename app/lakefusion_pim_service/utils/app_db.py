@@ -87,8 +87,8 @@ def init_engine_for_entity(entity_name: str, db_name: str) -> sessionmaker:
     """Initialize a data DB engine for a specific entity and store it in the pool.
 
     Called by:
-    - initialize_pim() after creating the DB
-    - get_or_create_engine() for lazy auto-reconnect
+    - get_or_create_engine() for lazy auto-reconnect (entity DB + synced tables
+      are provisioned by the PIM pipeline, not in-process)
     """
     global data_engine, DataSessionLocal
 

@@ -1,12 +1,12 @@
 import traceback
+import uuid
 from datetime import datetime
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
-from sqlalchemy import func
+from app.lakefusion_pim_service.utils import pim_sql
 from lakefusion_utility.models.pim import (
-    PimTaxonomyNode, PimTaxonomyNodeCreate, PimTaxonomyNodeUpdate,
-    PimSpecificationConfig, PimResolvedSpecification, PimEntity,
-    PimAttributeDefinition, PimTaxonomyBulkImportRequest,
+    PimTaxonomyNodeCreate, PimTaxonomyNodeUpdate,
+    PimTaxonomyBulkImportRequest,
     to_value_key,
 )
 from lakefusion_utility.utils.app_db import db_commit_auto_rollback
@@ -14,164 +14,192 @@ from lakefusion_utility.utils.logging_utils import get_logger
 
 app_logger = get_logger(__name__)
 
+# SCRUM-1929 Phase 6.4 — converted from ORM to raw SQL against the Delta-synced
+# tables. Ancestor walks use an in-memory map built from a flat SELECT of all
+# active nodes (no recursive CTE needed); descendant updates use materialized_path
+# LIKE; resolved-cache rebuild is the same closest-ancestor-wins algorithm over
+# rows. Synced tables have no FK cascade — resolved rows are cleared explicitly.
+# entity_name is threaded into the constructor.
+
+NODE_TBL = "pim_taxonomy_node"
+CONFIG_TBL = "pim_specification_config"
+RESOLVED_TBL = "pim_resolved_specification"
+ENTITY_TBL = "pim_entity"
+ATTR_TBL = "pim_attribute_definition"
+
 
 class PimTaxonomyService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, entity_name: str):
         self.db = db
+        self.entity_name = entity_name
+        self._node = pim_sql.pim_tbl(entity_name, NODE_TBL)
+        self._config = pim_sql.pim_tbl(entity_name, CONFIG_TBL)
+        self._resolved = pim_sql.pim_tbl(entity_name, RESOLVED_TBL)
+        self._entity = pim_sql.pim_tbl(entity_name, ENTITY_TBL)
+        self._attr = pim_sql.pim_tbl(entity_name, ATTR_TBL)
 
     # ------------------------------------------------------------------
-    # HELPER – resolve inherited attributes for a single node
+    # HELPER – resolve inherited attributes for a single node (no commit)
     # ------------------------------------------------------------------
-    def _resolve_inherited_for_node(self, node: PimTaxonomyNode):
-        """
-        Compute and upsert PimResolvedSpecification rows for a single node
-        by walking its ancestor chain and collecting configs with inherit_to_children=True.
-        Caller is responsible for committing after this returns.
-        """
-        # Clear any stale resolved rows for this node (handles reactivation)
-        self.db.query(PimResolvedSpecification).filter(
-            PimResolvedSpecification.taxonomy_node_id == node.id
-        ).delete()
-
-        # Build a map of all active nodes to walk the ancestor chain
-        all_nodes = (
-            self.db.query(PimTaxonomyNode)
-            .filter(PimTaxonomyNode.is_active == True)
-            .all()
+    def _resolve_inherited_for_node(self, node: dict):
+        """Compute + upsert resolved rows for one node by walking its ancestor
+        chain and collecting configs with inherit_to_children=True (closest
+        ancestor wins). Caller commits."""
+        pim_sql.execute(
+            self.db, f'DELETE FROM {self._resolved} WHERE "taxonomy_node_id" = :nid',
+            {"nid": node["id"]},
         )
-        ancestor_map = {n.id: n for n in all_nodes}
 
-        # Walk from root down to this node
+        all_nodes = pim_sql.fetch_all(
+            self.db, f'SELECT "id","parent_id","level" FROM {self._node} WHERE "is_active" = TRUE'
+        )
+        ancestor_map = {n["id"]: n for n in all_nodes}
+
         current = node
         ancestors = []
         while current:
             ancestors.insert(0, current)
-            current = ancestor_map.get(current.parent_id)
+            current = ancestor_map.get(current.get("parent_id"))
 
-        # Collect resolved configs (closest ancestor wins for the same attribute)
-        resolved = {}  # attribute_id -> (config, source_node)
+        resolved = {}  # attribute_id -> (config_row, source_node)
         for ancestor in ancestors:
-            configs = (
-                self.db.query(PimSpecificationConfig)
-                .filter(PimSpecificationConfig.taxonomy_node_id == ancestor.id)
-                .all()
+            configs = pim_sql.fetch_all(
+                self.db, f'SELECT * FROM {self._config} WHERE "taxonomy_node_id" = :nid',
+                {"nid": ancestor["id"]},
             )
             for cfg in configs:
-                if ancestor.id == node.id:
-                    resolved[cfg.attribute_id] = (cfg, ancestor)
-                elif cfg.inherit_to_children:
-                    if cfg.attribute_id not in resolved or resolved[cfg.attribute_id][1].level < ancestor.level:
-                        resolved[cfg.attribute_id] = (cfg, ancestor)
+                if ancestor["id"] == node["id"]:
+                    resolved[cfg["attribute_id"]] = (cfg, ancestor)
+                elif cfg["inherit_to_children"]:
+                    cur = resolved.get(cfg["attribute_id"])
+                    if cur is None or cur[1]["level"] < ancestor["level"]:
+                        resolved[cfg["attribute_id"]] = (cfg, ancestor)
 
         for attr_id, (cfg, source_node) in resolved.items():
-            row = PimResolvedSpecification(
-                taxonomy_node_id=node.id,
-                attribute_id=attr_id,
-                config_id=cfg.id,
-                source_node_id=source_node.id,
-                is_required=cfg.is_required,
-                display_order=cfg.display_order,
+            sql, params = pim_sql.build_insert(
+                self.entity_name, RESOLVED_TBL,
+                {
+                    "taxonomy_node_id": node["id"],
+                    "attribute_id": attr_id,
+                    "config_id": cfg["id"],
+                    "source_node_id": source_node["id"],
+                    "is_required": cfg["is_required"],
+                    "display_order": cfg["display_order"],
+                    "resolved_at": pim_sql.utcnow(),
+                },
+                # pim_resolved_specification has NO created_at/updated_at — it uses
+                # resolved_at (set above). Disable both auto-timestamps (matches
+                # rebuild_resolved_cache).
+                auto_created_at=False, auto_updated_at=False,
             )
-            self.db.add(row)
+            pim_sql.execute(self.db, sql, params)
 
     # ------------------------------------------------------------------
     # BULK CREATE
     # ------------------------------------------------------------------
-    def bulk_create_nodes(self, items: list[PimTaxonomyNodeCreate]):
+    def bulk_create_nodes(self, items):
         try:
             codes = [to_value_key(item.code) for item in items]
             if len(codes) != len(set(codes)):
                 raise HTTPException(status_code=400, detail="Duplicate codes found in the request.")
 
-            # All rows share the same parent_id (set by frontend for the target node)
             parent_ids = {item.parent_id for item in items}
 
-            # Pre-check existing codes under each parent
+            # Pre-check existing active codes under each parent
             for pid in parent_ids:
-                existing = (
-                    self.db.query(PimTaxonomyNode.code)
-                    .filter(
-                        PimTaxonomyNode.parent_id == pid,
-                        PimTaxonomyNode.code.in_(codes),
-                        PimTaxonomyNode.is_active == True,
+                if pid:
+                    existing = pim_sql.fetch_all(
+                        self.db,
+                        f'SELECT "code" FROM {self._node} WHERE "parent_id" = :pid '
+                        f'AND "is_active" = TRUE',
+                        {"pid": pid},
                     )
-                    .all()
-                )
-                existing_codes = {row.code for row in existing}
+                else:
+                    existing = pim_sql.fetch_all(
+                        self.db,
+                        f'SELECT "code" FROM {self._node} WHERE "parent_id" IS NULL '
+                        f'AND "is_active" = TRUE',
+                    )
+                existing_codes = {r["code"] for r in existing if r["code"] in codes}
                 if existing_codes:
                     raise HTTPException(
                         status_code=409,
                         detail=f"Taxonomy nodes already exist for codes: {', '.join(sorted(existing_codes))}",
                     )
 
-            # Resolve parent info once per unique parent_id
-            parent_map: dict[str | None, tuple[int, str]] = {}  # parent_id -> (level, path)
+            # Resolve parent info per unique parent_id
+            parent_map = {}  # parent_id -> (level, path)
             for pid in parent_ids:
                 if pid:
-                    parent = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == pid).first()
+                    parent = pim_sql.fetch_one(
+                        self.db, f'SELECT "level","materialized_path" FROM {self._node} WHERE "id" = :id',
+                        {"id": pid},
+                    )
                     if not parent:
                         raise HTTPException(status_code=404, detail=f"Parent taxonomy node '{pid}' not found.")
-                    parent_map[pid] = (parent.level + 1, parent.materialized_path)
+                    parent_map[pid] = (parent["level"] + 1, parent["materialized_path"])
                 else:
                     parent_map[None] = (0, "")
 
-            created = []
+            created_ids = []
             errors = []
             for idx, data in enumerate(items):
                 if not data.code or not data.label:
                     errors.append(f"Row {idx + 1}: code and label are required.")
                     continue
-
                 code = to_value_key(data.code)
                 level, parent_path = parent_map[data.parent_id]
                 materialized_path = f"{parent_path}/{code}" if parent_path else code
 
-                # Reactivate a previously soft-deleted node with the same (parent_id, code)
-                existing_inactive = (
-                    self.db.query(PimTaxonomyNode)
-                    .filter(
-                        PimTaxonomyNode.parent_id == data.parent_id,
-                        PimTaxonomyNode.code == code,
-                        PimTaxonomyNode.is_active == False,
-                    )
-                    .first()
+                existing_inactive = pim_sql.fetch_one(
+                    self.db,
+                    f'SELECT "id" FROM {self._node} WHERE '
+                    f'{"\"parent_id\" = :pid" if data.parent_id else "\"parent_id\" IS NULL"} '
+                    f'AND "code" = :code AND "is_active" = FALSE',
+                    ({"pid": data.parent_id, "code": code} if data.parent_id else {"code": code}),
                 )
                 if existing_inactive:
-                    existing_inactive.is_active = True
-                    existing_inactive.label = data.label
-                    existing_inactive.display_order = data.display_order or 0
-                    existing_inactive.materialized_path = materialized_path
-                    existing_inactive.level = level
-                    existing_inactive.updated_at = datetime.utcnow()
-                    created.append(existing_inactive)
+                    sql, params = pim_sql.build_update(
+                        self.entity_name, NODE_TBL,
+                        {"is_active": True, "label": data.label, "display_order": data.display_order or 0,
+                         "materialized_path": materialized_path, "level": level},
+                        where='"id" = :id', where_params={"id": existing_inactive["id"]},
+                    )
+                    pim_sql.execute(self.db, sql, params)
+                    created_ids.append((existing_inactive["id"], data.parent_id))
                     continue
 
-                node = PimTaxonomyNode(
-                    code=code,
-                    label=data.label,
-                    parent_id=data.parent_id,
-                    materialized_path=materialized_path,
-                    level=level,
-                    display_order=data.display_order or 0,
+                sql, params = pim_sql.build_insert(
+                    self.entity_name, NODE_TBL,
+                    {"code": code, "label": data.label, "parent_id": data.parent_id,
+                     "materialized_path": materialized_path, "level": level,
+                     "display_order": data.display_order or 0},
                 )
-                self.db.add(node)
-                created.append(node)
+                pim_sql.execute(self.db, sql, params)
+                created_ids.append((params["id"], data.parent_id))
 
             if errors:
                 self.db.rollback()
                 raise HTTPException(status_code=400, detail=errors)
 
             db_commit_auto_rollback(db=self.db, raise_exception=True)
-            for node in created:
-                self.db.refresh(node)
 
-            # Seed the resolved-attribute cache for every newly created/reactivated node
-            for node in created:
-                if node.parent_id:
-                    self._resolve_inherited_for_node(node)
+            # Seed resolved cache for each created/reactivated node with a parent
+            for node_id, pid in created_ids:
+                if pid:
+                    node = pim_sql.fetch_one(
+                        self.db, f'SELECT "id","parent_id","level" FROM {self._node} WHERE "id" = :id',
+                        {"id": node_id},
+                    )
+                    if node:
+                        self._resolve_inherited_for_node(node)
             db_commit_auto_rollback(db=self.db, raise_exception=True)
 
-            return {"created": len(created), "nodes": created}
+            nodes = [
+                pim_sql.coerce_row(NODE_TBL, pim_sql.fetch_one(self.db, f'SELECT * FROM {self._node} WHERE "id" = :id', {"id": nid}))
+                for nid, _ in created_ids
+            ]
+            return {"created": len(created_ids), "nodes": nodes}
 
         except HTTPException:
             raise
@@ -186,69 +214,79 @@ class PimTaxonomyService:
     def create_node(self, data: PimTaxonomyNodeCreate):
         try:
             code = to_value_key(data.code)
-            # Check for duplicate code under same parent (active nodes)
-            existing_active = (
-                self.db.query(PimTaxonomyNode)
-                .filter(
-                    PimTaxonomyNode.parent_id == data.parent_id,
-                    PimTaxonomyNode.code == code,
-                    PimTaxonomyNode.is_active == True,
+            if data.parent_id:
+                active_dup = pim_sql.fetch_one(
+                    self.db,
+                    f'SELECT "id" FROM {self._node} WHERE "parent_id" = :pid AND "code" = :code '
+                    f'AND "is_active" = TRUE',
+                    {"pid": data.parent_id, "code": code},
                 )
-                .first()
-            )
-            if existing_active:
+            else:
+                active_dup = pim_sql.fetch_one(
+                    self.db,
+                    f'SELECT "id" FROM {self._node} WHERE "parent_id" IS NULL AND "code" = :code '
+                    f'AND "is_active" = TRUE',
+                    {"code": code},
+                )
+            if active_dup:
                 raise HTTPException(
                     status_code=409,
                     detail=f"Taxonomy node with code '{code}' already exists under this parent.",
                 )
 
-            # Compute level and materialized_path
             if data.parent_id:
-                parent = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == data.parent_id).first()
+                parent = pim_sql.fetch_one(
+                    self.db, f'SELECT "level","materialized_path" FROM {self._node} WHERE "id" = :id',
+                    {"id": data.parent_id},
+                )
                 if not parent:
                     raise HTTPException(status_code=404, detail="Parent taxonomy node not found.")
-                level = parent.level + 1
-                materialized_path = f"{parent.materialized_path}/{code}"
+                level = parent["level"] + 1
+                materialized_path = f"{parent['materialized_path']}/{code}"
             else:
                 level = 0
                 materialized_path = code
 
-            # Reactivate a previously soft-deleted node with the same (parent_id, code)
-            existing_inactive = (
-                self.db.query(PimTaxonomyNode)
-                .filter(
-                    PimTaxonomyNode.parent_id == data.parent_id,
-                    PimTaxonomyNode.code == code,
-                    PimTaxonomyNode.is_active == False,
+            # Reactivate a soft-deleted node with the same (parent_id, code)
+            if data.parent_id:
+                inactive = pim_sql.fetch_one(
+                    self.db,
+                    f'SELECT "id" FROM {self._node} WHERE "parent_id" = :pid AND "code" = :code '
+                    f'AND "is_active" = FALSE',
+                    {"pid": data.parent_id, "code": code},
                 )
-                .first()
-            )
-            if existing_inactive:
-                existing_inactive.is_active = True
-                existing_inactive.label = data.label
-                existing_inactive.display_order = data.display_order or 0
-                existing_inactive.materialized_path = materialized_path
-                existing_inactive.level = level
-                existing_inactive.updated_at = datetime.utcnow()
+            else:
+                inactive = pim_sql.fetch_one(
+                    self.db,
+                    f'SELECT "id" FROM {self._node} WHERE "parent_id" IS NULL AND "code" = :code '
+                    f'AND "is_active" = FALSE',
+                    {"code": code},
+                )
+            if inactive:
+                sql, params = pim_sql.build_update(
+                    self.entity_name, NODE_TBL,
+                    {"is_active": True, "label": data.label, "display_order": data.display_order or 0,
+                     "materialized_path": materialized_path, "level": level},
+                    where='"id" = :id', where_params={"id": inactive["id"]},
+                )
+                pim_sql.execute(self.db, sql, params)
                 db_commit_auto_rollback(db=self.db)
-                self.db.refresh(existing_inactive)
-                if existing_inactive.parent_id:
-                    self._resolve_inherited_for_node(existing_inactive)
+                node = pim_sql.coerce_row(NODE_TBL, pim_sql.fetch_one(self.db, f'SELECT * FROM {self._node} WHERE "id" = :id', {"id": inactive["id"]}))
+                if node and node["parent_id"]:
+                    self._resolve_inherited_for_node(node)
                     db_commit_auto_rollback(db=self.db)
-                return existing_inactive
+                return node
 
-            node = PimTaxonomyNode(
-                code=code,
-                label=data.label,
-                parent_id=data.parent_id,
-                materialized_path=materialized_path,
-                level=level,
-                display_order=data.display_order or 0,
+            sql, params = pim_sql.build_insert(
+                self.entity_name, NODE_TBL,
+                {"code": code, "label": data.label, "parent_id": data.parent_id,
+                 "materialized_path": materialized_path, "level": level,
+                 "display_order": data.display_order or 0},
             )
-            self.db.add(node)
+            pim_sql.execute(self.db, sql, params)
             db_commit_auto_rollback(db=self.db)
-            self.db.refresh(node)
-            if node.parent_id:
+            node = pim_sql.coerce_row(NODE_TBL, pim_sql.fetch_one(self.db, f'SELECT * FROM {self._node} WHERE "id" = :id', {"id": params["id"]}))
+            if node and node["parent_id"]:
                 self._resolve_inherited_for_node(node)
                 db_commit_auto_rollback(db=self.db)
             return node
@@ -265,19 +303,17 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def get_tree(self):
         try:
-            nodes = (
-                self.db.query(PimTaxonomyNode)
-                .filter(PimTaxonomyNode.is_active == True)
-                .order_by(PimTaxonomyNode.level, PimTaxonomyNode.display_order)
-                .all()
+            nodes = pim_sql.coerce_rows(NODE_TBL, pim_sql.fetch_all(
+                self.db,
+                f'SELECT * FROM {self._node} WHERE "is_active" = TRUE '
+                f'ORDER BY "level", "display_order"',
+            ))
+            counts = pim_sql.fetch_all(
+                self.db,
+                f'SELECT "taxonomy_node_id", COUNT("id") AS cnt FROM {self._entity} '
+                f'WHERE "active" = TRUE GROUP BY "taxonomy_node_id"',
             )
-            counts = (
-                self.db.query(PimEntity.taxonomy_node_id, func.count(PimEntity.id).label("cnt"))
-                .filter(PimEntity.active == True)
-                .group_by(PimEntity.taxonomy_node_id)
-                .all()
-            )
-            count_map = {row.taxonomy_node_id: row.cnt for row in counts}
+            count_map = {r["taxonomy_node_id"]: r["cnt"] for r in counts}
             return self._build_tree(nodes, count_map)
         except Exception as e:
             app_logger.exception(f"Error fetching taxonomy tree: {str(e)}")
@@ -286,24 +322,19 @@ class PimTaxonomyService:
     def _build_tree(self, nodes, count_map=None):
         if count_map is None:
             count_map = {}
-        node_map = {n.id: {
-            "id": n.id,
-            "code": n.code,
-            "label": n.label,
-            "parent_id": n.parent_id,
-            "materialized_path": n.materialized_path,
-            "level": n.level,
-            "display_order": n.display_order,
-            "product_count": count_map.get(n.id, 0),
-            "children": [],
+        node_map = {n["id"]: {
+            "id": n["id"], "code": n["code"], "label": n["label"],
+            "parent_id": n["parent_id"], "materialized_path": n["materialized_path"],
+            "level": n["level"], "display_order": n["display_order"],
+            "product_count": count_map.get(n["id"], 0), "children": [],
         } for n in nodes}
 
         roots = []
         for n in nodes:
-            if n.parent_id and n.parent_id in node_map:
-                node_map[n.parent_id]["children"].append(node_map[n.id])
+            if n["parent_id"] and n["parent_id"] in node_map:
+                node_map[n["parent_id"]]["children"].append(node_map[n["id"]])
             else:
-                roots.append(node_map[n.id])
+                roots.append(node_map[n["id"]])
 
         def _compute_totals(node):
             total = node["product_count"]
@@ -314,7 +345,6 @@ class PimTaxonomyService:
 
         for root in roots:
             _compute_totals(root)
-
         return roots
 
     # ------------------------------------------------------------------
@@ -322,19 +352,17 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def get_subtree(self, node_id: str):
         try:
-            node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == node_id).first()
+            node = pim_sql.fetch_one(
+                self.db, f'SELECT "materialized_path" FROM {self._node} WHERE "id" = :id', {"id": node_id}
+            )
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
-
-            descendants = (
-                self.db.query(PimTaxonomyNode)
-                .filter(
-                    PimTaxonomyNode.materialized_path.like(f"{node.materialized_path}%"),
-                    PimTaxonomyNode.is_active == True,
-                )
-                .order_by(PimTaxonomyNode.level, PimTaxonomyNode.display_order)
-                .all()
-            )
+            descendants = pim_sql.coerce_rows(NODE_TBL, pim_sql.fetch_all(
+                self.db,
+                f'SELECT * FROM {self._node} WHERE "materialized_path" LIKE :pat '
+                f'AND "is_active" = TRUE ORDER BY "level", "display_order"',
+                {"pat": f"{node['materialized_path']}%"},
+            ))
             return self._build_tree(descendants)
         except HTTPException:
             raise
@@ -347,11 +375,9 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def get_node(self, node_id: str):
         try:
-            node = (
-                self.db.query(PimTaxonomyNode)
-                .filter(PimTaxonomyNode.id == node_id, PimTaxonomyNode.is_active == True)
-                .first()
-            )
+            node = pim_sql.coerce_row(NODE_TBL, pim_sql.fetch_one(
+                self.db, f'SELECT * FROM {self._node} WHERE "id" = :id AND "is_active" = TRUE', {"id": node_id}
+            ))
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
             return node
@@ -366,58 +392,72 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def update_node(self, node_id: str, data: PimTaxonomyNodeUpdate):
         try:
-            node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == node_id).first()
+            node = pim_sql.fetch_one(self.db, f'SELECT * FROM {self._node} WHERE "id" = :id', {"id": node_id})
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
 
-            parent_changed = False
+            new_code = to_value_key(data.code) if data.code is not None else node["code"]
+            set_values = {}
             if data.code is not None:
-                node.code = to_value_key(data.code)
+                set_values["code"] = new_code
             if data.label is not None:
-                node.label = data.label
+                set_values["label"] = data.label
             if data.display_order is not None:
-                node.display_order = data.display_order
+                set_values["display_order"] = data.display_order
             if data.is_active is not None:
-                node.is_active = data.is_active
+                set_values["is_active"] = data.is_active
 
-            # Handle parent_id change
-            # FE sends parent_id as: UUID string (reparent), empty string (move to root), or omits it (no change)
+            parent_changed = False
+            new_parent_id = node["parent_id"]
             if data.parent_id is not None:
-                new_parent_id = data.parent_id if data.parent_id else None
-                old_parent_id = str(node.parent_id) if node.parent_id else None
-                if new_parent_id != old_parent_id:
+                candidate = data.parent_id if data.parent_id else None
+                old_parent_id = str(node["parent_id"]) if node["parent_id"] else None
+                if candidate != old_parent_id:
                     parent_changed = True
-                    node.parent_id = new_parent_id
+                    new_parent_id = candidate
+                    set_values["parent_id"] = candidate
 
-            # Recompute materialized_path and level if parent or code changed
+            old_path = node["materialized_path"]
             if parent_changed or data.code is not None:
-                old_path = node.materialized_path
-                if node.parent_id:
-                    parent = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == node.parent_id).first()
+                if new_parent_id:
+                    parent = pim_sql.fetch_one(
+                        self.db, f'SELECT "level","materialized_path" FROM {self._node} WHERE "id" = :id',
+                        {"id": new_parent_id},
+                    )
                     if parent:
-                        node.level = parent.level + 1
-                        node.materialized_path = f"{parent.materialized_path}/{node.code}"
+                        set_values["level"] = parent["level"] + 1
+                        set_values["materialized_path"] = f"{parent['materialized_path']}/{new_code}"
                     else:
-                        node.level = 0
-                        node.materialized_path = f"/{node.code}"
+                        set_values["level"] = 0
+                        set_values["materialized_path"] = f"/{new_code}"
                 else:
-                    node.level = 0
-                    node.materialized_path = f"/{node.code}"
+                    set_values["level"] = 0
+                    set_values["materialized_path"] = f"/{new_code}"
 
-                # Update descendant paths and levels
-                descendants = (
-                    self.db.query(PimTaxonomyNode)
-                    .filter(PimTaxonomyNode.materialized_path.like(f"{old_path}/%"))
-                    .all()
+            if set_values:
+                sql, params = pim_sql.build_update(
+                    self.entity_name, NODE_TBL, set_values, where='"id" = :id', where_params={"id": node_id},
+                )
+                pim_sql.execute(self.db, sql, params)
+
+            # Update descendant paths + levels (path replace) if path changed
+            if (parent_changed or data.code is not None) and "materialized_path" in set_values:
+                new_path = set_values["materialized_path"]
+                descendants = pim_sql.fetch_all(
+                    self.db, f'SELECT "id","materialized_path" FROM {self._node} WHERE "materialized_path" LIKE :pat',
+                    {"pat": f"{old_path}/%"},
                 )
                 for desc in descendants:
-                    desc.materialized_path = desc.materialized_path.replace(old_path, node.materialized_path, 1)
-                    desc.level = len(desc.materialized_path.strip("/").split("/")) - 1
+                    dpath = desc["materialized_path"].replace(old_path, new_path, 1)
+                    dlevel = len(dpath.strip("/").split("/")) - 1
+                    dsql, dparams = pim_sql.build_update(
+                        self.entity_name, NODE_TBL, {"materialized_path": dpath, "level": dlevel},
+                        where='"id" = :id', where_params={"id": desc["id"]},
+                    )
+                    pim_sql.execute(self.db, dsql, dparams)
 
-            node.updated_at = datetime.utcnow()
             db_commit_auto_rollback(db=self.db)
-            self.db.refresh(node)
-            return node
+            return pim_sql.fetch_one(self.db, f'SELECT * FROM {self._node} WHERE "id" = :id', {"id": node_id})
 
         except HTTPException:
             raise
@@ -427,26 +467,29 @@ class PimTaxonomyService:
             raise HTTPException(status_code=500, detail=f"Failed to update taxonomy node: {str(e)}")
 
     # ------------------------------------------------------------------
-    # DELETE (soft)
+    # DELETE (soft) — node + all descendants
     # ------------------------------------------------------------------
     def delete_node(self, node_id: str):
         try:
-            node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == node_id).first()
+            node = pim_sql.fetch_one(
+                self.db, f'SELECT "code","materialized_path" FROM {self._node} WHERE "id" = :id', {"id": node_id}
+            )
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
 
-            # Soft-delete node and all descendants
-            descendants = (
-                self.db.query(PimTaxonomyNode)
-                .filter(PimTaxonomyNode.materialized_path.like(f"{node.materialized_path}%"))
-                .all()
+            descendants = pim_sql.fetch_all(
+                self.db, f'SELECT "id" FROM {self._node} WHERE "materialized_path" LIKE :pat',
+                {"pat": f"{node['materialized_path']}%"},
             )
-            for desc in descendants:
-                desc.is_active = False
-                desc.updated_at = datetime.utcnow()
-
+            now = pim_sql.utcnow()
+            pim_sql.execute(
+                self.db,
+                f'UPDATE {self._node} SET "is_active" = FALSE, "updated_at" = :ts '
+                f'WHERE "materialized_path" LIKE :pat',
+                {"ts": now, "pat": f"{node['materialized_path']}%"},
+            )
             db_commit_auto_rollback(db=self.db)
-            return {"message": f"Taxonomy node '{node.code}' and {len(descendants) - 1} descendants soft-deleted."}
+            return {"message": f"Taxonomy node '{node['code']}' and {len(descendants) - 1} descendants soft-deleted."}
 
         except HTTPException:
             raise
@@ -455,33 +498,33 @@ class PimTaxonomyService:
             raise HTTPException(status_code=500, detail=str(e))
 
     # ------------------------------------------------------------------
-    # DELETE CHILDREN (soft) — keeps the node, removes all descendants
+    # DELETE CHILDREN (soft) — keeps the node, removes descendants
     # ------------------------------------------------------------------
     def delete_children(self, node_id: str):
         try:
-            node = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == node_id).first()
+            node = pim_sql.fetch_one(
+                self.db, f'SELECT "code","materialized_path" FROM {self._node} WHERE "id" = :id', {"id": node_id}
+            )
             if not node:
                 raise HTTPException(status_code=404, detail="Taxonomy node not found.")
 
-            # Soft-delete only strict descendants (path starts with node path + "/")
-            descendants = (
-                self.db.query(PimTaxonomyNode)
-                .filter(
-                    PimTaxonomyNode.materialized_path.like(f"{node.materialized_path}/%"),
-                    PimTaxonomyNode.is_active == True,
-                )
-                .all()
+            pat = f"{node['materialized_path']}/%"
+            descendants = pim_sql.fetch_all(
+                self.db,
+                f'SELECT "id" FROM {self._node} WHERE "materialized_path" LIKE :pat AND "is_active" = TRUE',
+                {"pat": pat},
             )
-
             if not descendants:
-                return {"message": f"Node '{node.code}' has no active children to delete."}
+                return {"message": f"Node '{node['code']}' has no active children to delete."}
 
-            for desc in descendants:
-                desc.is_active = False
-                desc.updated_at = datetime.utcnow()
-
+            pim_sql.execute(
+                self.db,
+                f'UPDATE {self._node} SET "is_active" = FALSE, "updated_at" = :ts '
+                f'WHERE "materialized_path" LIKE :pat AND "is_active" = TRUE',
+                {"ts": pim_sql.utcnow(), "pat": pat},
+            )
             db_commit_auto_rollback(db=self.db)
-            return {"message": f"{len(descendants)} descendant(s) of '{node.code}' soft-deleted."}
+            return {"message": f"{len(descendants)} descendant(s) of '{node['code']}' soft-deleted."}
 
         except HTTPException:
             raise
@@ -494,66 +537,55 @@ class PimTaxonomyService:
     # ------------------------------------------------------------------
     def rebuild_resolved_cache(self):
         try:
-            # Clear existing cache
-            self.db.query(PimResolvedSpecification).delete()
+            pim_sql.execute(self.db, f'DELETE FROM {self._resolved}')
 
-            # Get all active nodes ordered by level (parents first)
-            nodes = (
-                self.db.query(PimTaxonomyNode)
-                .filter(PimTaxonomyNode.is_active == True)
-                .order_by(PimTaxonomyNode.level)
-                .all()
+            nodes = pim_sql.fetch_all(
+                self.db,
+                f'SELECT "id","parent_id","level","materialized_path" FROM {self._node} '
+                f'WHERE "is_active" = TRUE ORDER BY "level"',
             )
+            ancestor_map = {n["id"]: n for n in nodes}
 
-            # For each node, collect directly assigned + inherited configs
+            # Pre-fetch all configs grouped by node for efficiency
+            all_configs = pim_sql.fetch_all(self.db, f'SELECT * FROM {self._config}')
+            configs_by_node = {}
+            for c in all_configs:
+                configs_by_node.setdefault(c["taxonomy_node_id"], []).append(c)
+
             for node in nodes:
-                path_parts = node.materialized_path.split("/")
-
-                # Walk from root to this node, collecting configs
-                resolved = {}  # attribute_id -> (config, source_node)
-                ancestor_nodes = (
-                    self.db.query(PimTaxonomyNode)
-                    .filter(PimTaxonomyNode.is_active == True)
-                    .all()
-                )
-                ancestor_map = {n.id: n for n in ancestor_nodes}
-
-                # Walk the path from root to this node
                 current = node
                 ancestors = []
                 while current:
                     ancestors.insert(0, current)
-                    current = ancestor_map.get(current.parent_id)
+                    current = ancestor_map.get(current.get("parent_id"))
 
+                resolved = {}  # attribute_id -> (config, source_node)
                 for ancestor in ancestors:
-                    configs = (
-                        self.db.query(PimSpecificationConfig)
-                        .filter(PimSpecificationConfig.taxonomy_node_id == ancestor.id)
-                        .all()
-                    )
-                    for cfg in configs:
-                        if ancestor.id == node.id:
-                            # Direct config always applies
-                            resolved[cfg.attribute_id] = (cfg, ancestor)
-                        elif cfg.inherit_to_children:
-                            # Inherited config — may be overridden by descendant
-                            if cfg.attribute_id not in resolved or resolved[cfg.attribute_id][1].level < ancestor.level:
-                                resolved[cfg.attribute_id] = (cfg, ancestor)
+                    for cfg in configs_by_node.get(ancestor["id"], []):
+                        if ancestor["id"] == node["id"]:
+                            resolved[cfg["attribute_id"]] = (cfg, ancestor)
+                        elif cfg["inherit_to_children"]:
+                            cur = resolved.get(cfg["attribute_id"])
+                            if cur is None or cur[1]["level"] < ancestor["level"]:
+                                resolved[cfg["attribute_id"]] = (cfg, ancestor)
 
-                # Insert resolved rows
                 for attr_id, (cfg, source_node) in resolved.items():
-                    row = PimResolvedSpecification(
-                        taxonomy_node_id=node.id,
-                        attribute_id=attr_id,
-                        config_id=cfg.id,
-                        source_node_id=source_node.id,
-                        is_required=cfg.is_required,
-                        display_order=cfg.display_order,
+                    sql, params = pim_sql.build_insert(
+                        self.entity_name, RESOLVED_TBL,
+                        {
+                            "taxonomy_node_id": node["id"], "attribute_id": attr_id,
+                            "config_id": cfg["id"], "source_node_id": source_node["id"],
+                            "is_required": cfg["is_required"], "display_order": cfg["display_order"],
+                            "resolved_at": pim_sql.utcnow(),
+                        },
+                        # pim_resolved_specification has NO created_at/updated_at — it
+                        # uses resolved_at (set above). Disable both auto-timestamps.
+                        auto_created_at=False, auto_updated_at=False,
                     )
-                    self.db.add(row)
+                    pim_sql.execute(self.db, sql, params)
 
             db_commit_auto_rollback(db=self.db)
-            count = self.db.query(PimResolvedSpecification).count()
+            count = pim_sql.fetch_scalar(self.db, f'SELECT COUNT(*) FROM {self._resolved}') or 0
             return {"message": f"Resolved attribute config cache rebuilt. {count} rows created."}
 
         except Exception as e:
@@ -565,14 +597,9 @@ class PimTaxonomyService:
     # BULK TAXONOMY IMPORT  (SCRUM-1790)
     # ------------------------------------------------------------------
     def bulk_import_taxonomy(self, data: PimTaxonomyBulkImportRequest):
-        """
-        Bulk import taxonomy nodes and their spec bindings in a single transaction.
-        Specifications (attribute definitions) are NOT created here — they are
-        imported separately via the Specifications tab. Bindings reference spec
-        codes that must already exist; unresolved codes are reported as errors.
-        """
-        import uuid
-
+        """Bulk import taxonomy nodes + spec bindings in one transaction.
+        Specs must already exist (imported via Specifications tab); unresolved
+        codes are reported as errors."""
         errors = []
         nodes_created = 0
         bindings_created = 0
@@ -580,10 +607,8 @@ class PimTaxonomyService:
         def _uuid():
             return str(uuid.uuid4())
 
-        # ── Phase 1: Create taxonomy nodes (ordered by depth) ──
         app_logger.info(f"Bulk taxonomy import: {len(data.nodes)} nodes, {len(data.bindings)} bindings")
 
-        # Build parent-code → depth map for ordering
         parent_map = {n.code: n.parent_code for n in data.nodes}
         def get_depth(code):
             depth = 0
@@ -597,109 +622,83 @@ class PimTaxonomyService:
 
         sorted_nodes = sorted(data.nodes, key=lambda n: get_depth(n.code))
 
-        # Check existing nodes
-        existing_codes = set()
-        existing_query = self.db.query(PimTaxonomyNode.code).filter(PimTaxonomyNode.is_active == True).all()
-        for row in existing_query:
-            existing_codes.add(row.code)
-
-        code_to_id = {}
-        # Seed existing code→id
-        for row in self.db.query(PimTaxonomyNode.code, PimTaxonomyNode.id).filter(PimTaxonomyNode.is_active == True).all():
-            code_to_id[row.code] = row.id
+        existing_rows = pim_sql.fetch_all(
+            self.db, f'SELECT "code","id" FROM {self._node} WHERE "is_active" = TRUE'
+        )
+        existing_codes = {r["code"] for r in existing_rows}
+        code_to_id = {r["code"]: r["id"] for r in existing_rows}
 
         nodes_to_insert = []
         now = datetime.utcnow()
-
         for node in sorted_nodes:
             code = to_value_key(node.code)
             if code in existing_codes:
-                continue  # skip duplicates
-
+                continue
             node_id = _uuid()
             parent_id = code_to_id.get(to_value_key(node.parent_code)) if node.parent_code else None
-
-            # Calculate level and path
             level = 0
             path = code
             if parent_id and node.parent_code:
-                parent_row = self.db.query(PimTaxonomyNode).filter(PimTaxonomyNode.id == parent_id).first()
+                parent_row = pim_sql.fetch_one(
+                    self.db, f'SELECT "level","materialized_path" FROM {self._node} WHERE "id" = :id',
+                    {"id": parent_id},
+                )
                 if parent_row:
-                    level = parent_row.level + 1
-                    path = f"{parent_row.materialized_path}/{code}"
-
+                    level = parent_row["level"] + 1
+                    path = f"{parent_row['materialized_path']}/{code}"
             nodes_to_insert.append({
-                'id': node_id,
-                'code': code,
-                'label': node.label,
-                'parent_id': parent_id,
-                'level': level,
-                'materialized_path': path,
-                'display_order': 0,
-                'is_active': True,
-                'created_at': now,
-                'updated_at': now,
+                "id": node_id, "code": code, "label": node.label, "parent_id": parent_id,
+                "level": level, "materialized_path": path, "display_order": 0,
+                "is_active": True, "created_at": now, "updated_at": now,
             })
             code_to_id[node.code] = node_id
-            code_to_id[code] = node_id  # also store lowercase version
+            code_to_id[code] = node_id
             existing_codes.add(code)
             nodes_created += 1
 
-        # ── Phases 2-4: All inserts in a single try block with rollback on failure ──
         try:
-            # Phase 2a: Insert nodes
+            # Batched insert (reference-entity pattern) — node dicts are fully built
+            # (id/level/materialized_path computed above), safe to insert in one batch.
             if nodes_to_insert:
-                self.db.execute(PimTaxonomyNode.__table__.insert(), nodes_to_insert)
+                cols = list({k for r in nodes_to_insert for k in r.keys()})
+                norm = [{c: r.get(c) for c in cols} for r in nodes_to_insert]
+                pim_sql.bulk_insert(self.db, self.entity_name, NODE_TBL, norm)
                 app_logger.info(f"Bulk taxonomy: inserted {len(nodes_to_insert)} nodes")
 
-            # Phase 2b: Resolve spec (attribute) codes to ids for binding.
-            # Specs are created in the Specifications tab, so they must already exist.
-            attr_code_to_id = {}
-            for row in self.db.query(PimAttributeDefinition.code, PimAttributeDefinition.id).all():
-                attr_code_to_id[row.code] = row.id
+            attr_rows = pim_sql.fetch_all(self.db, f'SELECT "code","id" FROM {self._attr}')
+            attr_code_to_id = {r["code"]: r["id"] for r in attr_rows}
 
-            # Phase 3: Build and insert bindings
             existing_bindings = set()
-            for row in self.db.query(
-                PimSpecificationConfig.taxonomy_node_id,
-                PimSpecificationConfig.attribute_id
-            ).all():
-                existing_bindings.add(f"{row.taxonomy_node_id}:{row.attribute_id}")
+            for r in pim_sql.fetch_all(
+                self.db, f'SELECT "taxonomy_node_id","attribute_id" FROM {self._config}'
+            ):
+                existing_bindings.add(f"{r['taxonomy_node_id']}:{r['attribute_id']}")
 
-            bindings_to_insert = []
             unknown_specs = set()
+            bindings_to_insert = []
             for bind in (data.bindings or []):
                 node_id = code_to_id.get(bind.category_code) or code_to_id.get(to_value_key(bind.category_code))
                 attr_id = attr_code_to_id.get(bind.attribute_code) or attr_code_to_id.get(to_value_key(bind.attribute_code))
-
                 if not attr_id:
-                    # Spec code in the file does not exist — surface it instead of dropping silently.
                     unknown_specs.add(bind.attribute_code)
                     continue
                 if not node_id:
                     continue
-
                 binding_key = f"{node_id}:{attr_id}"
                 if binding_key in existing_bindings:
                     continue
-
                 bindings_to_insert.append({
-                    'id': _uuid(),
-                    'taxonomy_node_id': node_id,
-                    'attribute_id': attr_id,
-                    'is_required': bind.is_required or False,
-                    'inherit_to_children': bind.inherit_to_children if bind.inherit_to_children is not None else True,
-                    'override_allowed': True,
-                    'display_order': 0,
-                    'created_at': now,
-                    'updated_at': now,
+                    "id": _uuid(), "taxonomy_node_id": node_id, "attribute_id": attr_id,
+                    "is_required": bind.is_required or False,
+                    "inherit_to_children": bind.inherit_to_children if bind.inherit_to_children is not None else True,
+                    "override_allowed": True, "display_order": 0,
+                    "created_at": now, "updated_at": now,
                 })
                 existing_bindings.add(binding_key)
                 bindings_created += 1
-
+            # Batched insert (reference-entity pattern).
             if bindings_to_insert:
-                self.db.execute(PimSpecificationConfig.__table__.insert(), bindings_to_insert)
-                app_logger.info(f"Bulk taxonomy: inserted {len(bindings_to_insert)} bindings")
+                pim_sql.bulk_insert(self.db, self.entity_name, CONFIG_TBL, bindings_to_insert)
 
             if unknown_specs:
                 errors.append(
@@ -707,18 +706,15 @@ class PimTaxonomyService:
                     f"{', '.join(sorted(unknown_specs))}. Import them via the Specifications tab first."
                 )
 
-            # Phase 4: Single commit
             db_commit_auto_rollback(db=self.db)
             app_logger.info(f"Bulk taxonomy import complete: {nodes_created} nodes, {bindings_created} bindings")
 
         except Exception as e:
-            # Rollback entire transaction — DB stays clean
             self.db.rollback()
             app_logger.exception(f"Bulk taxonomy import failed, rolled back: {str(e)}")
             errors.append(f"Import failed (rolled back): {str(e)}")
             return {"nodes_created": 0, "bindings_created": 0, "errors": errors}
 
-        # ── Phase 5: Rebuild resolved config cache (after successful commit) ──
         if bindings_created > 0:
             try:
                 self.rebuild_resolved_cache()
@@ -726,8 +722,4 @@ class PimTaxonomyService:
             except Exception as e:
                 errors.append(f"Cache rebuild failed (data saved, cache stale): {str(e)}")
 
-        return {
-            "nodes_created": nodes_created,
-            "bindings_created": bindings_created,
-            "errors": errors,
-        }
+        return {"nodes_created": nodes_created, "bindings_created": bindings_created, "errors": errors}

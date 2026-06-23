@@ -1,12 +1,17 @@
+import os
+import requests
 from fastapi import HTTPException, Depends, APIRouter, Query
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
+from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.models.integration_hub import (
     Integration_HubCreate, Integration_HubResponse, Integration_HubUpdate,
     RefEntitySyncPipelineCreate, RefEntitySyncPipelineUpdate, RefEntitySyncPipelineResponse,
     RelationshipSyncPipelineCreate, RelationshipSyncPipelineUpdate, RelationshipSyncPipelineResponse,
 )
-from lakefusion_utility.services.integration_hub_service import Integration_HubService, RefEntitySyncPipelineService
+from lakefusion_utility.services.integration_hub_service import (
+    Integration_HubService, RefEntitySyncPipelineService,
+)
 from lakefusion_utility.services.relationship_sync_service import RelationshipSyncPipelineService
 from typing import List, Optional
 from pydantic import BaseModel
@@ -15,13 +20,47 @@ from lakefusion_utility.services.model_experiment_service import compare_version
 # Initialize the router with a prefix and tag
 integration_hub_router = APIRouter(tags=["Integration Hub API"], prefix='/integration-hub')
 
+_logger = get_logger(__name__)
+
+# Local dev only: the PIM init pipeline is Databricks-bound and cannot run against
+# local Postgres. Set PIM_LOCAL_INIT=true (middlelayer-owned flag) ONLY in a local
+# Postgres dev setup — then the hub skips the Databricks submit and triggers PIM's
+# /initialize-local over HTTP instead. Default = false (submit the Databricks job).
+# (We deliberately do NOT key off DATA_DB_TYPE: that describes the PIM service's data
+# DB, which the middlelayer doesn't own and usually doesn't set.)
+_SKIP_PIM_PIPELINE = os.getenv("PIM_LOCAL_INIT", "false").lower() == "true"
+
+
+def _trigger_pim_local_init(entity_id: int, token: str = ""):
+    """Call the PIM service to create + seed PIM tables in local Postgres."""
+    try:
+        pim_service_url = os.getenv("PIM_SERVICE_URL", "http://localhost:8006")
+        url = f"{pim_service_url}/api/pim/entity-bridge/{entity_id}/initialize-local"
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        resp = requests.post(url, headers=headers, timeout=60)
+        if resp.status_code >= 400:
+            _logger.warning(f"PIM local init failed ({resp.status_code}): {resp.text}")
+        else:
+            _logger.info(f"PIM local init done for entity {entity_id}: {resp.text}")
+    except Exception as e:
+        _logger.warning(f"PIM local init call failed (service unavailable?): {e}")
+
+
 # Create a new Entity
 @integration_hub_router.post("/", response_model=Integration_HubResponse)
 def create_integration_hub(task: Integration_HubCreate, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     task.created_by = check.get('decoded', {}).get('sub', '')
     token = check.get('token')
     service = Integration_HubService(db)  # Create an instance of EntityService
-    return service.create_integration_hub(task, token)
+    created = service.create_integration_hub(task, token, skip_pipeline_submit=_SKIP_PIM_PIPELINE)
+    # Local-Postgres dev only (PIM_LOCAL_INIT=true): the Databricks pipeline was
+    # skipped — create + seed the PIM tables locally by calling the PIM service
+    # (synchronous so the caller sees init complete before using the entity).
+    if _SKIP_PIM_PIPELINE and getattr(created, "task_type", None) == "pim":
+        _trigger_pim_local_init(created.entity_id, token)
+    return created
 
 # Read all Entitys with an optional `is_active` filter
 @integration_hub_router.get("/", response_model=List[Integration_HubResponse])

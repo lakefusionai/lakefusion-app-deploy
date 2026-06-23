@@ -8,7 +8,6 @@ the human email for LakeGraph's audit trail.
 """
 
 from typing import List, Optional
-import os
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
@@ -21,7 +20,10 @@ from lakefusion_utility.models.relationship import (
     RelationshipGraphUpdate,
     RelationshipGraphResponse,
 )
-from lakefusion_utility.services.lakegraph_service import LakeGraphService
+from lakefusion_utility.services.lakegraph_service import (
+    LakeGraphService,
+    _lakegraph_url_value,
+)
 from lakefusion_utility.services.relationship_graph_service import (
     RelationshipGraphService,
 )
@@ -41,10 +43,9 @@ def get_config(
     check: dict = Depends(token_required_wrapper),
 ):
     """Tells the UI whether the LakeGraph integration is configured + the base URL
-    (for the in-new-tab redirect after deploy)."""
-    url = os.environ.get("LAKEGRAPH_URL", "")
-    if url and not url.startswith(("http://", "https://")):
-        url = f"https://{url}"
+    (for the in-new-tab redirect after deploy). Read from db_config_properties
+    (Settings → LakeGraph), not an env var."""
+    url = _lakegraph_url_value(db)
     return {"enabled": bool(url), "lakegraph_url": url}
 
 

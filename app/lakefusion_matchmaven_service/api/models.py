@@ -103,22 +103,37 @@ def update_model(entity_id:int,model_id: int,request: Model_ExperimentUpdateRequ
 
 # Delete a model by its ID
 @models_router.delete("/{model_id}")
-def delete_model(model_id: int, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+def delete_model(
+    model_id: int,
+    drop_tables: bool = False,
+    delete_job: bool = False,
+    warehouse_id: str = None,
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
     """
     Delete a model by its ID.
-    
+
+    Optional cleanup flags (both default False — original behavior preserved):
+      - drop_tables=true → drop every Delta table/view + VS index this
+        experiment created (suffix `_<model_id>`).
+      - delete_job=true  → delete the Databricks job(s) linked to this model
+        from the workspace (Model_Databricks_Job rows are always deleted
+        from the DB regardless).
+
     MIGRATION NOTICE:
     - Previous endpoint: DELETE /match_maven/delete-model (DEPRECATED)
     - New endpoint: DELETE /entities/{entity_id}/models/{model_id}
-    
-    Changes made:
-    - Moved to nested resource structure following REST conventions
-    - Changed model_id from query parameter to path parameter
-    - Added entity_id as path parameter for proper resource hierarchy
-    - Maintained same response structure for backward compatibility
     """
+    token = check.get('token')
     experiment_service = ExperimentService(db)
-    return experiment_service.delete_model(model_id)
+    return experiment_service.delete_model(
+        model_id,
+        token=token,
+        drop_tables=drop_tables,
+        delete_job=delete_job,
+        warehouse_id=warehouse_id,
+    )
 
 #----------------------------------------------------------------#
 # Potential Matches API

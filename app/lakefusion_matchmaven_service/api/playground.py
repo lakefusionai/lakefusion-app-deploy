@@ -3,7 +3,10 @@ Playground API Routes for Match Maven.
 
 Provides endpoints for the playground feature:
 - Execute LLM entity comparison
+- Execute deterministic rules comparison (pandas-based, in-process)
 """
+
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -11,8 +14,11 @@ from app.lakefusion_matchmaven_service.utils.app_db import token_required_wrappe
 from app.lakefusion_matchmaven_service.schemas.playground import (
     ExecuteCompareRequest,
     ExecuteCompareResponse,
+    ExecuteRulesCompareRequest,
+    ExecuteRulesCompareResponse,
+    RecordComparison,
 )
-from app.lakefusion_matchmaven_service.services.playground_service import MatchMavenLLMService
+from app.lakefusion_matchmaven_service.services.playground_service import MatchMavenLLMService, DeterministicRulesService
 from lakefusion_utility.utils.logging_utils import get_logger
 
 app_logger = get_logger(__name__)
@@ -107,3 +113,38 @@ async def execute_compare(
         )
 
 
+# =============================================================================
+# Execute Rules Compare Endpoint
+# =============================================================================
+
+@playground_router.post("/execute-rules-compare", response_model=ExecuteRulesCompareResponse)
+async def execute_rules_compare(
+    request: ExecuteRulesCompareRequest,
+    check: dict = Depends(token_required_wrapper),
+):
+    """
+    Evaluate deterministic match rules against master records using pandas (in-process).
+    No Databricks round-trip — rules are applied locally for minimal latency.
+    """
+    token = check.get("token")
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication token is required")
+
+    start_ms = time.time() * 1000
+
+    try:
+        service = DeterministicRulesService()
+        comparisons_raw = service.execute_rules_compare(
+            query_record=request.query_record,
+            master_records=request.master_records,
+            rules=request.rules,
+        )
+        elapsed_ms = round(time.time() * 1000 - start_ms, 1)
+        comparisons = [RecordComparison(**c) for c in comparisons_raw]
+        return ExecuteRulesCompareResponse(comparisons=comparisons, elapsed_ms=elapsed_ms)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        app_logger.error(f"Rules compare failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Rules comparison failed: {str(e)}")

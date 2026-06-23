@@ -1,5 +1,5 @@
 {
   "productName": "LakeFusion",
-  "productVersion": "4.4.0",
-  "environment": "production"
+  "productVersion": "6.0.0",
+  "environment": "development"
 }

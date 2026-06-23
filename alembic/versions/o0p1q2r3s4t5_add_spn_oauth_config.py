@@ -28,7 +28,7 @@ def upgrade() -> None:
         SET config_label = 'Service Principal Client ID',
             config_desc = 'The Application (Client) ID of the Service Principal used for secure authentication between LakeFusion and Databricks, including job execution (run_as) and workflow OAuth flows such as the Vector Search network-optimized route.',
             config_category = 'SPN',
-            updated_at = NOW()
+            updated_at = CURRENT_TIMESTAMP
         WHERE config_key = 'lakefusion_spn'
     """))
 
@@ -42,6 +42,6 @@ def downgrade() -> None:
         SET config_label = 'Lakefusion SPN',
             config_desc = 'Represents the Service Principal Name (SPN) used for secure authentication between LakeFusion and Databricks.',
             config_category = 'GENERAL',
-            updated_at = NOW()
+            updated_at = CURRENT_TIMESTAMP
         WHERE config_key = 'lakefusion_spn'
     """))

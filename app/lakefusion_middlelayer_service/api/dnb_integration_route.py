@@ -105,7 +105,7 @@ async def save_dnb_credentials(
 
         secret_service.upsert_secret(key="dnb_consumer_key", value=payload.consumer_key)
         secret_service.upsert_secret(key="dnb_consumer_secret", value=payload.consumer_secret)
-        secret_service.grant_read_acl(principal="users")
+        secret_service.grant_read_acl()
 
         return HttpResponse(
             message="D&B credentials saved successfully",

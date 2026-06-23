@@ -6,6 +6,15 @@ from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.services.quality_tasks import QualityTaskService
 from databricks import sql
 import traceback
+import re
+
+_TABLE_PATH_RE = re.compile(r'^[A-Za-z0-9_]+\.[A-Za-z0-9_]+\.[A-Za-z0-9_]+$')
+
+def _validate_table_path(path: str) -> None:
+    """Validate that a table path matches catalog.schema.table format with safe characters only."""
+    raw_path = path.replace('`', '')
+    if not _TABLE_PATH_RE.match(raw_path):
+        raise ValueError(f"Invalid table path: {raw_path!r} — must be catalog.schema.table with alphanumeric/underscore only")
 
 # Initialize security scheme for token-based authentication and logger for logging activities
 token_auth_scheme = HTTPBearer()
@@ -30,9 +39,11 @@ def execute_quality_task_sample_output(token: str, db, task_id: int, warehouse_i
         # Fetch the quality task by its ID from the database
         quality_task = quality_task_service.get_task(task_id=task_id)
         
-        # Get the cleaned table path
-        cleaned_table_path = common_utils.apply_tilde(quality_task.dataset.path + "_cleaned") 
-        
+        # Get the cleaned table path and validate before SQL interpolation
+        raw_path = quality_task.dataset.path + "_cleaned"
+        _validate_table_path(raw_path)
+        cleaned_table_path = common_utils.apply_tilde(raw_path)
+
         # Initialize DataSetSQLService to execute SQL queries related to the task
         sqlservice_conn = DataSetSQLService(token, warehouse_id)
         

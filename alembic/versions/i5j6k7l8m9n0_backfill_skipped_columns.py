@@ -9,7 +9,6 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects import mysql
 import json
 from datetime import datetime
 import logging
@@ -76,7 +75,7 @@ def upgrade() -> None:
                 sa.column('entity_version', sa.String),
                 sa.column('pt_type', sa.String),
                 sa.column('model_category', sa.String),
-                sa.column('pt_config', mysql.JSON),
+                sa.column('pt_config', sa.JSON),
                 sa.column('is_active', sa.Boolean),
                 sa.column('created_at', sa.DateTime),
                 sa.column('updated_at', sa.DateTime),

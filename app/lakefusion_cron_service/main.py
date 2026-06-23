@@ -2,11 +2,21 @@ import os
 import sys
 from fastapi import FastAPI
 from starlette.responses import RedirectResponse
+import logging
 from fastapi.middleware.cors import CORSMiddleware
 
 from lakefusion_utility.utils.logging_utils import get_logger, init_logger
-# Initialize logger
+# Initialize logger BEFORE any lakefusion_utility import that touches
+# app_db / models — those modules call get_logger() at module-load time
+# and will raise RuntimeError("Logging not initialized") if we don't.
 init_logger(service="cron_service")
+
+# NOTE: do NOT import get_app_sp_token at module level here. The installed
+# lakefusion_utility wheel has a latent circular import between
+# databricks_util.py ↔ models/__init__.py ↔ utils/auth.py that only fires
+# when databricks_util is the FIRST submodule touched. Other imports below
+# (app_db, services, models) load the package along a safe path; once that
+# settles, lazy-importing databricks_util inside functions works fine.
 
 from app.lakefusion_cron_service.utils.app_db import engine
 from app.lakefusion_cron_service.middleware import DBCleanupMiddleware
@@ -17,6 +27,10 @@ from lakefusion_utility.models.dbconfig import DBConfigProperties
 from lakefusion_utility.config_defaults import CONFIG_DEFAULTS
 from sqlalchemy.orm import Session
 from app.lakefusion_cron_service.config import run_dbx_pipeline_artifacts_import
+# EVENT_JOB_ERROR fires for APScheduler-level failures (thread-pool exhaustion,
+# misfire resolution errors) that bypass job_wrapper entirely — distinct from
+# job-level exceptions which job_wrapper catches and logs itself.
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 
 from lakefusion_utility.routes.ops import ops_router
 
@@ -29,12 +43,36 @@ app_prefix = "/api/cron"
 # Logger
 logger = get_logger(__name__)
 
+
+def _apscheduler_event_listener(event):
+    job_id = getattr(event, "job_id", "<unknown>")
+    if event.code == EVENT_JOB_MISSED:
+        logger.warning(
+            f"APS job missed job_id={job_id} scheduled_run_time={getattr(event, 'scheduled_run_time', None)}"
+        )
+    elif event.code == EVENT_JOB_MAX_INSTANCES:
+        logger.warning(
+            f"APS job NOT started - previous instance still running (likely hung) job_id={job_id}"
+        )
+    elif event.code == EVENT_JOB_ERROR:
+        # Scheduler-level error (thread-pool exhaustion, misfire resolution, etc.).
+        # These bypass job_wrapper, so this is the only place they are logged.
+        # Note: exc_info=True would capture the *current* exception context, which
+        # is empty inside an event listener.  Log the exception object directly and
+        # emit the traceback string (when present) as a separate debug line.
+        logger.error(
+            f"APS scheduler error for job_id={job_id}: {getattr(event, 'exception', None)}",
+        )
+        tb = getattr(event, "traceback", None)
+        if tb:
+            logger.debug("APS scheduler error traceback for job_id=%s:\n%s", job_id, tb)
+
 from lakefusion_utility.utils.database import lifespan as base_lifespan
 from contextlib import asynccontextmanager
 
 # Import your run_migrations helper
 from app.lakefusion_cron_service.utils.run_migrations import run_migrations
-from app.lakefusion_cron_service.utils.app_db import db_context
+from app.lakefusion_cron_service.utils.app_db import db_context, enable_pool_pre_ping
 from lakefusion_utility.services.databricks_sync_service import import_lakefusion_artifacts
 import lakefusion_utility.models.notebook_sync  # noqa: ensure tables are registered with Base
 from app.lakefusion_cron_service.services.notebook_sync_executor import execute_sync
@@ -47,6 +85,7 @@ from lakefusion_utility.services.pt_models_service import PTModelsConfigService
 @asynccontextmanager
 async def lifespan(app):
     async with base_lifespan(app):
+        enable_pool_pre_ping()
         try:    
             with db_context() as db:
                 # ------------------------------------------------------
@@ -106,6 +145,9 @@ async def lifespan(app):
                 # ------------------------------------------------------
 
                 try:
+                    # Lazy import — see note at top of file about the
+                    # latent circular import in the lakefusion_utility wheel.
+                    from lakefusion_utility.utils.databricks_util import get_app_sp_token
                     service = Integration_HubService(db=db)
                     from lakefusion_utility.utils.databricks_util import get_app_sp_token
                     token = get_app_sp_token()
@@ -147,7 +189,30 @@ async def lifespan(app):
             logger.error(f"Error during startup: {e}")
             raise
 
-        yield  # continue the application lifecycle
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from app.lakefusion_cron_service.cron_jobs import get_scheduler_jobs
+
+        scheduler = BackgroundScheduler()
+        scheduler.add_listener(
+            _apscheduler_event_listener,
+            EVENT_JOB_MISSED | EVENT_JOB_MAX_INSTANCES | EVENT_JOB_ERROR,
+        )
+        scheduler = get_scheduler_jobs(scheduler=scheduler)
+        scheduler.start()
+
+        aps_logger = get_logger("apscheduler")
+        aps_logger.setLevel(logging.INFO)
+
+        logger.info("\n--- Registered APScheduler Jobs ---")
+        for job in scheduler.get_jobs():
+            logger.info(f"ID: {job.id}, Next Run: {getattr(job, 'next_run_time', None)}, Trigger: {job.trigger}")
+        logger.info("-----------------------------------\n")
+
+        try:
+            yield  # continue the application lifecycle
+        finally:
+            logger.info("Shutting down APScheduler")
+            scheduler.shutdown(wait=False)
 
 app = FastAPI(
     title="Cron Service API",
@@ -158,11 +223,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Add CORS middleware — use explicit origin when DATABRICKS_APP_URL is set
+_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+_allowed_origins = [_app_url] if _app_url else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"], 
+    allow_origins=_allowed_origins,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 app.add_middleware(DBCleanupMiddleware, db_session=get_db)
@@ -179,17 +246,3 @@ logger.info("API up and running")
 async def original_endpoint():
     return RedirectResponse(url=f"{app_prefix}/docs")
 
-# APScheduler
-from apscheduler.schedulers.background import BackgroundScheduler
-from app.lakefusion_cron_service.cron_jobs import get_scheduler_jobs
-
-# Create the scheduler instance
-scheduler = BackgroundScheduler()
-scheduler = get_scheduler_jobs(scheduler=scheduler)
-scheduler.start()
-
-# Print all registered jobs
-print("\n--- Registered APScheduler Jobs ---")
-for job in scheduler.get_jobs():
-    print(f"ID: {job.id}, Next Run: {job.next_run_time}, Trigger: {job.trigger}")
-print("-----------------------------------\n")

@@ -149,11 +149,46 @@ logger.info("\n" + "="*80)
 logger.info("STEP 3: Updating master table")
 logger.info("="*80)
 
-# Build the SET clause for the update
+# Build the SET clause for the update. STRUCT/ARRAY columns can't accept a
+# plain string literal — they need `from_json(<json>, '<DDL>')` so Spark can
+# reconstruct the typed value. Detect complex columns from the master table
+# schema and produce the right SQL per column.
+from pyspark.sql.types import StructType as _MU_StructType, ArrayType as _MU_ArrayType
+
+
+def _mu_type_to_ddl(t):
+    """Convert a Spark DataType into a DDL string usable inside from_json.
+
+    DO NOT uppercase — field names inside STRUCT must match the JSON keys
+    case-exactly. simpleString() yields the correct lower-case identifiers
+    and lower-case type names (both accepted by Spark)."""
+    return t.simpleString()
+
+
+_master_schema = {f.name: f.dataType for f in spark.table(master_table).schema.fields}
+
+
+def _is_complex_dtype(dt):
+    return isinstance(dt, (_MU_StructType, _MU_ArrayType))
+
+
 set_clauses = []
 for attr_name, attr_value in update_attributes.items():
     if attr_value is None:
         set_clauses.append(f"{attr_name} = NULL")
+        continue
+    dt = _master_schema.get(attr_name)
+    if dt is not None and _is_complex_dtype(dt):
+        # Frontend now ships JSON strings for STRUCT/ARRAY values. If a
+        # native dict/list slipped through, json-encode it first so the
+        # SQL literal is valid JSON.
+        if isinstance(attr_value, (dict, list, tuple)):
+            payload = json.dumps(attr_value, default=str)
+        else:
+            payload = str(attr_value)
+        payload_escaped = payload.replace("'", "''")
+        ddl = _mu_type_to_ddl(dt).replace("'", "''")
+        set_clauses.append(f"{attr_name} = from_json('{payload_escaped}', '{ddl}')")
     else:
         escaped_value = str(attr_value).replace("'", "''")
         set_clauses.append(f"{attr_name} = '{escaped_value}'")
@@ -178,11 +213,32 @@ if set_clauses:
     """).collect()
 
     if updated_record:
+        # Match Spark `build_attributes_combined_column` semantics so the
+        # downstream embedding matches what initial/incremental load produced:
+        # STRUCT -> space-joined sub-fields, ARRAY -> JSON, scalar -> str.
+        from pyspark.sql import Row as _Row
+
+        def _flatten(val):
+            if val is None:
+                return ""
+            if isinstance(val, _Row):
+                pieces = [str(v) for v in val if v is not None]
+                return " ".join(pieces).strip()
+            if isinstance(val, (list, tuple)):
+                try:
+                    return json.dumps(list(val), default=str)
+                except Exception:
+                    return str(val)
+            if isinstance(val, dict):
+                pieces = [str(v) for v in val.values() if v is not None]
+                return " ".join(pieces).strip()
+            return str(val)
+
         attr_values = []
+        rec_dict = updated_record[0].asDict(recursive=True)
         for attr in entity_attributes:
-            if attr in updated_record[0].asDict():
-                val = updated_record[0][attr]
-                attr_values.append(str(val) if val is not None else '')
+            if attr in rec_dict:
+                attr_values.append(_flatten(rec_dict[attr]))
 
         attributes_combined = " | ".join(attr_values)
         attributes_combined_escaped = attributes_combined.replace("'", "''")

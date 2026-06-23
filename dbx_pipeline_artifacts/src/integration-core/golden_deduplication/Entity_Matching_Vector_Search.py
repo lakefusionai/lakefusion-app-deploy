@@ -322,6 +322,9 @@ try:
                 "Check DAG ordering — Compute_Embeddings must run before this task."
             )
         embedding_dim = int(embedding_dim_raw)
+        # Whitelist only scalar columns the index actually needs. VS Delta
+        # Sync Index rejects STRUCT/ARRAY columns from the source table; we
+        # carry the embedding vector, PK, and the searchable text only.
         index = client.create_delta_sync_index(
             endpoint_name=vs_endpoint,
             source_table_name=master_table,
@@ -330,6 +333,7 @@ try:
             primary_key=master_id_key,
             embedding_vector_column=embedding_vector_column,
             embedding_dimension=embedding_dim,
+            columns_to_sync=[master_id_key, merged_desc_column, embedding_vector_column],
         )
     else:
         index = client.create_delta_sync_index(
@@ -341,6 +345,7 @@ try:
             embedding_source_column=merged_desc_column,
             embedding_model_endpoint_name=embedding_endpoint,
             sync_computed_embeddings=True,
+            columns_to_sync=[master_id_key, merged_desc_column],
         )
     logger.info(f"Create request submitted for index: {index_name}")
 

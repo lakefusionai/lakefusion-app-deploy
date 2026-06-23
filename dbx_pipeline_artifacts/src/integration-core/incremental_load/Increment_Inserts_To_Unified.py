@@ -17,11 +17,52 @@ LOGIC FLOW:
 import json
 from delta.tables import DeltaTable
 from pyspark.sql.functions import *
-from pyspark.sql.types import StringType
+from pyspark.sql.types import StringType, IntegerType, LongType, DoubleType, FloatType, BooleanType, DateType, TimestampType, ShortType, ByteType
 from pyspark.sql.window import Window
 from datetime import datetime
 
 
+def get_spark_data_type(dtype_str):
+    """
+    Convert string data type to Spark DataType.
+    Handles both old lowercase types and new uppercase types.
+    """
+    dtype_map = {
+        # New uppercase types (primary)
+        'BIGINT': LongType(),
+        'BOOLEAN': BooleanType(),
+        'DATE': DateType(),
+        'DOUBLE': DoubleType(),
+        'FLOAT': FloatType(),
+        'INT': IntegerType(),
+        'SMALLINT': ShortType(),
+        'STRING': StringType(),
+        'TINYINT': ByteType(),
+        'TIMESTAMP': TimestampType(),
+
+        # Legacy lowercase types (backward compatibility)
+        'bigint': LongType(),
+        'boolean': BooleanType(),
+        'char': StringType(),
+        'varchar': StringType(),
+        'date': DateType(),
+        'double precision': DoubleType(),
+        'double': DoubleType(),
+        'integer': IntegerType(),
+        'int': IntegerType(),
+        'long': LongType(),
+        'numeric': FloatType(),
+        'real': FloatType(),
+        'smallint': ShortType(),
+        'text': StringType(),
+        'string': StringType(),
+        'timestamp': TimestampType(),
+        'float': FloatType(),
+        'decimal': DoubleType(),
+    }
+
+    # Try exact match first, then lowercase fallback
+    return dtype_map.get(dtype_str, dtype_map.get(dtype_str.lower(), StringType()))
 
 # COMMAND ----------
 
@@ -76,9 +117,21 @@ has_inserts = dbutils.jobs.taskValues.get("Check_Increments_Exists", "has_insert
 tables_with_inserts = dbutils.jobs.taskValues.get("Check_Increments_Exists", "tables_with_inserts", debugValue="[]")
 table_version_info = dbutils.jobs.taskValues.get("Check_Increments_Exists", "table_version_info", debugValue="{}")
 
+# RDM configs drive inline mapping resolution at ingestion. Empty list → no
+# REFERENCE_ENTITY attrs and resolver short-circuits.
+rdm_configs = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON",
+    "rdm_configs",
+    debugValue="[]",
+)
+
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -96,6 +149,16 @@ attributes_mapping_json = json.loads(attributes_mapping_json)
 attributes = json.loads(attributes)
 tables_with_inserts = json.loads(tables_with_inserts)
 table_version_info = json.loads(table_version_info)
+rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+
+# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # Convert has_inserts to boolean if it's a string
 if isinstance(has_inserts, str):
@@ -308,6 +371,9 @@ for source_table in tables_with_inserts:
     logger.info("\n" + "=" * 80)
     logger.info(f" Processing: {source_table}")
     logger.info("=" * 80)
+
+    # Pull this source's dataset_id (drives RDM mapping lookups via rdm_configs)
+    source_id_for_resolver = (dataset_objects.get(source_table) or {}).get("id")
     
     # Get version info with error handling
     if source_table not in table_version_info:
@@ -425,31 +491,50 @@ for source_table in tables_with_inserts:
     logger.info(f" Applying mapping: {len(mapping_dict)} columns")
     logger.info(f"   Source PK column: {source_pk_column} -> Entity PK: {primary_key}")
     
-    # Apply column mappings (source_col -> entity_col)
-    # Include the _source_pk_value column in the transformation
+    # Apply column mappings (source_col -> entity_col) WITH TYPE CASTING
+    # Cast each column to its entity model type to prevent schema mismatches
     try:
-        df_transformed = df_clean.selectExpr(
-            *[f"`{source_col}` as `{entity_col}`" for source_col, entity_col in mapping_dict.items()],
-            "_source_pk_value"
-        )
+        select_exprs = []
+        for source_col, entity_col in mapping_dict.items():
+            target_dtype_str = entity_attributes_datatype.get(entity_col, 'string')
+            target_spark_dtype = get_spark_data_type(target_dtype_str)
+            select_exprs.append(col(source_col).cast(target_spark_dtype).alias(entity_col))
+        select_exprs.append(col("_source_pk_value"))
+        df_transformed = df_clean.select(*select_exprs)
     except Exception as e:
         logger.error(f" Error applying column mappings: {e}")
         logger.error(f"   Mapping: {mapping_dict}")
         logger.error(f"   Source columns: {df_clean.columns}")
         continue
-    
-    # Add missing entity attributes as NULL columns
+
+    # Add missing entity attributes as NULL columns with correct types
     existing_columns = df_transformed.columns
     missing_columns = [col_name for col_name in entity_attributes if col_name not in existing_columns and col_name != "lakefusion_id"]
-    
+
     for col_name in missing_columns:
         sql_dtype = entity_attributes_datatype.get(col_name, "string")
-        spark_dtype = sql_dtype.lower().strip()
+        spark_dtype = get_spark_data_type(sql_dtype)
         df_transformed = df_transformed.withColumn(col_name, lit(None).cast(spark_dtype))
     
     # Select columns in entity_attributes order (excluding lakefusion_id for now)
+    # AND re-cast every attribute to its entity-declared dtype. This is the
+    # belt-and-suspenders fix for the unionByName cast bug: unionByName takes
+    # the schema of the FIRST DataFrame in the union and silently tries to
+    # cast every subsequent frame's columns to those types. If source A has
+    # SourceID as INT (e.g. Factorsoft) and source B has it as STRING, the
+    # implicit STRING -> INT cast on B will fail for any non-numeric value.
+    # Pinning every per-source frame to entity_attributes_datatype here
+    # makes all frames structurally identical so unionByName has nothing
+    # to coerce. We pass the SQL dtype string directly to .cast() (same
+    # pattern as the missing-columns block above), which avoids depending
+    # on a helper that may not be in scope.
     final_columns = [col_name for col_name in entity_attributes if col_name != "lakefusion_id"]
-    df_transformed = df_transformed.select(*final_columns, "_source_pk_value")
+    final_select_exprs = []
+    for col_name in final_columns:
+        target_dtype_str = entity_attributes_datatype.get(col_name, "string").lower().strip()
+        final_select_exprs.append(col(col_name).cast(target_dtype_str).alias(col_name))
+    final_select_exprs.append(col("_source_pk_value"))
+    df_transformed = df_transformed.select(*final_select_exprs)
     
     logger.info(f" Transformed to unified schema with {len(final_columns)} columns")
     
@@ -487,13 +572,46 @@ for source_table in tables_with_inserts:
     df_transformed = df_transformed.withColumn("table_name", lit(source_table))
     
     # Generate attributes_combined column (for deduplication matching)
-    # Only include attributes that exist in the dataframe
     available_attributes = [attr for attr in attributes if attr in df_transformed.columns]
     if available_attributes:
+        # Resolve REFERENCE_ENTITY attrs inline via mapping table — bakes ref_id
+        # into the column and queues PENDING / NO_MATCH rows for steward review.
+        df_transformed, df_pending_ref = resolve_reference_attributes(
+            spark,
+            df_transformed,
+            rdm_configs,
+            source_id=source_id_for_resolver,
+        )
+
+        concat_inputs = []
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            src = display_col if display_col in df_transformed.columns else c
+            concat_inputs.append(regexp_replace(trim(col(src).cast("string")), r'\s+', ' '))
+
         df_transformed = df_transformed.withColumn(
             "attributes_combined",
             concat_ws(" | ", *[coalesce(regexp_replace(trim(col(c)), r'\s+', ' '), lit("")) for c in available_attributes])
         )
+
+        # Drop the resolver's __display columns before downstream writes
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            if display_col in df_transformed.columns:
+                df_transformed = df_transformed.drop(display_col)
+
+        # Route PENDING / NO_MATCH rows to the unified error log (stage=RDM)
+        if df_pending_ref is not None and not df_pending_ref.isEmpty():
+            unified_error_handler = UnifiedErrorHandler(spark, unified_table)
+            unified_error_handler.log_errors(
+                df_pending_ref.select(
+                    col("surrogate_key"),
+                    col("_rdm_pending_reason").alias("error_message"),
+                ),
+                stage="RDM",
+                run_id=run_id,
+            )
+            logger.info(f" Logged {df_pending_ref.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
     else:
         df_transformed = df_transformed.withColumn("attributes_combined", lit(""))
     

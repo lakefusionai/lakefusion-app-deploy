@@ -9,6 +9,15 @@ from pyspark.sql.functions import *
 import json
 import re
 
+_IDENTIFIER_RE = re.compile(r'^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$')
+
+def validate_sql_identifier(name: str, label: str = "identifier") -> str:
+    """Validate that a SQL identifier contains only safe characters (alphanumeric, underscores, dots).
+    Returns backtick-quoted identifier safe for interpolation into Spark SQL."""
+    if not name or not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid {label}: {name!r} — must be alphanumeric/underscore/dot only")
+    return '.'.join(f'`{part}`' for part in name.split('.'))
+
 # COMMAND ----------
 
 # Define HttpResponse class for structured JSON output
@@ -36,7 +45,12 @@ def exit_with_response(message: str, status: int, data=None, file=None, has_more
         totalCount=totalCount,
         session_token=session_token
     )
-    dbutils.notebook.exit(response.to_json())
+    payload = response.to_json()
+
+    if status >= 500:
+        raise Exception(payload)   # marks run as FAILED
+
+    dbutils.notebook.exit(payload)
 
 # COMMAND ----------
 
@@ -58,10 +72,18 @@ table_primary_key = dbutils.widgets.get("table_primary_key")
 if not input_table:
     exit_with_response("Error: input_table is required", 400)
 
+# Validate identifiers to prevent SQL injection
+try:
+    safe_input_table = validate_sql_identifier(input_table, "input_table")
+    safe_primary_key = validate_sql_identifier(table_primary_key, "table_primary_key") if table_primary_key else None
+except ValueError as e:
+    exit_with_response(str(e), 400)
+
 # COMMAND ----------
 
 catalog_name = input_table.split(".")[0]
 meta_info_table = f"{catalog_name}.silver.table_meta_info"
+safe_meta_info_table = validate_sql_identifier(meta_info_table, "meta_info_table")
 
 # COMMAND ----------
 
@@ -85,7 +107,8 @@ def update_last_processed_version(table_meta_info, entity, table_name, version):
     if not spark.catalog.tableExists(table_meta_info):
         # Create the meta info table
         schema = "table_name STRING,entity_name string,last_processed_version LONG, last_processed_timestamp TIMESTAMP"
-        spark.sql(f"CREATE TABLE {table_meta_info} ({schema}) USING DELTA")
+        safe_tmi = validate_sql_identifier(table_meta_info, "table_meta_info")
+        spark.sql(f"CREATE TABLE {safe_tmi} ({schema}) USING DELTA")
     
     # Create DataFrame to upsert
     new_row = spark.createDataFrame([(table_name, entity, version, )], ["table_name","entity_name","last_processed_version"])
@@ -102,14 +125,15 @@ def update_last_processed_version(table_meta_info, entity, table_name, version):
 def check_and_enable_cdf(table_name):
     try:
         # Check if CDF is already enabled
-        table_properties = spark.sql(f"SHOW TBLPROPERTIES {table_name}").collect()
+        safe_tn = validate_sql_identifier(table_name, "table_name")
+        table_properties = spark.sql(f"SHOW TBLPROPERTIES {safe_tn}").collect()
         cdf_enabled = False
         for prop in table_properties:
             if prop['key'] == 'delta.enableChangeDataFeed' and prop['value'].lower() == 'true':
                 cdf_enabled = True
                 break
         if not cdf_enabled:
-            spark.sql(f"ALTER TABLE {table_name} SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
+            spark.sql(f"ALTER TABLE {safe_tn} SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'true')")
             print(f"CDF enabled on {table_name}")
         else:
             print(f"CDF already enabled on {table_name}")
@@ -122,7 +146,7 @@ check_and_enable_cdf(input_table)
 
 # COMMAND ----------
 
-latest_version = spark.sql(f"DESCRIBE HISTORY {input_table}").selectExpr("max(version)").first()[0]
+latest_version = spark.sql(f"DESCRIBE HISTORY {safe_input_table}").selectExpr("max(version)").first()[0]
 print(f"latest_version: {latest_version}")
 last_processed_version = get_last_processed_version(meta_info_table, input_table,entity)
 print(f"last_processed_version: {last_processed_version}")
@@ -163,6 +187,7 @@ output_df = input_df
 # COMMAND ----------
 
 output_table = f"{input_table}_cleaned"
+safe_output_table = validate_sql_identifier(output_table, "output_table")
 
 # COMMAND ----------
 
@@ -180,9 +205,9 @@ if first_run != True:
         # Write output_df into output table using Delta merge operation
         output_df.createOrReplaceTempView("output_df_view")
         spark.sql(f"""
-            MERGE INTO {output_table} AS target
+            MERGE INTO {safe_output_table} AS target
             USING output_df_view AS source
-            ON target.{table_primary_key} = source.{table_primary_key}
+            ON target.{safe_primary_key} = source.{safe_primary_key}
             WHEN MATCHED AND source._change_type = 'delete' THEN DELETE
             WHEN MATCHED AND source._change_type = 'update_postimage' THEN UPDATE SET *
             WHEN NOT MATCHED AND source._change_type = 'insert' THEN INSERT *

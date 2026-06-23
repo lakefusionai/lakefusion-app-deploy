@@ -52,7 +52,7 @@ async def save_spn_credentials(
 
         secret_service.upsert_secret(key="lakefusion_spn", value=payload.client_id)
         secret_service.upsert_secret(key="lakefusion_spn_secret", value=payload.client_secret)
-        secret_service.grant_read_acl(principal="users")
+        secret_service.grant_read_acl()
 
         return HttpResponse(
             message="Service Principal credentials saved successfully",

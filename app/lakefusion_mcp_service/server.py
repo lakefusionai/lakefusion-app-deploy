@@ -3,6 +3,7 @@ FastAPI server for health checks and monitoring.
 MCP tools are exposed via StreamableHTTP transport for Claude Desktop.
 """
 import asyncio
+import os
 import signal
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -105,10 +106,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Add CORS middleware — use explicit origin when DATABRICKS_APP_URL is set
+_app_url = os.environ.get("DATABRICKS_APP_URL", "")
+_allowed_origins = [_app_url] if _app_url else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

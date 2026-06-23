@@ -146,9 +146,64 @@ processed_records = dbutils.widgets.get("processed_records")
 
 experiment_id = dbutils.widgets.get("experiment_id")
 
+rdm_configs = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="rdm_configs",
+    debugValue="[]"
+)
+
+dataset_objects = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="dataset_objects",
+    debugValue="{}"
+)
+
+# Complex-type aware payloads (STRUCT / ARRAY support).
+attributes_mapping_full_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="attributes_mapping_full",
+    debugValue="[]",
+)
+entity_attribute_records_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="entity_attribute_records",
+    debugValue="[]",
+)
+model_selected_sub_fields_raw = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="model_selected_sub_fields",
+    debugValue="{}",
+)
+
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/spark_types
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/complex_type_mapping
+
 
 # COMMAND ----------
 
@@ -164,6 +219,50 @@ entity_attributes_datatype = json.loads(entity_attributes_datatype)
 match_attributes = json.loads(match_attributes)
 attributes_mapping = json.loads(attributes_mapping)
 dataset_tables = json.loads(dataset_tables)
+rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+dataset_objects = json.loads(dataset_objects) if isinstance(dataset_objects, str) else (dataset_objects or {})
+
+try:
+    attributes_mapping_full = json.loads(attributes_mapping_full_raw) if attributes_mapping_full_raw else []
+except Exception:
+    attributes_mapping_full = []
+try:
+    entity_attribute_records = json.loads(entity_attribute_records_raw) if entity_attribute_records_raw else []
+except Exception:
+    entity_attribute_records = []
+try:
+    model_selected_sub_fields = json.loads(model_selected_sub_fields_raw) if model_selected_sub_fields_raw else {}
+except Exception:
+    model_selected_sub_fields = {}
+
+_has_complex_attrs = any(
+    (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT")
+    for rec in entity_attribute_records
+    if isinstance(rec, dict)
+)
+_records_by_name = {
+    r["name"]: r for r in entity_attribute_records
+    if isinstance(r, dict) and r.get("name")
+}
+
+# Make utils importable for project_source_to_target.
+import os as _pp_os, sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _src_path)
+        break
+
+# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # Parse processed_records - format: "[start, end]" or "[0, 2000]"
 processed_records = json.loads(processed_records) if processed_records else [0, 2000]
@@ -210,6 +309,63 @@ logger.info("="*60)
 
 # COMMAND ----------
 
+# DBTITLE 1,Validate primary key — fail on NULL or duplicate values
+# Match Maven experiments previously skipped the primary-key validation that
+# Integration Jobs enforce (Validate_Initial_Load): every dataset table's PK
+# column must have NO NULLs and NO duplicates. Without this, experiments ran on
+# dirty PKs. Fail fast with a clear error so the experiment surfaces the issue.
+def _resolve_source_pk_column(table_name):
+    """source dataset column mapped to the entity primary key, or None if unmapped."""
+    for _entry in attributes_mapping:
+        if table_name in _entry:
+            return _entry[table_name].get(primary_key)
+    return None
+
+logger.info("\n" + "=" * 60)
+logger.info("VALIDATION: PRIMARY KEY NULL / DUPLICATE CHECK")
+logger.info("=" * 60)
+
+_pk_violations = []
+for _table in dataset_tables:
+    _src_pk = _resolve_source_pk_column(_table)
+    if not _src_pk:
+        logger.warning(f"  Skipping {_table}: primary key '{primary_key}' not mapped")
+        continue
+    try:
+        _df = spark.read.table(_table)
+    except Exception as _e:
+        logger.warning(f"  Skipping {_table}: could not read table - {_e}")
+        continue
+    if _src_pk not in _df.columns:
+        logger.warning(f"  Skipping {_table}: column '{_src_pk}' not found")
+        continue
+
+    _total = _df.count()
+    _null = _df.filter(col(_src_pk).isNull()).count()
+    _distinct = _df.select(_src_pk).distinct().count()
+    _dupes = _total - _distinct
+
+    if _null > 0:
+        _pk_violations.append(f"{_table}.{_src_pk}: {_null} NULL value(s)")
+        logger.error(f"  NULLs: {_table}.{_src_pk} — {_null}/{_total}")
+    if _dupes > 0:
+        _pk_violations.append(f"{_table}.{_src_pk}: {_dupes} duplicate value(s)")
+        logger.error(f"  Duplicates: {_table}.{_src_pk} — {_dupes} dup(s), distinct {_distinct}/{_total}")
+    if _null == 0 and _dupes == 0:
+        logger.info(f"  OK: {_table}.{_src_pk} ({_total} records)")
+
+if _pk_violations:
+    _msg = (
+        "Primary key validation failed — fix the source data and re-run:\n  - "
+        + "\n  - ".join(_pk_violations)
+    )
+    logger.error(_msg)
+    raise ValueError(_msg)
+
+logger.info("Primary key validation passed (no NULLs, no duplicates)")
+
+# COMMAND ----------
+
 # DBTITLE 1,Determine if this is initial or incremental load
 #master_count_before = spark.table(master_table).count()
 #master_count_before = spark.table(master_table).isEmpty()
@@ -235,46 +391,164 @@ generate_surrogate_key_udf = udf(
 def apply_attribute_mapping(df, table_name, mapping_list, entity_attrs, entity_attr_dtypes):
     """
     Apply attribute mapping with type casting to a DataFrame.
-    
-    Args:
-        df: Source DataFrame
-        table_name: Name of the source table
-        mapping_list: List of mapping dictionaries
-        entity_attrs: List of entity attribute names
-        entity_attr_dtypes: Dict of attribute data types
-        
-    Returns:
-        DataFrame with mapped and typed columns
+
+    Complex types (STRUCT, ARRAY, ARRAY<STRUCT>) are projected via
+    `project_source_to_target` so direct_column / subfield_assembly /
+    scalar-to-array auto-wrap all work and the produced struct field order
+    matches the target Delta schema (avoids DELTA_FAILED_TO_MERGE_FIELDS).
+    Scalar-only entities continue through the legacy cast path.
     """
-    # Find the mapping for this table
+    # Find legacy scalar mapping for this table (entity_attr -> dataset_attr).
     table_mapping = None
     for mapping_entry in mapping_list:
         if table_name in mapping_entry:
             table_mapping = mapping_entry[table_name]
             break
-    
+
     if not table_mapping:
         raise ValueError(f"No attribute mapping found for table: {table_name}")
-    
-    # Build select expressions
+
+    # Find full rich mapping (with mode + sub_field_map) for this table.
+    full_records = None
+    for _entry in attributes_mapping_full:
+        if isinstance(_entry, dict) and table_name in _entry:
+            full_records = _entry[table_name]
+            break
+
+    if _has_complex_attrs and full_records:
+        _resolve_complex_dtype=get_complex_spark_data_type
+        mapped_df = project_source_to_target(df, full_records, entity_attribute_records)
+        mapped_columns = set(mapped_df.columns)
+
+        # Backfill missing attributes as NULL with the correct (possibly
+        # nested) Spark type so the master table append schema-matches.
+        for attr in entity_attrs:
+            if attr in mapped_columns or attr == "lakefusion_id":
+                continue
+            rec = _records_by_name.get(attr)
+            if rec and (rec.get("is_array") or (rec.get("type") or "").strip().upper() == "STRUCT"):
+                spark_dtype = _resolve_complex_dtype(rec)
+            else:
+                dtype_str = entity_attr_dtypes.get(attr, 'string')
+                spark_dtype = get_spark_data_type(dtype_str)
+            mapped_df = mapped_df.withColumn(attr, lit(None).cast(spark_dtype))
+        return mapped_df
+
+    # ── Legacy scalar-only path ─────────────────────────────────────────
     select_exprs = []
     mapped_columns = set()
-    
+
     for entity_attr, dataset_attr in table_mapping.items():
         if dataset_attr in df.columns:
             target_dtype_str = entity_attr_dtypes.get(entity_attr, 'string')
             target_spark_dtype = get_spark_data_type(target_dtype_str)
             select_exprs.append(col(dataset_attr).cast(target_spark_dtype).alias(entity_attr))
             mapped_columns.add(entity_attr)
-    
-    # Add missing attributes as NULL
+
     for attr in entity_attrs:
         if attr not in mapped_columns and attr != "lakefusion_id":
             dtype_str = entity_attr_dtypes.get(attr, 'string')
             spark_dtype = get_spark_data_type(dtype_str)
             select_exprs.append(lit(None).cast(spark_dtype).alias(attr))
-    
+
     return df.select(*select_exprs)
+
+
+def create_attributes_combined(df, combine_attrs, source_id):
+    """
+    Resolve REFERENCE_ENTITY attrs inline via mapping table, then build
+    attributes_combined using the canonical display value for REF attrs and
+    raw value for the rest.
+
+    Args:
+        df: DataFrame with match attribute columns
+        combine_attrs: List of attribute names to combine into attributes_combined
+        source_id: dataset_id of the source being loaded; drives mapping lookup
+
+    Returns:
+        (approved_df, pending_df) where:
+          - approved_df has attributes_combined and REF columns replaced with
+            ref_lakefusion_id; safe to write to unified/master.
+          - pending_df holds rows whose REF attrs are PENDING / NO_MATCH; caller
+            routes them to UnifiedErrorHandler with stage="RDM" using
+            log_rdm_pending().
+    """
+    df, pending_df = resolve_reference_attributes(
+        spark, df, rdm_configs, source_id=source_id
+    )
+
+    # Complex-type aware combined string. STRUCT collapses to space-joined
+    # sub-field values, ARRAY/ARRAY<STRUCT> JSON-serializes. RDM resolver may
+    # have produced `<attr>__display` aliases — those take precedence for the
+    # combined string, falling back to the original column.
+
+    effective_names = []
+    for attr in combine_attrs:
+        display_col = f"{attr}__display"
+        effective_names.append(display_col if display_col in df.columns else attr)
+
+    # Build records keyed by the *effective* column name so the builder picks
+    # the right type. Display columns are scalar strings, so passing an empty
+    # record record (record={}) makes the builder fall through to scalar.
+    effective_records = []
+    for original_attr, eff_name in zip(combine_attrs, effective_names):
+        if eff_name == original_attr:
+            rec = _records_by_name.get(original_attr, {})
+            # Builder keys lookup by record['name'], so rename if needed.
+            if rec:
+                rec = {**rec, "name": original_attr}
+            effective_records.append(rec)
+        else:
+            # Display column is always plain string — empty record yields scalar path.
+            effective_records.append({"name": eff_name})
+
+    # Honour MatchMaven sub-field selection — the builder restricts STRUCT
+    # / ARRAY<STRUCT> fields to those the user chose for embedding.
+    # Selection is keyed by ORIGINAL attribute name; map keys to effective
+    # column names so the builder applies them after RDM display aliasing.
+    effective_sub_field_selection = {}
+    for original_attr, eff_name in zip(combine_attrs, effective_names):
+        sel = (model_selected_sub_fields or {}).get(original_attr)
+        if sel:
+            effective_sub_field_selection[eff_name] = sel
+
+    df = df.withColumn(
+        "attributes_combined",
+        build_attributes_combined_column(
+            df,
+            effective_names,
+            effective_records,
+            selected_sub_fields_by_attr=effective_sub_field_selection,
+        ),
+    )
+
+    # Drop resolver's __display columns before downstream writes
+    for attr in combine_attrs:
+        display_col = f"{attr}__display"
+        if display_col in df.columns:
+            df = df.drop(display_col)
+
+    return df, pending_df
+
+
+def log_rdm_pending(pending_df, target_unified_table):
+    """Route PENDING / NO_MATCH rows to the unified error log (stage=RDM).
+
+    The unified error table sits alongside `target_unified_table` so master
+    inserts and unified inserts share the same error-handler context.
+    """
+    if pending_df is None or pending_df.isEmpty():
+        return
+    handler = UnifiedErrorHandler(spark, target_unified_table)
+    handler.log_errors(
+        pending_df.select(
+            col("surrogate_key"),
+            col("_rdm_pending_reason").alias("error_message"),
+        ),
+        stage="RDM",
+        run_id=run_id,
+    )
+    logger.info(f"  Logged {pending_df.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
 
 # COMMAND ----------
 
@@ -330,20 +604,21 @@ if is_single_source:
         generate_surrogate_key_udf(col("source_path"), col("source_id"))
     )
     
-    # Create attributes_combined
+    # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
     combine_attrs = [attr for attr in match_attributes if attr in id_df.columns]
-    id_df = id_df.withColumn(
-        "attributes_combined",
-        concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
-    )
-    
+    primary_source_id = (dataset_objects.get(primary_table) or {}).get("id")
+    id_df, id_pending_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
+
     # Prepare master insert
     master_columns = ["lakefusion_id"] + [attr for attr in entity_attributes if attr != "lakefusion_id"] + ["attributes_combined"]
     master_insert_df = id_df.select(*master_columns)
-    
+
     # Insert into master table
     master_insert_df.write.format("delta").mode("append").saveAsTable(master_table)
-    
+
+    # Route PENDING / NO_MATCH rows to the unified error log
+    log_rdm_pending(id_pending_df, unified_dedup_table)
+
     # Now clone master to unified_dedup for self-comparison
     logger.info("\n" + "-"*60)
     logger.info("Cloning Master to Unified Dedup for self-comparison...")
@@ -411,19 +686,20 @@ if not is_single_source:
             generate_surrogate_key_udf(col("source_path"), col("source_id"))
         )
         
-        # Create attributes_combined
+        # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
         combine_attrs = [attr for attr in match_attributes if attr in id_df.columns]
-        id_df = id_df.withColumn(
-            "attributes_combined",
-            concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
-        )
-        
+        primary_source_id = (dataset_objects.get(primary_table) or {}).get("id")
+        id_df, id_pending_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
+
         # Prepare and insert into master
         master_columns = ["lakefusion_id"] + [attr for attr in entity_attributes if attr != "lakefusion_id"] + ["attributes_combined"]
         master_insert_df = id_df.select(*master_columns)
-        
+
         master_insert_df.write.format("delta").mode("append").saveAsTable(master_table)
-        
+
+        # Route PENDING / NO_MATCH rows to the unified error log
+        log_rdm_pending(id_pending_df, unified_table)
+
         # NOTE: In the experiment pipeline, primary records do NOT go into Unified.
         # - Multi-source: Only secondary records go to Unified (with ACTIVE status)
         # - Single-source: Master is cloned to Unified_Deduplicate by Process_Unified_Dedup_Table
@@ -523,13 +799,16 @@ if not is_single_source:
                 generate_surrogate_key_udf(col("source_path"), col("source_id"))
             )
             
-            # Create attributes_combined
+            # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
             combine_attrs = [attr for attr in match_attributes if attr in mapped_df.columns]
-            mapped_df = mapped_df.withColumn(
-                "attributes_combined",
-                concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
+            secondary_source_id = (dataset_objects.get(secondary_table) or {}).get("id")
+            mapped_df, mapped_pending_df = create_attributes_combined(
+                mapped_df, combine_attrs, secondary_source_id
             )
-            
+
+            # Route PENDING / NO_MATCH rows to the unified error log
+            log_rdm_pending(mapped_pending_df, unified_table)
+
             # Prepare for unified insert (SIMPLIFIED - no master_lakefusion_id)
             unified_select_cols = [
                 "surrogate_key",
@@ -541,7 +820,7 @@ if not is_single_source:
                 lit("").alias("search_results"),
                 lit("").alias("scoring_results")
             ]
-            
+
             unified_insert_df = mapped_df.select(*unified_select_cols)
             
             # Insert into unified

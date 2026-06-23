@@ -232,7 +232,7 @@ def _scd2_expire(delta_audit, keys_df, action_type="DELETE_EXPIRED"):
         delta_audit
         .filter(F.col("is_current") == F.lit(True))
         .join(keys_only, on="ref_lakefusion_id", how="inner")
-    ).cache()
+    )
     current_snapshot.count()  # force materialisation before mutating audit
 
     # Step 2 — flip prior current

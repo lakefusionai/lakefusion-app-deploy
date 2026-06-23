@@ -154,7 +154,12 @@ dev_group = groups["developer"]
 steward_group = groups["data_steward"]
 
 skip_run = False
-if _group_exists(dev_group) and _group_exists(steward_group):
+try:
+    _groups_present = _group_exists(dev_group) and _group_exists(steward_group)
+except Exception as e:
+    print(f"  Pre-flight check failed (non-fatal): {e}")
+    _groups_present = False
+if _groups_present:
     print("  Pre-flight: Both entity groups already exist")
     member_ok = True
     if rbac_owner_emails:
@@ -195,12 +200,18 @@ if job_id:
         print(f"  Job owner: {owner_name} (id={owner_user_id})")
 
 for grp_name in groups.values():
-    ensure_account_group(api, grp_name, owner_user_id=owner_user_id)
+    try:
+        ensure_account_group(api, grp_name, owner_user_id=owner_user_id)
+    except Exception as e:
+        print(f"  Skipping group '{grp_name}' — could not ensure it exists: {e}")
 
 if rbac_owner_emails:
     print(f"  Adding creator emails to groups: {rbac_owner_emails}")
     for grp_name in groups.values():
-        add_group_members_by_email(api, w, grp_name, rbac_owner_emails)
+        try:
+            add_group_members_by_email(api, w, grp_name, rbac_owner_emails)
+        except Exception as e:
+            print(f"  Could not add members to '{grp_name}': {e}")
 
 # COMMAND ----------
 
@@ -240,8 +251,11 @@ if job_id and job_rows:
             continue
         group_perms.setdefault(row.group_name, []).extend(row.privileges)
     if group_perms:
-        set_job_permissions_with_owner(w, job_id, group_perms)
-        print(f"  Granted job perms to groups: {list(group_perms.keys())}")
+        try:
+            set_job_permissions_with_owner(w, job_id, group_perms)
+            print(f"  Granted job perms to groups: {list(group_perms.keys())}")
+        except Exception as e:
+            print(f"  Could not grant job perms (non-fatal): {e}")
 else:
     print("  No job_id or job rows — skipping")
 

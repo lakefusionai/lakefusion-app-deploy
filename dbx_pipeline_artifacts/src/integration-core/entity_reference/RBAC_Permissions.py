@@ -86,12 +86,18 @@ group_list = [dev_group, steward_group]
 
 # DBTITLE 1,Step 1 — Ensure entity groups + add creators
 for grp_name in groups.values():
-    ensure_account_group(api, grp_name)
+    try:
+        ensure_account_group(api, grp_name)
+    except Exception as e:
+        print(f"  Skipping group '{grp_name}' — could not ensure it exists: {e}")
 
 if rbac_owner_emails:
     print(f"  Adding creator emails to groups: {rbac_owner_emails}")
     for grp_name in groups.values():
-        add_group_members_by_email(api, w, grp_name, rbac_owner_emails)
+        try:
+            add_group_members_by_email(api, w, grp_name, rbac_owner_emails)
+        except Exception as e:
+            print(f"  Could not add members to '{grp_name}': {e}")
 
 # COMMAND ----------
 

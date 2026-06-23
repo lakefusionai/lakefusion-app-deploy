@@ -1606,7 +1606,7 @@ def unassign_user(
 # Onboard
 # ---------------------------------------------------------------------------
 
-@rbac_groups_router.post("/onboard")
+@rbac_groups_router.post("/onboard", dependencies=[Depends(require_user_management)])
 def onboard_admins(
     req: OnboardRequest,
     check: dict = Depends(require_admin),

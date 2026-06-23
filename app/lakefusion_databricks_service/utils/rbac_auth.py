@@ -8,8 +8,11 @@ from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.lakefusion_databricks_service.utils.app_db import get_db, token_required_wrapper
+from lakefusion_utility.services.feature_flags_service import FeatureFlagService
 from lakefusion_utility.services.rbac_service import RBACService
 from lakefusion_utility.utils.logging_utils import get_logger
+
+USER_MANAGEMENT_FLAG = "ENABLE_USER_MANAGEMENT"
 
 logger = get_logger(__name__)
 
@@ -53,7 +56,13 @@ def require_user_management(
     Populates ``check["roles"]`` with the caller's globally-scoped roles so
     downstream ownership gates (see ``_is_admin`` in rbac_groups_route) can
     short-circuit admin mutations without re-querying.
+
+    Gated by the ``ENABLE_USER_MANAGEMENT`` feature flag: when disabled the whole
+    user-management surface (RBAC groups + users routes) returns 403 cleanly.
     """
+    if not FeatureFlagService._is_feature_flag_enabled(db, USER_MANAGEMENT_FLAG):
+        raise HTTPException(status_code=403, detail="User management is disabled")
+
     user_id, _token = _extract_user(check)
     check["user_id"] = user_id
     if user_id:

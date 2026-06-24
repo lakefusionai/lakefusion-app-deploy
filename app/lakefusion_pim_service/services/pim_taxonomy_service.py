@@ -151,10 +151,11 @@ class PimTaxonomyService:
                 level, parent_path = parent_map[data.parent_id]
                 materialized_path = f"{parent_path}/{code}" if parent_path else code
 
+                parent_clause = '"parent_id" = :pid' if data.parent_id else '"parent_id" IS NULL'
                 existing_inactive = pim_sql.fetch_one(
                     self.db,
                     f'SELECT "id" FROM {self._node} WHERE '
-                    f'{"\"parent_id\" = :pid" if data.parent_id else "\"parent_id\" IS NULL"} '
+                    f'{parent_clause} '
                     f'AND "code" = :code AND "is_active" = FALSE',
                     ({"pid": data.parent_id, "code": code} if data.parent_id else {"code": code}),
                 )

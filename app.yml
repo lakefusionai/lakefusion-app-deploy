@@ -41,7 +41,7 @@ env:
   - name: DATA_DATABRICKS_DATABASE_INSTANCE
     value: "lakefusion-db"
   - name: DATA_DB_SEARCH_PATH
-    value: "public"
+    value: "gold"
   - name: DATABRICKS_OIDC_CLIENT_ID
     valueFrom: DATABRICKS_OIDC_CLIENT_ID
   - name: DATABRICKS_OIDC_CLIENT_SECRET

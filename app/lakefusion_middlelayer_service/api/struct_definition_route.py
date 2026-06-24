@@ -53,12 +53,13 @@ def create_struct_definition(
 @struct_definition_router.get("/", response_model=List[StructDefinitionResponse])
 def list_struct_definitions(
     is_active: Optional[bool] = None,
+    entity_id: Optional[int] = None,
     db: Session = Depends(get_db),
     check: dict = Depends(token_required_wrapper),
 ):
     _require_flag(db)
     service = StructDefinitionService(db)
-    return service.list_all(is_active=is_active)
+    return service.list_all(is_active=is_active, entity_id=entity_id)
 
 
 @struct_definition_router.get(

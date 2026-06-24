@@ -45,13 +45,14 @@ dbutils.widgets.text("lakebase_branch_id", "", "lakebase_branch_id")
 dbutils.widgets.text("lakebase_endpoint_id", "", "lakebase_endpoint_id")
 dbutils.widgets.text("lakebase_database", "databricks_postgres", "lakebase_database")
 dbutils.widgets.text("soft_delete", "false", "Soft-delete (record_status=DELETED) vs hard delete on master")
+dbutils.widgets.text("job_run_id", "", "job id for this run")
 
 # COMMAND ----------
 
 catalog_name = dbutils.widgets.get("catalog_name")
 entity       = dbutils.widgets.get("entity")
 write_mode   = dbutils.widgets.get("write_mode")
-
+job_run_id   = dbutils.widgets.get("job_run_id")
 entity     = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSON", "entity", debugValue=entity)
 
 # The change-log + synced tables live in the entity's own Lakebase database
@@ -160,7 +161,7 @@ for row in routes:
 # Mark the drained rows processed (psycopg2). New rows arriving during the run get a
 # higher seq and are picked up next run — lock-free, idempotent.
 import time as _time
-batch_id = f"sync_{int(_time.time())}"
+batch_id = f"sync_{job_run_id}"
 with LakebasePgClient(
     instance_id=lakebase_params["lakebase_instance_id"],
     branch_id=lakebase_params["lakebase_branch_id"],

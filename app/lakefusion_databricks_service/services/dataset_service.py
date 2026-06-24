@@ -465,7 +465,7 @@ def fetch_metadata_dataset(token: str, db, dataset_id: int, warehouse_id: str):
                 "table_name": table,
                 "table_schema": schema,
                 "table_comment": getattr(table_info, "comment", None),
-                "columns": columns,
+                "columns": sorted(columns, key=lambda x: x["col_name"].lower()),
             }
             return HttpResponse(status=200, data=data)
         except Exception as sdk_err:
@@ -480,6 +480,7 @@ def fetch_metadata_dataset(token: str, db, dataset_id: int, warehouse_id: str):
             t.table_name,
             t.table_schema,
             t.comment AS table_comment,
+            array_sort(
             collect_list(
                 named_struct(
                 'col_name', c1.column_name,
@@ -487,6 +488,7 @@ def fetch_metadata_dataset(token: str, db, dataset_id: int, warehouse_id: str):
                 'comment', c1.comment,
                 'tags_map', COALESCE(c2.tags_map, map())
                 )
+            )
             ) AS columns
         FROM {catalog}.information_schema.tables t
         JOIN {catalog}.information_schema.COLUMNS c1

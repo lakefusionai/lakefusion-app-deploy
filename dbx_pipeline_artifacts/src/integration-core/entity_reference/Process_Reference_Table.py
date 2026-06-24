@@ -30,6 +30,7 @@ dbutils.widgets.text("write_mode", "delta", "Write Mode (delta/lakebase)")
 dbutils.widgets.text("lakebase_instance_id", "", "lakebase_instance_id")
 dbutils.widgets.text("lakebase_branch_id", "", "lakebase_branch_id")
 dbutils.widgets.text("lakebase_endpoint_id", "", "lakebase_endpoint_id")
+dbutils.widgets.text("job_run_id", "", "job id for this run")
 
 # COMMAND ----------
 
@@ -45,6 +46,7 @@ write_mode = dbutils.widgets.get("write_mode")
 lakebase_instance_id = dbutils.widgets.get("lakebase_instance_id")
 lakebase_branch_id = dbutils.widgets.get("lakebase_branch_id")
 lakebase_endpoint_id = dbutils.widgets.get("lakebase_endpoint_id")
+job_run_id=dbutils.widgets.get("job_run_id")
 
 # COMMAND ----------
 
@@ -94,7 +96,7 @@ import uuid
 
 try:
     # Works in Databricks Jobs — set automatically by the job scheduler
-    RUN_ID = f"RUN_{dbutils.jobs.taskValues.get(taskKey='run_id', default=str(uuid.uuid4()))}"
+    RUN_ID = f"RUN_{job_run_id}"
 except Exception:
     RUN_ID = f"RUN_{uuid.uuid4()}"
 RUN_ID=RUN_ID.replace('-','_')

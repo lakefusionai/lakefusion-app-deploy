@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body
 from lakefusion_utility.services.validation_functions_service import ValidationFunctionsService
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
-from lakefusion_utility.models.entity import Entity, EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags, EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse  # Import your Pydantic models
+from lakefusion_utility.models.entity import Entity, EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityAttributeReorderRequest, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags, EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse  # Import your Pydantic models
 from lakefusion_utility.models.api_response import ApiResponse
 from lakefusion_utility.services.entity_service import EntityService, EntityDnBService, EntityAttributeService, SurvivorshipRuleService, EntityDatasetMappingService # Import the EntityService class
 from fastapi.responses import FileResponse
@@ -115,6 +115,11 @@ def check_entity_tables_existence(
     service = EntityService(db)
     token = check.get('token', '')
     return service.check_entity_tables_existence(token, entity_name)
+
+@entity_router.patch("/{entity_id}/attributes/reorder")
+def reorder_entity_attributes(entity_id: int, body: EntityAttributeReorderRequest, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+    service = EntityAttributeService(db)
+    return service.reorder_attributes(entity_id, body.attribute_ids)
 
 @entity_router.post("/{entity_id}/attribute", response_model=ApiResponse[EntityAttributeResponse])
 def create_entity_attribute(entity_id:int, entity_attribute: EntityAttributeCreate, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):

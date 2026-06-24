@@ -242,7 +242,7 @@ def upgrade() -> None:
             SELECT
                 id, task_name, entity_id, job_id_1, version, pipeline_mode
             FROM integration_hub
-            WHERE is_active = 1
+            WHERE is_active = true
             ORDER BY id
         """)
 

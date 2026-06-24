@@ -56,6 +56,34 @@ def parse_attributes_mapping(dataset_mappings):
 
     return attribute_mappings
 
+def parse_attributes_mapping_full(dataset_mappings):
+    """Like ``parse_attributes_mapping_json`` but preserves the full mapping
+    record (including ``mode`` and ``sub_field_map``) for each entity
+    attribute. Required by complex-type projection so the pipeline
+    can choose between direct_column and subfield_assembly transforms.
+
+    Returns:
+        List of dicts: [{table_path: [MappingAttribute dict, ...]}, ...]
+    """
+    attribute_mappings = []
+    for dataset in dataset_mappings:
+        records = []
+        for attr in dataset.get("attributes", []) or []:
+            records.append(
+                {
+                    "entity_attribute": attr.get("entity_attribute"),
+                    "dataset_attribute": attr.get("dataset_attribute"),
+                    "ref_attribute": attr.get("ref_attribute"),
+                    "ref_entity_id": attr.get("ref_entity_id"),
+                    "match_strategy": attr.get("match_strategy"),
+                    "mode": attr.get("mode"),
+                    "sub_field_map": attr.get("sub_field_map"),
+                }
+            )
+        attribute_mappings.append({dataset["dataset"]["path"]: records})
+    return attribute_mappings
+
+
 def parse_attributes_mapping_json(dataset_mappings):
     """
     Parse attribute mappings from dataset_mappings.

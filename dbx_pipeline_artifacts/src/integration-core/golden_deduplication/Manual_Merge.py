@@ -51,6 +51,11 @@ match_attributes = dbutils.jobs.taskValues.get(
     key="match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
 master_id = dbutils.widgets.get("master_id")
 match_record_id = dbutils.widgets.get("match_record_id")
 action_type = dbutils.widgets.get("operation_type")
@@ -62,10 +67,19 @@ entity_attributes_datatype = json.loads(entity_attributes_datatype)
 default_survivorship_rules = json.loads(default_survivorship_rules)
 dataset_objects = json.loads(dataset_objects)
 match_attributes = json.loads(match_attributes)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -318,18 +332,19 @@ for attr in entity_attributes:
     target_type = entity_attributes_datatype.get(attr, "string")
     master_updates_cols.append(merged_record_column(attr, target_type))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# Handles single ref_id and concat-aggregated multi-id values.
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes and attr != id_key:
-            concat_cols.append(coalesce(col(f"merged_record.{attr}").cast("string"), lit("")))
-    
-    if concat_cols:
-        master_updates_cols.append(concat_ws(" | ", *concat_cols).alias("attributes_combined"))
-    else:
-        master_updates_cols.append(lit("").alias("attributes_combined"))
+    master_updates_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=id_key,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix="merged_record",
+        ).alias("attributes_combined")
+    )
 else:
     master_updates_cols.append(lit("").alias("attributes_combined"))
 

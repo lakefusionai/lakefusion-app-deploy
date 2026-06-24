@@ -76,7 +76,7 @@ def upgrade() -> None:
         session.execute(
             text("""
                 INSERT INTO feature_flags (name, description, status, owner_team, created_at, updated_at)
-                VALUES ('SCHEMA_EVOLUTION', 'Enable schema evolution for entities', 'ACTIVE', 'LakeFusion', NOW(), NOW())
+                VALUES ('SCHEMA_EVOLUTION', 'Enable schema evolution for entities', 'ACTIVE', 'LakeFusion', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """)
         )
         session.commit()

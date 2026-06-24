@@ -37,15 +37,14 @@ dbutils.library.restartPython()
 # COMMAND ----------
 
 # Widget definitions
-dbutils.widgets.text("app_name", "lakefusionai", "App Name")
-dbutils.widgets.text("app_description", "LakeFusion AI", "App Description")
-dbutils.widgets.text("source_code_path", "/Workspace/Users/{user}/lakefusion-app-deploy", "Source Code Path")
-dbutils.widgets.text("database_name", "lakefusion-db", "Lakebase Instance Name")
-dbutils.widgets.text("internal_db_name", "lakefusion_transactional_db", "PostgreSQL Database Name")
-dbutils.widgets.text("secrets_scope", "lakefusion", "Secrets Scope Name")
+dbutils.widgets.text("app_name", "", "App Name")
+dbutils.widgets.text("app_description", "", "App Description")
+dbutils.widgets.text("source_code_path", "", "Source Code Path")
+dbutils.widgets.text("database_name", "", "Lakebase Instance Name")
+dbutils.widgets.text("internal_db_name", "", "PostgreSQL Database Name")
+dbutils.widgets.text("secrets_scope", "", "Secrets Scope Name")
 dbutils.widgets.text("oidc_client_id", "", "OIDC Client ID (for SSO)")
 dbutils.widgets.text("oidc_client_secret", "", "OIDC Client Secret (for SSO)")
-dbutils.widgets.text("databricks_dapi", "", "Databricks DAPI Token")
 dbutils.widgets.dropdown("create_database", "true", ["true", "false"], "Create Lakebase Database")
 dbutils.widgets.dropdown("create_secrets", "true", ["true", "false"], "Create Secrets")
 
@@ -65,9 +64,39 @@ INTERNAL_DB_NAME = dbutils.widgets.get("internal_db_name")
 SECRETS_SCOPE = dbutils.widgets.get("secrets_scope")
 OIDC_CLIENT_ID = dbutils.widgets.get("oidc_client_id")
 OIDC_CLIENT_SECRET = dbutils.widgets.get("oidc_client_secret")
-DATABRICKS_DAPI = dbutils.widgets.get("databricks_dapi")
 CREATE_DATABASE = dbutils.widgets.get("create_database") == "true"
 CREATE_SECRETS = dbutils.widgets.get("create_secrets") == "true"
+
+# --- Validate required parameters ---
+_errors = []
+
+# OIDC credentials are critical — check first
+if not OIDC_CLIENT_ID:
+    _errors.append("OIDC Client ID is required. Register an OAuth app in Account Console > Settings > App connections.")
+if not OIDC_CLIENT_SECRET:
+    _errors.append("OIDC Client Secret is required. Register an OAuth app in Account Console > Settings > App connections.")
+
+if _errors:
+    for e in _errors:
+        print(f"❌ {e}")
+    raise SystemExit("Setup aborted: OIDC credentials are required. Please configure them in the widgets above and re-run.")
+
+# Other required parameters
+if not APP_NAME:
+    _errors.append("App Name is required.")
+if not SOURCE_CODE_PATH:
+    _errors.append("Source Code Path is required.")
+if not DATABASE_NAME:
+    _errors.append("Lakebase Instance Name is required.")
+if not INTERNAL_DB_NAME:
+    _errors.append("PostgreSQL Database Name is required.")
+if not SECRETS_SCOPE:
+    _errors.append("Secrets Scope Name is required.")
+
+if _errors:
+    for e in _errors:
+        print(f"❌ {e}")
+    raise SystemExit("Setup aborted: Please fill in all required parameters in the widgets above and re-run.")
 
 # Replace {user} placeholder in source code path
 current_user = spark.sql("SELECT current_user()").collect()[0][0]
@@ -83,8 +112,8 @@ print(f"  PostgreSQL Database Name: {INTERNAL_DB_NAME}")
 print(f"  Secrets Scope: {SECRETS_SCOPE}")
 print(f"  Create Database: {CREATE_DATABASE}")
 print(f"  Create Secrets: {CREATE_SECRETS}")
-print(f"  OIDC Client ID: {'[SET]' if OIDC_CLIENT_ID else '[NOT SET]'}")
-print(f"  OIDC Client Secret: {'[SET]' if OIDC_CLIENT_SECRET else '[NOT SET]'}")
+print(f"  OIDC Client ID: [SET]")
+print(f"  OIDC Client Secret: [SET]")
 
 # COMMAND ----------
 
@@ -200,8 +229,6 @@ if CREATE_SECRETS:
         put_secret(SECRETS_SCOPE, "DATABRICKS_OIDC_CLIENT_ID", OIDC_CLIENT_ID)
     if OIDC_CLIENT_SECRET:
         put_secret(SECRETS_SCOPE, "DATABRICKS_OIDC_CLIENT_SECRET", OIDC_CLIENT_SECRET)
-    if DATABRICKS_DAPI:
-        put_secret(SECRETS_SCOPE, "LAKEFUSION_DATABRICKS_DAPI", DATABRICKS_DAPI)
 else:
     print("Skipping secrets setup (CREATE_SECRETS=false)")
 
@@ -457,7 +484,7 @@ if CREATE_DATABASE and db_info:
 from databricks.sdk.service.database import DatabaseCatalog
 
 # Widget for catalog name
-dbutils.widgets.text("catalog_name", "lakefusion_ai", "Unity Catalog Name")
+dbutils.widgets.text("catalog_name", "", "Database Unity Catalog Name")
 CATALOG_NAME = dbutils.widgets.get("catalog_name")
 
 def create_database_and_catalog(instance_name, db_name, catalog_name):
@@ -682,16 +709,6 @@ if CREATE_SECRETS and OIDC_CLIENT_SECRET:
         }
     })
 
-if CREATE_SECRETS and DATABRICKS_DAPI:
-    resources.append({
-        "name": "LAKEFUSION_DATABRICKS_DAPI",
-        "secret": {
-            "scope": SECRETS_SCOPE,
-            "key": "LAKEFUSION_DATABRICKS_DAPI",
-            "permission": "READ"
-        }
-    })
-
 if resources:
     print(f"Configuring {len(resources)} resources:")
     for r in resources:
@@ -707,58 +724,45 @@ else:
 
 # MAGIC %md
 # MAGIC ## Step 4a: Update app.yml with widget values
+# MAGIC
+# MAGIC > **Note:** This step is commented out. The app.yml no longer contains hardcoded
+# MAGIC > database names — the app resolves them at runtime from platform-injected PGHOST/PGDATABASE.
+# MAGIC > Uncomment if you need to customize app.yml for non-standard deployments.
 
 # COMMAND ----------
 
-import base64
-from databricks.sdk.service.workspace import ImportFormat, ExportFormat
-
-# Read existing app.yml as raw text (preserves formatting that Databricks Apps requires)
-app_yml_path = f"{SOURCE_CODE_PATH}/app.yml"
-try:
-    export_resp = w.workspace.export(path=app_yml_path, format=ExportFormat.AUTO)
-    content = base64.b64decode(export_resp.content).decode('utf-8')
-    print(f"Read existing app.yml from {app_yml_path}")
-except Exception as e:
-    print(f"⚠️  Could not read existing app.yml: {e}")
-    content = ""
-
-if content:
-    # String replacements to update dynamic values while preserving YAML formatting
-    import re
-
-    # Update app name
-    content = re.sub(r'^name: .+$', f'name: {APP_NAME}', content, count=1, flags=re.MULTILINE)
-
-    # Update database resource name and database
-    content = re.sub(r'(resources:\n  - name: ).+', rf'\g<1>{DATABASE_NAME}', content)
-    content = re.sub(r'(    database: ).+', rf'\g<1>{INTERNAL_DB_NAME}', content)
-
-    # Update env var values
-    env_replacements = {
-        "DATABRICKS_DATABASE_INSTANCE": DATABASE_NAME,
-        "DATABRICKS_DATABASE_NAME": INTERNAL_DB_NAME,
-        "PGDATABASE": INTERNAL_DB_NAME,
-    }
-    for env_name, env_value in env_replacements.items():
-        content = re.sub(
-            rf'(- name: {env_name}\n    value: ).+',
-            rf'\g<1>"{env_value}"',
-            content
-        )
-
-    print("---")
-    print(content)
-
-    w.workspace.import_(
-        path=app_yml_path,
-        content=base64.b64encode(content.encode()).decode(),
-        format=ImportFormat.AUTO,
-        overwrite=True
-    )
-    print(f"✅ app.yml updated at {app_yml_path}")
-else:
-    print("❌ No existing app.yml found — run the build/deploy first")
+# import base64
+# from databricks.sdk.service.workspace import ImportFormat, ExportFormat
+#
+# # Read existing app.yml as raw text (preserves formatting that Databricks Apps requires)
+# app_yml_path = f"{SOURCE_CODE_PATH}/app.yml"
+# try:
+#     export_resp = w.workspace.export(path=app_yml_path, format=ExportFormat.AUTO)
+#     content = base64.b64decode(export_resp.content).decode('utf-8')
+#     print(f"Read existing app.yml from {app_yml_path}")
+# except Exception as e:
+#     print(f"⚠️  Could not read existing app.yml: {e}")
+#     content = ""
+#
+# if content:
+#     import re
+#     # Update app name
+#     content = re.sub(r'^name: .+$', f'name: {APP_NAME}', content, count=1, flags=re.MULTILINE)
+#     # Update database resource name and database
+#     content = re.sub(r'(resources:\n  - name: ).+', rf'\g<1>{DATABASE_NAME}', content)
+#     content = re.sub(r'(    database: ).+', rf'\g<1>{INTERNAL_DB_NAME}', content)
+#     print("---")
+#     print(content)
+#     w.workspace.import_(
+#         path=app_yml_path,
+#         content=base64.b64encode(content.encode()).decode(),
+#         format=ImportFormat.AUTO,
+#         overwrite=True
+#     )
+#     print(f"✅ app.yml updated at {app_yml_path}")
+# else:
+#     print("❌ No existing app.yml found — run the build/deploy first")
+print("⏭️  Step 4a skipped — app.yml resolves DB config at runtime from platform-injected PGHOST/PGDATABASE")
 
 # COMMAND ----------
 

@@ -2,6 +2,7 @@ from fastapi.security import HTTPBearer
 from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import NotebookService
 from lakefusion_utility.models.httpresponse import HttpResponse
+from lakefusion_utility.utils.dbx_error_handler import raise_on_dbx_permission_error
 import traceback
 
 # Initialize an HTTPBearer security scheme for token-based authentication
@@ -30,10 +31,11 @@ def list_workspace_contents(token: str, path: str):
         # Return the retrieved directory contents
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list workspace contents")
         # Capture the traceback in case of an exception and log the error message
         message = traceback.format_exc()
         app_logger.exception(f"Unable to fetch workspace contents for path '{path}'. Reason - {message}")
-        
+
         # Raise an HTTPException with a 500 status code, indicating internal server error
         raise HttpResponse(
             status_code=500,

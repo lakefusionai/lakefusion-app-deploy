@@ -40,6 +40,11 @@ match_attributes = dbutils.jobs.taskValues.get(
     "Parse_Entity_Model_JSON", "match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
 master_id = dbutils.widgets.get("master_id")
 unified_dataset_ids = dbutils.widgets.get("unified_dataset_ids")
 
@@ -49,10 +54,19 @@ entity_attributes = json.loads(entity_attributes)
 entity_attributes_datatype = json.loads(entity_attributes_datatype)
 match_attributes = json.loads(match_attributes)
 unified_dataset_ids = json.loads(unified_dataset_ids)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -565,21 +579,20 @@ for attr in entity_attributes:
     else:
         insert_cols.append(col(attr).alias(attr))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# Note: this build site uses " " as the inter-attribute separator (not " | ").
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(attr).cast("string"), lit("")))
-    
-    if concat_cols:
-        insert_cols.append(
-            concat_ws(" ", *concat_cols).alias("attributes_combined")
-        )
-    else:
-        insert_cols.append(lit("").alias("attributes_combined"))
+    insert_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix=None,
+            separator=" ",
+        ).alias("attributes_combined")
+    )
 else:
     insert_cols.append(lit("").alias("attributes_combined"))
 

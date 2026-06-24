@@ -9,7 +9,6 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects import mysql
 
 
 # revision identifiers, used by Alembic.
@@ -23,7 +22,7 @@ def upgrade() -> None:
     """Add nullable JSON column deterministic_rules to model_experiments."""
     op.add_column(
         'model_experiments',
-        sa.Column('deterministic_rules', mysql.JSON(), nullable=True)
+        sa.Column('deterministic_rules', sa.JSON(), nullable=True)
     )
 
 

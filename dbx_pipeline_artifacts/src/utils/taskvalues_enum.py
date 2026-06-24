@@ -23,7 +23,15 @@ class TaskValueKey(str, Enum):
     # Entity attributes and mapping
     ENTITY_ATTRIBUTES = "entity_attributes"
     ATTRIBUTES_MAPPING = "attributes_mapping"
+    # Full mapping records (preserves mode + sub_field_map for STRUCT/ARRAY
+    # targets). Used by complex-type loaders introduced in
+    ATTRIBUTES_MAPPING_FULL = "attributes_mapping_full"
     ENTITY_ATTRIBUTES_DATATYPE = "entity_attributes_datatype"
+    # Full attribute records (name + type + is_array + struct_definition) needed
+    # by table-creation notebooks to resolve complex (STRUCT / ARRAY) columns
+    # to nested Spark types.
+    ENTITY_ATTRIBUTE_RECORDS = "entity_attribute_records"
+    RDM_FLAG = "rdm_flag"
     
     # Rules and validation
     DEFAULT_SURVIVORSHIP_RULES = "default_survivorship_rules"
@@ -50,6 +58,11 @@ class TaskValueKey(str, Enum):
 
     # Matching configuration
     MATCH_ATTRIBUTES = "match_attributes"
+    # Per-attribute sub-field selection from the MatchMaven model config.
+    # Format: { entity_attribute_name: [sub_field_name, ...] }. Empty / absent
+    # entries mean "use all sub-fields". Consumed by LLM prompt enrichment
+    # so STRUCT / ARRAY<STRUCT> descriptors can be narrowed.
+    MODEL_SELECTED_SUB_FIELDS = "model_selected_sub_fields"
     CONFIG_THRESHOLDS = "config_thresholds"
     PROCESS_RECORDS = "process_records"
     VS_ENDPOINT = "vs_endpoint"
@@ -73,3 +86,39 @@ class TaskValueKey(str, Enum):
     SCHEMA_EVOLUTION_CATALOG_NAME = "schema_evolution_catalog_name"
     SCHEMA_EVOLUTION_ID_KEY = "schema_evolution_id_key"
     SCHEMA_EVOLUTION_EXPERIMENT_ID = "schema_evolution_experiment_id"
+
+    # Vector search results
+    VECTOR_SEARCH_COMPLETE = "vector_search_complete"
+    RECORDS_SEARCHED = "records_searched"
+
+    # LLM matching results
+    LLM_MATCHING_COMPLETE = "llm_matching_complete"
+    RECORDS_PROCESSED = "records_processed"
+
+    # Entity/Model metadata
+    ENTITY_CREATED_BY = "entity_created_by"
+    MODEL_CREATED_BY = "model_created_by"
+    RBAC_OWNER_EMAILS = "rbac_owner_emails"
+    ENTITY_TYPE = "entity_type"
+    STORAGE_TYPE = "storage_type"
+
+    # Master existence check
+    MASTER_EXISTS = "master_exists"
+    UNIFIED_EXISTS = "unified_exists"
+
+    #Reference entity
+    REFERENCE_CONFIG="entity_reference_config"
+    RDM_CONFIGS="rdm_configs"
+    REFERENCE_ATTRIBUTE_CONFIG="reference_attribute_config"
+
+    # PIM product entity (SCRUM-1929)
+    # PIM_TABLE_SCHEMAS: JSON manifest of the 16 pim_* table schemas, introspected
+    # from the SQLAlchemy models in Parse_PIM_Entity_JSON. Format:
+    #   { table_name: { "columns": [{name, type, nullable}, ...], "primary_key": [...] } }
+    # PIM_ENTITY_SUBTYPE: raw entity_subtype string used by Seed to create tiers.
+    PIM_TABLE_SCHEMAS = "pim_table_schemas"
+    PIM_ENTITY_SUBTYPE = "pim_entity_subtype"
+
+
+    #Lakebase
+

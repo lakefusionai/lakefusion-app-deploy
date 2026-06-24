@@ -3,6 +3,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import ComputeService
 from lakefusion_utility.models.httpresponse import HttpResponse
+from lakefusion_utility.utils.dbx_error_handler import raise_on_dbx_permission_error
 from databricks.sdk.service.compute import ListClustersFilterBy, ClusterSource
 import traceback
 
@@ -18,6 +19,7 @@ def list_clusters(token: str):
         data = cs.list_clusters(filter_by=ListClustersFilterBy(is_pinned=True, cluster_sources=[ClusterSource.UI]))
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list clusters")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the clusters list. Reason - {message}')
         raise HttpResponse(
@@ -33,6 +35,7 @@ def list_warehouses(token: str):
         data = cs.list_warehouses()
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list warehouses")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the warehouses list. Reason - {message}')
         raise HttpResponse(
@@ -40,7 +43,7 @@ def list_warehouses(token: str):
             detail="An internal server error occurred while fetching the warehouses list",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
+
 
 def get_warehouse(token: str,warehouse_id:str):
     try:
@@ -48,6 +51,7 @@ def get_warehouse(token: str,warehouse_id:str):
         data = cs.get_warehouse(warehouse_id=warehouse_id)
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "get warehouse")
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the warehouses list. Reason - {message}')
         raise HttpResponse(

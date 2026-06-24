@@ -3,14 +3,6 @@
 
 # COMMAND ----------
 
-# MAGIC %run ../utils/execute_utils
-
-# COMMAND ----------
-
-logger.info("Parsing Entity and Model JSON")
-
-# COMMAND ----------
-
 dbutils.widgets.text('entity_id', '', 'Entity ID')
 dbutils.widgets.text('experiment_id', '', 'Experiment ID')
 dbutils.widgets.text('process_records', '', 'No of records to be proceesed')
@@ -28,11 +20,26 @@ meta_info_table = f"{catalog_name}.silver.table_meta_info"
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC %run execute_utils MUST run AFTER catalog_name is read above — its
+# MAGIC init_logger needs catalog_name to resolve the pipeline_logs volume path.
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/execute_utils
+
+# COMMAND ----------
+
+logger.info("Parsing Entity and Model JSON")
+
+# COMMAND ----------
+
 experiment_path = 'prod'
 if experiment_id and experiment_id != 'prod':
   experiment_path = f'experiment_{experiment_id}'
 entity_json_path = f'/Volumes/{catalog_name}/metadata/metadata_files/entity_{entity_id}_{experiment_path}_entity.json'
 model_json_path = f'/Volumes/{catalog_name}/metadata/metadata_files/entity_{entity_id}_{experiment_path}_model.json'
+entity_reference_config_json_path = f'/Volumes/{catalog_name}/metadata/metadata_files/entity_{entity_id}_{experiment_path}_reference.json'
 
 # COMMAND ----------
 
@@ -59,7 +66,22 @@ master_table = entity_json.get("path")
 primary_table = get_primary_dataset_path(entity_json["dataset_mappings"])
 dataset_tables, dataset_objects = get_dataset_tables(entity_json["dataset_mappings"])
 entity_attributes = [item["name"] for item in entity_json.get("attributes")]
+# Full attribute records carry name + type + is_array + struct_definition
+# so downstream notebooks (Create_Tables, Incremental_Load_To_Unified, …)
+# can resolve STRUCT / ARRAY columns to nested Spark types.
+entity_attribute_records = [
+    {
+        "name": item.get("name"),
+        "type": item.get("type"),
+        "is_array": bool(item.get("is_array", False)),
+        "struct_definition": item.get("struct_definition"),
+    }
+    for item in entity_json.get("attributes", [])
+]
 attributes_mapping = parse_attributes_mapping_json(entity_json["dataset_mappings"])
+# Full mapping records preserving mode + sub_field_map for complex-type
+# loaders. Legacy callers continue to read ATTRIBUTES_MAPPING.
+attributes_mapping_full = parse_attributes_mapping_full(entity_json["dataset_mappings"])
 entity_attributes_datatype = {item["name"]: item["type"] for item in entity_json.get("attributes")}
 primary_key = next(
     (attr['name'] for attr in entity_json.get("attributes") if attr.get('is_primary_key') == True), 
@@ -70,6 +92,7 @@ default_survivorship_rules = get_default_survivorship_rules(entity_json.get("sur
 validation_functions = entity_json.get("validation_functions")
 dataset_tables_len=len(dataset_tables)
 entity_attributes_datatype = {item["name"]: item["type"] for item in entity_json.get("attributes")}
+rdm_flag = 1 if any(v == "REFERENCE_ENTITY" for v in entity_attributes_datatype.values()) else 0
 is_entity_dnb_enabled_temp=entity_json.get("dnb_integration") or {}
 if(is_entity_dnb_enabled_temp!={}):
    is_entity_dnb_enabled=str(is_entity_dnb_enabled_temp.get("is_active", False))
@@ -80,6 +103,134 @@ entity_dnb_settings = entity_json.get("dnb_integration",{})
 # Check if single source (only one dataset table)
 is_single_source = dataset_tables_len == 1
 
+
+# ── Build one config dict per REFERENCE_ENTITY attribute PER source table ─────
+# Iterates ALL dataset_mappings (primary + secondary), not just the first one.
+# Each source table may map the same entity attribute to a different source column.
+
+# Mapping-table suffix — same convention as other entity tables
+# (unified, master, error tables): bare for prod, "_<experiment_id>" for
+# experiments. Each experiment gets its own isolated mapping table — they're
+# NOT shared with prod or other experiments.
+mapping_experiment_suffix = ""
+if experiment_id and experiment_id != "prod":
+    mapping_experiment_suffix = f"_{experiment_id}"
+else:
+    mapping_experiment_suffix=f"_{experiment_id}"
+
+
+rdm_configs = []
+if(rdm_flag==1):
+
+    reference_dataset_lookup = {
+        rd["reference_entity_id"]: rd
+        for rd in entity_json.get("reference_dataset", [])
+    }
+
+    # Collect REFERENCE_ENTITY attribute metadata (shared across all sources)
+    ref_entity_attrs = []
+    for attr in entity_json.get("attributes", []):
+        if attr.get("type") != "REFERENCE_ENTITY":
+            continue
+        ref_entity_attrs.append(attr)
+
+    # Iterate ALL dataset_mappings (primary + all secondary sources)
+    for dataset_mapping in entity_json.get("dataset_mappings", []):
+        source_table = dataset_mapping["dataset"]["path"]
+        source_id    = dataset_mapping.get("dataset_id") or dataset_mapping.get("dataset", {}).get("id")
+
+        # Build attribute lookup for THIS source table
+        # Includes match_strategy and ref_attr per attribute per source
+        dataset_attr_lookup = {
+            m["entity_attribute"]: m
+            for m in dataset_mapping.get("attributes", [])
+        }
+
+        # Build one config per REFERENCE_ENTITY attribute for this source
+        for attr in ref_entity_attrs:
+            attribute_name = attr["name"]
+            type_config    = attr.get("type_config") or {}
+            ref_entity_id  = type_config.get("reference_entity_id")
+            ref_dataset    = reference_dataset_lookup.get(ref_entity_id, {})
+
+            # Get THIS source's mapping for this attribute
+            ds_attr_entry = dataset_attr_lookup.get(attribute_name, {})
+            source_attr   = ds_attr_entry.get("dataset_attribute")
+            ref_attr      = ds_attr_entry.get("ref_attribute") or attribute_name
+
+            # Skip if this source doesn't map this attribute
+            if not source_attr:
+                continue
+
+            # match_strategy comes from the dataset mapping, NOT from entity type_config
+            # e.g. {"match_strategy_type": "fuzzy", "fuzzy_config": {...}}
+            ds_match_strategy = ds_attr_entry.get("match_strategy") or {}
+            match_strategy    = ds_match_strategy.get("match_strategy_type", "exact")
+
+            fuzzy_config     = ds_match_strategy.get("fuzzy_config") or {}
+            fuzzy_algorithm  = fuzzy_config.get("algorithm",        "")
+            high_threshold   = fuzzy_config.get("high_threshold",   0.92)
+            low_threshold    = fuzzy_config.get("low_threshold",    0.75)
+            case_insensitive = fuzzy_config.get("case_insensitive", True)
+
+            ref_entity_name = ref_dataset.get("reference_entity_name", "")
+            mapping_table   = f"{catalog_name}.gold.{ref_entity_name}_reference_mappings{mapping_experiment_suffix}"
+            ref_output_attr = type_config.get("reference_entity_output_attr") or attribute_name
+
+            rdm_configs.append({
+                "attribute_name":   attribute_name,   # entity column  e.g. "SPECIALTY_CODE"
+                "source_table":     source_table,      # THIS source dataset path
+                "source_id":        source_id,         # THIS source's dataset_id
+                "source_attr":      source_attr,       # raw source col for THIS source
+                "ref_table":        ref_dataset.get("reference_entity_table_path"),
+                "ref_entity_name":  ref_entity_name,
+                "ref_storage_type": ref_dataset.get("reference_entity_storage_type", "delta"),
+                "ref_attr":         ref_attr,          # ref table key col (varies per source)
+                "ref_output_attr":  ref_output_attr,   # display column in ref table
+                "match_strategy":   match_strategy,    # "exact" | "fuzzy" (per source)
+                # What to do when a REF value can't be resolved (NO_MATCH/PENDING):
+                # "keep_null" (default) keeps the row with the attr nulled,
+                # "move_to_error" routes the row to the unified error table.
+                "unresolved_action": ds_match_strategy.get("unresolved_action", "keep_null"),
+                "fuzzy_algorithm":  fuzzy_algorithm,   # per source
+                "high_threshold":   high_threshold,
+                "low_threshold":    low_threshold,
+                "case_insensitive": case_insensitive,
+                "unified_table":    f"{catalog_name}.silver.{entity}_unified_prod",
+                "master_table":    f"{catalog_name}.gold.{entity}_master_prod",
+                "mapping_table":    mapping_table,
+            })
+else:
+    pass
+
+# ── Build reference_attribute_config for load steps ─────────────────────────
+# Maps: {attr_name: {ref_table, output_attr, mapping_table}} for REFERENCE_ENTITY attrs
+# Used by load steps to:
+#   1. Lookup mapping_table: source_value → ref_lakefusion_id (stored in column)
+#   2. LEFT JOIN ref_table on ref_lakefusion_id → output_attr (used in attributes_combined)
+reference_attribute_config = {}
+if rdm_flag == 1:
+    for attr in entity_json.get("attributes", []):
+        if attr.get("type") != "REFERENCE_ENTITY":
+            continue
+        attribute_name = attr["name"]
+        type_config = attr.get("type_config") or {}
+        ref_entity_id = type_config.get("reference_entity_id")
+        output_attr = type_config.get("reference_entity_output_attr") or attribute_name
+        ref_dataset = reference_dataset_lookup.get(ref_entity_id, {})
+        ref_table = ref_dataset.get("reference_entity_table_path")
+        ref_entity_name = ref_dataset.get("reference_entity_name", "")
+        mapping_table = (
+            f"{catalog_name}.gold.{ref_entity_name}_reference_mappings{mapping_experiment_suffix}"
+            if ref_entity_name else None
+        )
+        if ref_table:
+            reference_attribute_config[attribute_name] = {
+                "ref_table": ref_table,
+                "output_attr": output_attr,
+                "mapping_table": mapping_table,
+            }
+
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY.value, entity)
 dbutils.jobs.taskValues.set(TaskValueKey.MASTER_TABLE.value, master_table)
 dbutils.jobs.taskValues.set(TaskValueKey.PRIMARY_TABLE.value, primary_table)
@@ -89,7 +240,9 @@ dbutils.jobs.taskValues.set(TaskValueKey.DATASET_TABLES.value, json.dumps(datase
 dbutils.jobs.taskValues.set(TaskValueKey.DATASET_OBJECTS.value, json.dumps(dataset_objects))
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTES.value, json.dumps(entity_attributes))
 dbutils.jobs.taskValues.set(TaskValueKey.ATTRIBUTES_MAPPING.value, json.dumps(attributes_mapping))
+dbutils.jobs.taskValues.set(TaskValueKey.ATTRIBUTES_MAPPING_FULL.value, json.dumps(attributes_mapping_full))
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTES_DATATYPE.value, json.dumps(entity_attributes_datatype))
+dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_ATTRIBUTE_RECORDS.value, json.dumps(entity_attribute_records))
 dbutils.jobs.taskValues.set(TaskValueKey.DEFAULT_SURVIVORSHIP_RULES.value, json.dumps(default_survivorship_rules))
 dbutils.jobs.taskValues.set(TaskValueKey.VALIDATION_FUNCTIONS.value, json.dumps(validation_functions))
 dbutils.jobs.taskValues.set(TaskValueKey.IS_GOLDEN_DEDUPLICATION.value, dataset_tables_len)
@@ -98,6 +251,31 @@ dbutils.jobs.taskValues.set(TaskValueKey.IS_ENTITY_DNB_ENABLED.value, is_entity_
 dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_DNB_SETTINGS.value, json.dumps(entity_dnb_settings))
 dbutils.jobs.taskValues.set(TaskValueKey.CATALOG_NAME.value, catalog_name)
 dbutils.jobs.taskValues.set(TaskValueKey.META_INFO_TABLE.value, meta_info_table)
+dbutils.jobs.taskValues.set(TaskValueKey.RDM_CONFIGS.value, rdm_configs)
+dbutils.jobs.taskValues.set(TaskValueKey.RDM_FLAG.value, rdm_flag)
+dbutils.jobs.taskValues.set(TaskValueKey.REFERENCE_ATTRIBUTE_CONFIG.value, json.dumps(reference_attribute_config))
+
+
+# COMMAND ----------
+
+entity_type = entity_json.get("entity_type", "reference")
+storage_type = entity_json.get("storage_type", "delta")
+dbutils.jobs.taskValues.set(TaskValueKey.ENTITY_TYPE.value, entity_type)
+dbutils.jobs.taskValues.set(TaskValueKey.STORAGE_TYPE.value, storage_type)
+
+# COMMAND ----------
+
+if(entity_type=="reference"):
+  entity_reference_config_json_path_str = ''
+  with open(entity_reference_config_json_path, 'r') as f:
+    entity_reference_config_json_path_str = f.read()
+  entity_reference_config_json = json.loads(entity_reference_config_json_path_str)
+  entity_reference_config = entity_reference_config_json.get('merge_config', '')
+  dbutils.jobs.taskValues.set(TaskValueKey.REFERENCE_CONFIG.value, entity_reference_config)
+  dbutils.notebook.exit("Reference Entity Found")
+else:
+  pass
+
 
 # COMMAND ----------
 
@@ -117,6 +295,13 @@ embedding_model_source = model_json.get('embedding_model_source', 'databricks_fo
 embedding_model_source_str = embedding_model_source
 attribute_objects = model_json.get('attributes', '')
 attributes = [attribute.get('name') for attribute in attribute_objects]
+# Sub-field selection per model-config attribute (only meaningful for STRUCT
+# / ARRAY<STRUCT> targets). Empty / missing = use all sub-fields.
+model_selected_sub_fields = {
+    a.get('name'): a.get('selected_sub_fields') or []
+    for a in attribute_objects
+    if a.get('name') and a.get('selected_sub_fields')
+}
 config_thresholds = model_json.get('config_thresold')
 vs_endpoint = model_json.get('vs_endpoint')
 additional_instructions = model_json.get('additional_instructions', '').replace("'", "''")
@@ -279,6 +464,9 @@ dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL_SOURCE.value, embedding
 dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL.value, embedding_model)
 dbutils.jobs.taskValues.set(TaskValueKey.EMBEDDING_MODEL_ENDPOINT.value, embedding_model_endpoint)
 dbutils.jobs.taskValues.set(TaskValueKey.MATCH_ATTRIBUTES.value, json.dumps(attributes))
+dbutils.jobs.taskValues.set(
+    TaskValueKey.MODEL_SELECTED_SUB_FIELDS.value, json.dumps(model_selected_sub_fields)
+)
 dbutils.jobs.taskValues.set(TaskValueKey.CONFIG_THRESHOLDS.value, json.dumps(config_thresholds))
 dbutils.jobs.taskValues.set(TaskValueKey.PROCESS_RECORDS.value, process_records)
 dbutils.jobs.taskValues.set(TaskValueKey.VS_ENDPOINT.value, vs_endpoint)

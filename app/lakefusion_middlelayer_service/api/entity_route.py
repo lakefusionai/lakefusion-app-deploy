@@ -1,12 +1,49 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+import os
+import threading
+import requests
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body
 from lakefusion_utility.services.validation_functions_service import ValidationFunctionsService
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
-from lakefusion_utility.models.entity import EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags,EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse  # Import your Pydantic models
+from lakefusion_utility.models.entity import Entity, EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags, EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse  # Import your Pydantic models
 from lakefusion_utility.models.api_response import ApiResponse
-from lakefusion_utility.services.entity_service import EntityService, EntityDnBService, EntityAttributeService, SurvivorshipRuleService, EntityDatasetMappingService  # Import the EntityService class
+from lakefusion_utility.services.entity_service import EntityService, EntityDnBService, EntityAttributeService, SurvivorshipRuleService, EntityDatasetMappingService # Import the EntityService class
 from fastapi.responses import FileResponse
 from typing import List, Optional
+from lakefusion_utility.utils.logging_utils import get_logger
+
+_webhook_logger = get_logger(__name__)
+
+
+def _notify_pim_attribute_sync(entity_id: int, attr_data: dict, db: Session, token: str = ""):
+    """Fire-and-forget webhook to PIM service to sync a single attribute.
+    Only fires for product entities that have been initialized."""
+    try:
+        entity = db.query(Entity).filter(Entity.id == entity_id).first()
+        if not entity or entity.entity_type != "product":
+            return  # Not a product entity — skip
+
+        pim_service_url = os.getenv("PIM_SERVICE_URL", "http://localhost:8006")
+        url = f"{pim_service_url}/api/pim/entity-bridge/{entity_id}/sync-attribute"
+
+        def _fire():
+            try:
+                headers = {"Content-Type": "application/json"}
+                if token:
+                    headers["Authorization"] = f"Bearer {token}"
+                resp = requests.post(url, json=attr_data, headers=headers, timeout=5)
+                if resp.status_code == 503:
+                    _webhook_logger.debug(f"PIM not initialized yet for entity {entity_id}, skipping sync")
+                elif resp.status_code >= 400:
+                    _webhook_logger.warning(f"PIM attribute sync failed ({resp.status_code}): {resp.text}")
+                else:
+                    _webhook_logger.info(f"PIM attribute synced for entity {entity_id}: {attr_data.get('name')}")
+            except Exception as e:
+                _webhook_logger.debug(f"PIM attribute sync skipped (service unavailable): {e}")
+
+        threading.Thread(target=_fire, daemon=True).start()
+    except Exception as e:
+        _webhook_logger.debug(f"PIM webhook check failed: {e}")
 
 # Initialize the router with a prefix and tag
 entity_router = APIRouter(tags=["Entity API"], prefix='/entity')
@@ -32,14 +69,14 @@ def read_entitys_tags(is_active: bool = True,db: Session = Depends(get_db), chec
     return service.read_entity_tags(is_active)
 
 @entity_router.get("/", response_model=List[EntityResponse])
-def read_entitys(is_active: Optional[bool] = None,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+def read_entitys(is_active: Optional[bool] = None,entity_type:Optional[str]=None,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = EntityService(db)
-    return service.read_entity(is_active)
+    return service.read_entity(is_active,entity_type)
 
 # Soft delete a Entity by id
 @entity_router.delete("/{entity_id}")
 def delete_entity(entity_id: int, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
-    service = EntityService(db)  # Create an instance of EntityService
+    service = EntityService(db)
     return service.delete_entity(entity_id)
 
 # Retrieve a Entity by ID
@@ -84,6 +121,14 @@ def create_entity_attribute(entity_id:int, entity_attribute: EntityAttributeCrea
     created_by = check.get('decoded', {}).get('sub', '')
     service = EntityAttributeService(db)  # Create an instance of EntityAttributeService
     result = service.create_entity_attribute(entity_attribute, entity_id, created_by=created_by)
+    # Webhook: sync to PIM if this is a product entity
+    _notify_pim_attribute_sync(entity_id, {
+        "source_attr_id": result.get("data", {}).get("id") if isinstance(result, dict) else None,
+        "name": entity_attribute.name,
+        "label": entity_attribute.label,
+        "type": entity_attribute.type,
+        "type_config": entity_attribute.type_config if hasattr(entity_attribute, 'type_config') else None,
+    }, db, token=check.get('token', ''))
     return result
 
 @entity_router.patch("/{entity_id}/attribute/{attribute_id}", response_model=ApiResponse[EntityAttributeResponse])
@@ -91,13 +136,26 @@ def update_entity_attribute(entity_id: int, attribute_id: int, entity_attribute:
     created_by = check.get('decoded', {}).get('sub', '')
     service = EntityAttributeService(db)
     result = service.update_entity_attribute(entity_id, attribute_id, entity_attribute, created_by=created_by)
+    # Webhook: sync to PIM if this is a product entity
+    _notify_pim_attribute_sync(entity_id, {
+        "source_attr_id": attribute_id,
+        "name": entity_attribute.name,
+        "label": entity_attribute.label,
+        "type": entity_attribute.type,
+        "type_config": entity_attribute.type_config if hasattr(entity_attribute, 'type_config') else None,
+    }, db, token=check.get('token', ''))
     return result
 
 @entity_router.delete("/{entity_id}/attribute/{attribute_id}")
 def delete_entity_attribute(entity_id: int, attribute_id: int, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = EntityAttributeService(db)
     result = service.delete_entity_attribute(entity_id, attribute_id)
-    return result 
+    # Webhook: notify PIM of deletion (sync service will soft-deactivate)
+    _notify_pim_attribute_sync(entity_id, {
+        "source_attr_id": attribute_id,
+        "action": "delete",
+    }, db, token=check.get('token', ''))
+    return result
 
 @entity_router.get("/{entity_id}/attribute", response_model=List[EntityAttributeResponse])
 def read_entityattribute(entity_id:int, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):

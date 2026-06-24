@@ -1,4 +1,4 @@
-from fastapi import HTTPException, Depends, APIRouter, Query
+from fastapi import HTTPException, Depends, APIRouter, Query, Body
 from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
@@ -8,7 +8,7 @@ from lakefusion_utility.services.entity_search_service import EntitySearchServic
 from lakefusion_utility.services.integration_hub_service import Integration_HubService
 from lakefusion_utility.services.model_experiment_service import compare_versions
 from lakefusion_utility.services.steward_reason_service import StewardReasonService
-from typing import List,Optional
+from typing import List, Optional, Any
 from lakefusion_utility.models.entity import EntityResponseTags
 from lakefusion_utility.services.feature_flags_service import FeatureFlagService
 
@@ -161,11 +161,72 @@ async def get_attribute_sources(entity_id:int, profile_id:str, warehouse_id:str,
     token = check.get('token')
     return service.get_attribute_sources(entity_id,profile_id,warehouse_id,token)
 
+@entity_search_router.get("/{entity_id}/profile/{profile_id}/rdm-resolution", response_model=dict, summary="Resolve all REFERENCE_ENTITY attributes for a master profile record")
+async def get_rdm_resolution(entity_id: int, profile_id: str, warehouse_id: str, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+    service = EntitySearchService(db)
+    token = check.get('token')
+    return service.get_rdm_resolution_for_profile(entity_id, profile_id, warehouse_id, token)
+
+@entity_search_router.get("/{entity_id}/reference-entity-attr-options", summary="Get select options for a REFERENCE_ENTITY attribute")
+async def fetch_reference_entity_attr_options(
+    entity_id: int,
+    attr_name: str = Query(..., description="Name of the REFERENCE_ENTITY attribute on the master entity"),
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.fetch_reference_entity_attr_option(entity_id, attr_name, warehouse_id, token)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@entity_search_router.get("/{entity_id}/reference-profile/{ref_lakefusion_id}", summary="Fetch a single reference record by ref_lakefusion_id")
+async def get_reference_profile(entity_id: int, ref_lakefusion_id: str, warehouse_id: str = Query(...), db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+    service = EntitySearchService(db)
+    token = check.get('token')
+    return service.get_reference_profile_by_id(token, entity_id, ref_lakefusion_id, warehouse_id)
+
+@entity_search_router.get("/{entity_id}/reference-profile/{ref_lakefusion_id}/history", summary="Fetch SCD-2 version history for a reference record")
+async def get_reference_profile_history(entity_id: int, ref_lakefusion_id: str, warehouse_id: str = Query(...), db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+    service = EntitySearchService(db)
+    token = check.get('token')
+    return service.get_reference_record_history(token, entity_id, ref_lakefusion_id, warehouse_id)
+
 @entity_search_router.get("/{entity_id}/profile/{profile_id}/history")
 async def get_merge_activities(entity_id:int, profile_id:str, warehouse_id:str,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = EntitySearchService(db)
     token = check.get('token')
     return service.get_merge_activities(entity_id,profile_id,warehouse_id,token)
+
+@entity_search_router.get("/{entity_id}/errored-records", summary="Fetch errored records from unified_error_prod")
+async def get_errored_records(
+    entity_id: int,
+    warehouse_id: str = Query(...),
+    page: int = Query(1),
+    page_size: int = Query(50),
+    error_stage: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    service = EntitySearchService(db)
+    token = check.get('token')
+    return service.fetch_errored_records(token, entity_id, warehouse_id, page, page_size, error_stage)
+
+@entity_search_router.get("/{entity_id}/errored-records/{surrogate_key}/detail", summary="Fetch full record for errored record detail dialog")
+async def get_errored_record_detail(
+    entity_id: int,
+    surrogate_key: str,
+    warehouse_id: str = Query(...),
+    db: Session = Depends(get_db),
+    check: dict = Depends(token_required_wrapper),
+):
+    service = EntitySearchService(db)
+    token = check.get('token')
+    return service.fetch_errored_record_detail(token, entity_id, warehouse_id, surrogate_key)
 
 @entity_search_router.get("/{entity_id}/all-records")
 async def get_all_records(
@@ -182,10 +243,10 @@ async def get_all_records(
     return service.get_all_records(entity_id, warehouse_id, token, page, page_size, filters)
 
 @entity_search_router.get("/{entity_id}/validation-data")
-async def read_all_validation_records(entity_id:int, warehouse_id:str,validation_type:str,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
+async def read_all_validation_records(entity_id:int, warehouse_id:str,validation_type:str, page: int = 1, page_size: int = 1000, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = EntitySearchService(db)
     token = check.get('token')
-    return service.read_entity_validation_data(entity_id,warehouse_id,validation_type,token)
+    return service.read_entity_validation_data(entity_id,warehouse_id,validation_type,token, page, page_size)
 
 @entity_search_router.get("/{entity_id}/profile/validation-records-id")
 async def read_entity_search_profile_validation_id(entity_id:int,id_value:str,warehouse_id:str,validation_type:str,db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
@@ -211,7 +272,6 @@ async def reject_all_dnb_candidates(entity_id: int, payload: dict, warehouse_id:
     token = check.get('token')
     return service.reject_all_dnb_candidates(entity_id, payload["master_id"], warehouse_id, token)
 
-
 @entity_search_router.patch("/{entity_id}/steward-reason/{job_id}")
 async def add_steward_reason(entity_id: int, job_id: int, request: StewardReasonRequest, warehouse_id: Optional[str] = None, db: Session = Depends(get_db), check: dict = Depends(token_required_wrapper)):
     service = StewardReasonService(db)
@@ -234,3 +294,310 @@ async def get_stewardship_history(
     token = check.get('token')
     service = StewardReasonService(db)
     return service.get_stewardship_history(entity_id, token, warehouse_id, action_type, has_reason, page, page_size)
+
+from lakefusion_utility.utils.logging_utils import get_logger as _get_logger
+_ref_logger = _get_logger(__name__)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Reference Entity Routes (merged from reference_entity_route.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@entity_search_router.get("/{entity_id}/check-reference-tables", summary="Check existence of all reference-related tables in a single call")
+async def check_reference_tables(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.check_reference_entity_tables_existence(token, entity_id, warehouse_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to check reference tables for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.get("/{entity_id}/reference/records", summary="Fetch paginated records from the reference table")
+async def get_reference_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
+    filters: Optional[str] = Query(None),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.fetch_reference_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, page=page, page_size=page_size, filters=filters)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to fetch reference records for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@entity_search_router.post(
+    "/{entity_id}/reference/conflicts/{conflict_id}/resolve",
+    summary="Resolve a conflict from the conflict queue table"
+)
+async def resolve_conflict(
+    entity_id: int,
+    conflict_id: str,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    decision: str = Query(..., description="KEEP_RDM | USE_SOURCE | APPROVED | REJECTED"),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        resolved_by = check.get('decoded', {}).get('sub', '')
+        return service.resolve_conflict(
+            token=token,
+            warehouse_id=warehouse_id,
+            entity_id=entity_id,
+            conflict_id=conflict_id,
+            decision=decision,
+            resolved_by=resolved_by
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(
+            f"Failed to resolve conflict {conflict_id} for entity {entity_id}: {str(e)}"
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+@entity_search_router.post("/{entity_id}/reference/records", summary="Insert a new record into the reference table")
+async def insert_reference_record(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    data_object: dict = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.create_reference_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, data_object=data_object)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to insert reference record for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.patch("/{entity_id}/reference/records", summary="Bulk-update records in the reference table")
+async def patch_reference_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    update_data: dict = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        edited_by = check.get("decoded", {}).get("sub", "")
+        primary_field = service.get_primary_field_for_entity(entity_id)
+        if not primary_field:
+            raise HTTPException(status_code=400, detail="No primary key attribute set for this entity.")
+        return service.update_reference_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, primary_field=primary_field, updates=update_data.get("updates", []), edited_by=edited_by)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to update reference records for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.delete("/{entity_id}/reference/records", summary="Delete a record from the reference table by primary key")
+async def remove_reference_record(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    primary_field_value: Any = Body(..., embed=True),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        if primary_field_value is None:
+            raise HTTPException(status_code=400, detail="'primary_field_value' is required.")
+        primary_field = service.get_primary_field_for_entity(entity_id)
+        if not primary_field:
+            raise HTTPException(status_code=400, detail="No primary key attribute set for this entity.")
+        affected = service.delete_reference_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, primary_field=primary_field, primary_field_value=primary_field_value)
+        return {"message": f"Record where {primary_field} = '{primary_field_value}' deleted successfully.", "affected_rows": affected}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to delete reference record for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.get("/{entity_id}/reference-review/records", summary="Fetch paginated records from the reference review table")
+async def get_reference_review_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
+    filters: Optional[str] = Query(None),
+    conflict_type: Optional[str] = Query(None, description="UPDATE_CONFLICT or PENDING_INSERT"),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.fetch_conflict_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, page=page, page_size=page_size, filters=filters, conflict_type=conflict_type)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to fetch reference review records for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.get("/{entity_id}/reference-mappings/records", summary="Fetch paginated records from the reference mappings table")
+async def get_reference_mappings_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
+    view: Optional[str] = Query(None, description="'review' for PENDING/NO_MATCH, 'approved' for AUTO_APPROVED/APPROVED/MANUALLY_ADDED"),
+    filters: Optional[str] = Query(None),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        status_filter = None
+        if view == "review":
+            status_filter = list(service.REVIEW_STATUSES)
+        elif view == "approved":
+            status_filter = list(service.APPROVED_STATUSES)
+        return service.fetch_reference_mappings_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, page=page, page_size=page_size, status_filter=status_filter, filters=filters)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to fetch reference mappings for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.post("/{entity_id}/reference-mappings/records/approve-all", summary="Bulk-approve all PENDING/NO_MATCH mapping records")
+async def approve_all_reference_mapping_records_endpoint(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.approve_all_reference_mapping_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to bulk-approve mappings for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.post("/{entity_id}/reference-mappings/records", summary="Insert a new mapping record (MANUALLY_ADDED) into the reference mappings table")
+async def insert_reference_mapping_record(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    data_object: dict = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.create_reference_mapping_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, data_object=data_object)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to insert reference mapping for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.post("/{entity_id}/reference/records/import", summary="Bulk insert records into the reference table, creating it if it does not exist")
+async def import_reference_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    records: List[dict] = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.import_reference_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, records=records)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to bulk import reference records for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.post("/{entity_id}/reference-mappings/records/import", summary="Bulk insert mapping records; raises 400 if mappings table does not exist")
+async def import_reference_mapping_records(
+    entity_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    records: List[dict] = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.import_reference_mapping_records(token=token, entity_id=entity_id, warehouse_id=warehouse_id, records=records)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to bulk import reference mapping records for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.patch("/{entity_id}/reference-mappings/records/{record_id}", summary="Update a mapping record in the reference mappings table")
+async def patch_reference_mapping_record(
+    entity_id: int,
+    record_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    data_object: dict = Body(...),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        return service.update_reference_mapping_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, record_id=record_id, data_object=data_object)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to update reference mapping {record_id} for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@entity_search_router.delete("/{entity_id}/reference-mappings/records/{record_id}", summary="Delete a mapping record from the reference mappings table")
+async def remove_reference_mapping_record(
+    entity_id: int,
+    record_id: int,
+    warehouse_id: str = Query(..., description="SQL warehouse ID"),
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    try:
+        service = EntitySearchService(db)
+        token = check.get("token")
+        affected = service.delete_reference_mapping_record(token=token, entity_id=entity_id, warehouse_id=warehouse_id, record_id=record_id)
+        return {"message": f"Mapping record {record_id} deleted successfully.", "affected_rows": affected}
+    except HTTPException:
+        raise
+    except Exception as e:
+        _ref_logger.error(f"Failed to delete reference mapping {record_id} for entity {entity_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

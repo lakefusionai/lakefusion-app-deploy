@@ -25,7 +25,10 @@ from app.lakefusion_matchmaven_service.services.llm_response_parser import (
 app_logger = get_logger(__name__)
 
 # Default Configuration
-DATABRICKS_HOST = os.environ.get('DATABRICKS_HOST', 'https://databricks.com')
+# Shared helper guarantees the https:// prefix is present (Databricks Apps
+# inject the host bare); keep the historical placeholder as fallback default.
+from lakefusion_utility.utils.databricks_host import get_databricks_host
+DATABRICKS_HOST = get_databricks_host() or "https://databricks.com"
 DEFAULT_LLM_ENDPOINT = "databricks-meta-llama-3-3-70b-instruct"
 DEFAULT_MAX_TOKENS = 4000
 DEFAULT_TEMPERATURE = 0.0  # Nearly deterministic for consistent results

@@ -26,6 +26,7 @@ dbutils.widgets.text("catalog_name", "", "catalog name")
 dbutils.widgets.text("entity_attributes_datatype","","entity_attributes_datatype")
 dbutils.widgets.text("deterministic_rules","","deterministic_rules")
 dbutils.widgets.text("config_thresholds", "", "Match Thresholds Config")
+dbutils.widgets.text("reference_attribute_config", "{}", "REFERENCE_ENTITY -> {ref_table, output_attr} map")
 
 # COMMAND ----------
 
@@ -44,6 +45,16 @@ entity_attributes_datatype = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSO
 attributes = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="match_attributes", debugValue=attributes)
 rules_config = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="deterministic_rules", debugValue=deterministic_rules)
 config_thresholds = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="config_thresholds", debugValue=config_thresholds)
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue=dbutils.widgets.get("reference_attribute_config"),
+)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
@@ -121,8 +132,51 @@ from pyspark.sql.types import DoubleType
 from rapidfuzz.distance import JaroWinkler
 from functools import reduce as ft_reduce   # alias avoids clash with pyspark.sql.functions.reduce (Spark 3.3+)
 
+# ── REFERENCE_ENTITY display resolution ──────────────────────────────────────
+# Both df_unified and df_master store REFERENCE_ENTITY columns as the raw
+# ref_lakefusion_id (UUID). For deterministic rule comparison (especially
+# fuzzy: levenshtein / jaro_winkler / soundex), comparing UUIDs is meaningless.
+# We LEFT-JOIN the ref view per REFERENCE_ENTITY attribute and overwrite the
+# column in place with the human-readable output value, so all downstream
+# rule expressions naturally operate on display values.
+def _resolve_reference_columns(df):
+    for attr, cfg in (reference_attribute_config or {}).items():
+        if attr not in df.columns:
+            continue
+        ref_table   = cfg.get("ref_table")
+        output_attr = cfg.get("output_attr")
+        if not ref_table or not output_attr:
+            continue
+        ref_view = (
+            spark.read.table(ref_table)
+            .select(
+                F.col("ref_lakefusion_id").alias(f"_ref_{attr}_id"),
+                F.col(output_attr).alias(f"_ref_{attr}_disp"),
+            )
+        )
+        df = (
+            df.join(
+                F.broadcast(ref_view),
+                df[attr] == F.col(f"_ref_{attr}_id"),
+                "left",
+            )
+            .withColumn(attr, F.coalesce(F.col(f"_ref_{attr}_disp"), F.col(attr)))
+            .drop(f"_ref_{attr}_id", f"_ref_{attr}_disp")
+        )
+    return df
 
-# ── 1. JW UDF ──────────────────────────────────────────────────────────────────
+
+df_unified = _resolve_reference_columns(df_unified)
+df_master  = _resolve_reference_columns(df_master)
+
+# COMMAND ----------
+
+
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import DoubleType, BooleanType, StructType, ArrayType
+from rapidfuzz.distance import JaroWinkler, Levenshtein
+from functools import reduce as ft_reduce
+import operator as _operator
 
 def _jw_similarity(s1, s2):
     if s1 is None or s2 is None:
@@ -132,32 +186,93 @@ def _jw_similarity(s1, s2):
 jaro_winkler_udf = F.udf(_jw_similarity, DoubleType())
 spark.udf.register("jaro_winkler_similarity", _jw_similarity, DoubleType())
 
+# COMMAND ----------
+
+# Make utils importable for build_attributes_combined_column (same pattern as
+# Process_Unmatched_Records / Promote_Pending_RDM / Load_Primary_Source).
+import os as _pp_os, sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _src_path)
+        break
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/attributes_combined
+
+# COMMAND ----------
+
 
 # ── 2. Dynamic struct builder ──────────────────────────────────────────────────
 
-def build_dynamic_struct(x_col, attributes, entity_attributes_datatype):
+from pyspark.sql import functions as F
+# Spark scalar cast targets. Anything else in entity_attributes_datatype (e.g.
+# the LakeFusion attribute type "REFERENCE_ENTITY") is NOT a Spark type and must
+# not be passed to cast() — it's kept as a string.
+_SPARK_SCALAR_TYPES = {
+    "STRING", "VARCHAR", "CHAR", "TEXT",
+    "INT", "INTEGER", "BIGINT", "LONG", "SMALLINT", "SHORT", "TINYINT", "BYTE",
+    "DOUBLE", "FLOAT", "REAL", "BOOLEAN", "BINARY",
+    "DATE", "TIMESTAMP", "TIMESTAMP_NTZ",
+}
+
+
+def build_dynamic_struct(x_col, attributes, entity_attributes_datatype, complex_attrs=None):
+    """`attributes` = body columns only (id is a separate trailing field).
+
+    `complex_attrs` = set of STRUCT/ARRAY attribute names. Those are carried as
+    JSON strings (encoded upstream via to_json), so we keep the raw string and
+    skip the scalar dtype cast — comparison re-parses the JSON when needed."""
+    complex_attrs = complex_attrs or set()
     struct_fields = []
     parts = F.split(x_col, "\\|")
     for idx, attr in enumerate(attributes):
         raw_value = F.trim(F.element_at(parts, idx + 1))
-        if idx == len(attributes) - 1:
-            raw_value = F.trim(F.regexp_extract(raw_value, r"^([^,]+),", 1))
-        # Reverse Step 5's null→"null" coercion so allow_nulls comparisons see
-        # actual NULL on the candidate side instead of the literal string "null".
         raw_value = F.when(
-            (raw_value == "null") | (raw_value == ""),
+            raw_value.isNull() | (raw_value == "null") | (raw_value == ""),
             F.lit(None).cast("string"),
         ).otherwise(raw_value)
         dtype = entity_attributes_datatype.get(attr)
-        if dtype:
+        # Only cast to a real Spark SCALAR type. Skip complex declared types
+        # ("STRUCT"/"ARRAY"/"MAP", carried as JSON strings) and LakeFusion
+        # attribute types that aren't Spark types (e.g. "REFERENCE_ENTITY",
+        # which raises UNSUPPORTED_DATATYPE) — keep those as the trimmed string.
+        _dt_norm = (dtype or "").strip().upper()
+        _is_complex_dtype = _dt_norm.startswith(("STRUCT", "ARRAY", "MAP"))
+        _is_scalar_dtype = (_dt_norm in _SPARK_SCALAR_TYPES) or _dt_norm.startswith("DECIMAL")
+        if dtype and attr not in complex_attrs and not _is_complex_dtype and _is_scalar_dtype:
             raw_value = raw_value.cast(dtype)
         struct_fields.append(raw_value.alias(f"{attr}_matches"))
-    lakefusion_id = F.trim(F.regexp_extract(x_col, r"([a-f0-9]{32})", 1))
+
+    # id is the field right after the body columns
+    lakefusion_id = F.trim(F.element_at(parts, len(attributes) + 1))
+    lakefusion_id = F.when(
+        lakefusion_id.isNull() | (lakefusion_id == ""),
+        F.lit(None).cast("string"),
+    ).otherwise(lakefusion_id)
     struct_fields.append(lakefusion_id.alias("lakefusion_id"))
     return F.struct(*struct_fields)
 
 
-# ── 3. Operator helper ──────────────────────────────────────────────────────────
+def build_candidate_struct(cand, scalar_cols, complex_cols, entity_attributes_datatype, complex_attrs):
+    """Build a candidate struct from a collected element `cand`:
+        struct(_combined: scalar pipe-string, <native complex cols...>)
+    Scalar fields are parsed from the pipe-string (via build_dynamic_struct);
+    STRUCT/ARRAY fields are kept in their NATIVE Spark type. Output fields:
+    `<attr>_matches` for every attr + `lakefusion_id`."""
+    base = build_dynamic_struct(
+        cand.getField("_combined"), scalar_cols, entity_attributes_datatype, complex_attrs
+    )
+    fields = [base.getField(f"{a}_matches").alias(f"{a}_matches") for a in scalar_cols]
+    fields += [cand.getField(a).alias(f"{a}_matches") for a in complex_cols]
+    # carry the master's pre-built attributes_combined for use as the display id
+    fields.append(cand.getField("_cand_attributes_combined").alias("_cand_attributes_combined"))
+    fields.append(base.getField("lakefusion_id").alias("lakefusion_id"))
+    return F.struct(*fields)
+
 
 def _apply_operator(col_expr: F.Column, operator: str, threshold) -> F.Column:
     return {
@@ -167,36 +282,45 @@ def _apply_operator(col_expr: F.Column, operator: str, threshold) -> F.Column:
         "<":  col_expr <  threshold,
         "=":  col_expr == threshold,
         "==": col_expr == threshold,
-        "!=": col_expr != threshold
+        "!=": col_expr != threshold,
     }[operator]
 
+_PYOPS = {">=": _operator.ge, "<=": _operator.le, ">": _operator.gt,
+          "<": _operator.lt, "=": _operator.eq, "==": _operator.eq, "!=": _operator.ne}
 
-# ── 4. Condition match Column (True/False) ─────────────────────────────────────
-def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
-    """Returns a boolean Column: does this condition pass on the current row?
-    Row must have flat columns: <attr> (source) and <attr>_matches (candidate)."""
-    attr        = cond["attribute"]
-    match_type  = cond.get("match_type", "exact")
-    fuzzy_func  = cond.get("function")
-    threshold   = cond.get("threshold")
-    operator    = cond.get("operator", ">=")
-    allow_nulls = cond.get("allow_nulls", rule_allow_nulls)
 
-    # Normalize empty/whitespace strings to NULL on both sides. The candidate
-    # side already does this in build_dynamic_struct (empty/"null" -> NULL),
-    # but the source side comes straight from the DataFrame where empties
-    # remain "". Without this, source="" vs candidate=NULL never matches
-    # under either allow_nulls branch.
-    src_raw  = F.col(attr).cast("string")
-    cand_raw = F.col(f"{attr}_matches").cast("string")
+def _scalar_condition(src_col, cand_col, match_type, fuzzy_func, threshold,
+                      operator, allow_nulls) -> F.Column:
+    """Scalar comparison of two columns (cast to string). This is the original
+    build_condition_column body, factored out unchanged so scalar attributes,
+    STRUCT sub-fields, and serialized whole-struct comparison all share it."""
+    src_raw  = src_col.cast("string")
+    cand_raw = cand_col.cast("string")
     src  = F.when(F.trim(src_raw)  == "", F.lit(None).cast("string")).otherwise(src_raw)
     cand = F.when(F.trim(cand_raw) == "", F.lit(None).cast("string")).otherwise(cand_raw)
 
     left  = F.lower(src)
     right = F.lower(cand)
 
+    both_null = src.isNull() & cand.isNull()
+    both_set  = src.isNotNull() & cand.isNotNull()
+    one_null  = (src.isNull() & ~cand.isNull()) | (~src.isNull() & cand.isNull())  # exactly one null
+
+    is_negation = operator in ("!=", "<>")
+
     if match_type == "exact":
-        base = left == right
+        if is_negation:
+            # explicit, null-safe negation:
+            #   both null      -> NOT different (False)
+            #   one null       -> different (True)   [present vs absent]
+            #   both set       -> left != right
+            return (
+                F.when(both_null, F.lit(False))
+                 .when(one_null,  F.lit(True))
+                 .otherwise(left != right)
+            )
+        else:
+            base = (left == right)
     elif match_type == "fuzzy":
         if fuzzy_func == "levenshtein_normalized":
             score = F.lit(1.0) - (
@@ -207,7 +331,6 @@ def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
         elif fuzzy_func == "levenshtein_standard":
             base = _apply_operator(F.levenshtein(left, right), operator, threshold)
         elif fuzzy_func == "jaro_winkler":
-            # Python UDF on flat columns — works because we're not inside a lambda.
             base = _apply_operator(jaro_winkler_udf(left, right), operator, threshold)
         elif fuzzy_func == "soundex":
             base = F.soundex(src) == F.soundex(cand)
@@ -216,115 +339,244 @@ def build_condition_column(cond: dict, rule_allow_nulls: bool) -> F.Column:
     else:
         raise ValueError(f"Unsupported match_type: {match_type}")
 
-    null_match = src.isNull()    & cand.isNull()
-    not_null   = src.isNotNull() & cand.isNotNull()
-    return (null_match | base) if allow_nulls else (not_null & base)
-
-# ── 5. Actual score Column for a single condition ──────────────────────────────
-
-def build_score_column(cond: dict) -> F.Column:
-    attr       = cond["attribute"]
-    match_type = cond.get("match_type", "exact")
-    fuzzy_func = cond.get("function")
-
-    left  = F.lower(F.col(attr).cast("string"))
-    right = F.lower(F.col(f"{attr}_matches").cast("string"))
-
-    if match_type == "exact":
-        return F.when(left == right, F.lit(1.0)).otherwise(F.lit(0.0)).cast("double")
-
-    elif match_type == "fuzzy":
-        if fuzzy_func == "jaro_winkler":
-            return jaro_winkler_udf(left, right).cast("double")
-        elif fuzzy_func == "levenshtein_normalized":
-            return (
-                F.lit(1.0) - (
-                    F.levenshtein(left, right).cast("double") /
-                    F.greatest(F.length(left), F.length(right)).cast("double")
-                )
-            )
-        elif fuzzy_func == "levenshtein_standard":
-            lev  = F.levenshtein(left, right).cast("double")
-            mlen = F.greatest(F.length(left), F.length(right)).cast("double")
-            return F.lit(1.0) - (lev / F.when(mlen == 0, F.lit(1.0)).otherwise(mlen))
-        elif fuzzy_func == "soundex":
-            return F.when(
-                F.soundex(F.col(attr).cast("string")) ==
-                F.soundex(F.col(f"{attr}_matches").cast("string")),
-                F.lit(1.0)
-            ).otherwise(F.lit(0.0)).cast("double")
-
-    return F.lit(0.0).cast("double")
+    # positive (non-negation) matching
+    null_match = both_null
+    if allow_nulls:
+        return F.when(both_set, base).when(null_match, F.lit(True)).otherwise(F.lit(False))
+    else:
+        return F.when(both_set, base).otherwise(F.lit(False))
 
 
-
-def apply_rules(df_parsed: DataFrame, rules_config: list) -> DataFrame:
-       """Evaluate each rule per (source row × candidate), produce one
-       `<rule>_results` array column per rule containing matched candidate structs."""
-       non_array_cols = [c for c in df_parsed.columns if c != "search_result_parsed"]
-    
-       # A. Explode: one row per candidate
-       df_exp = df_parsed.withColumn("_candidate", F.explode("search_result_parsed"))
-    
-       # B. Flatten candidate struct fields to top-level columns.
-       #    The candidate struct also carries `lakefusion_id`, which collides with
-       #    the source row's own `lakefusion_id`. Flatten it under a distinct name
-       #    so we can compare the two for self-match detection.
-       candidate_fields = [
-           f.name for f in
-           df_parsed.schema["search_result_parsed"].dataType.elementType.fields
-       ]
-       for field in candidate_fields:
-           if field == "lakefusion_id":
-               df_exp = df_exp.withColumn("candidate_lakefusion_id", F.col(f"_candidate.{field}"))
-           else:
-               df_exp = df_exp.withColumn(field, F.col(f"_candidate.{field}"))
-    
-       # B.1 Self-match guard: a record must never match against its own id.
-       #     Source id stays in the original `lakefusion_id` column (from exp.*).
-       df_exp = df_exp.withColumn(
-           "_is_self_match",
-           F.col("candidate_lakefusion_id") == F.col("lakefusion_id"),
-       )
-    
-       # C. Per rule: evaluate match flag (UDF runs on flat cols, not in a lambda)
-       for rule in rules_config:
-           rule_name        = rule["name"]
-           logical_op       = rule.get("logical_operator", "AND").upper()
-           rule_allow_nulls = rule.get("allow_nulls", False)
-    
-           cond_flags = [build_condition_column(c, rule_allow_nulls) for c in rule["conditions"]]
-           rule_flag  = cond_flags[0]
-           for flag in cond_flags[1:]:
-               rule_flag = (rule_flag & flag) if logical_op == "AND" else (rule_flag | flag)
-    
-           # Exclude self-match: never count a candidate that is the source itself.
-           rule_flag = rule_flag & (~F.col("_is_self_match"))
-    
-           # Coalesce 3VL NULL → False so passed rows don't disappear silently
-           df_exp = df_exp.withColumn(
-               f"_match_{rule_name}",
-               F.coalesce(rule_flag, F.lit(False)),
-           )
-    
-       # D. Aggregate back: per rule, collect candidates where _match_{rule_name} is true
-       per_rule_aggs = []
-       for rule in rules_config:
-           rule_name = rule["name"]
-           per_rule_aggs.append(
-               F.collect_list(
-                   F.when(F.col(f"_match_{rule_name}"), F.col("_candidate"))
-               ).alias(f"{rule_name}_results")
-           )
-    
-       df_grouped = df_exp.groupBy(*[F.col(c) for c in non_array_cols]).agg(*per_rule_aggs)
-       return df_grouped
+def _array_match_udf(match_type, fuzzy_func, threshold, operator):
+    """UDF(arr_src, arr_cand) -> bool: any element of src matches any of cand.
+    Runs on two flat string-array columns — Python UDFs (jaro_winkler etc.)
+    cannot be called inside Spark higher-order-function lambdas, so the pairwise
+    scan happens here instead."""
+    def _m(a, b):
+        if not a or not b:
+            return False
+        for x in a:
+            if x is None:
+                continue
+            xs = str(x).lower()
+            for y in b:
+                if y is None:
+                    continue
+                ys = str(y).lower()
+                if match_type == "exact":
+                    ok = (xs != ys) if operator in ("!=", "<>") else (xs == ys)
+                    if ok:
+                        return True
+                    continue
+                if fuzzy_func == "jaro_winkler":
+                    score = JaroWinkler.similarity(xs, ys)
+                elif fuzzy_func == "levenshtein_normalized":
+                    ml = max(len(xs), len(ys)) or 1
+                    score = 1.0 - (Levenshtein.distance(xs, ys) / ml)
+                elif fuzzy_func == "levenshtein_standard":
+                    score = Levenshtein.distance(xs, ys)
+                elif fuzzy_func == "soundex":
+                    return False  # soundex not supported on ARRAY attributes
+                else:
+                    raise ValueError(f"Unsupported fuzzy function: {fuzzy_func}")
+                if _PYOPS[operator](score, threshold):
+                    return True
+        return False
+    return F.udf(_m, BooleanType())
 
 
+def _array_any_match(src_vals, cand_vals, match_type, fuzzy_func, threshold,
+                     operator, allow_nulls) -> F.Column:
+    """Element-wise 'any element matches' over two string-array columns."""
+    src_empty  = src_vals.isNull()  | (F.size(src_vals)  == 0)
+    cand_empty = cand_vals.isNull() | (F.size(cand_vals) == 0)
+    base = F.coalesce(
+        _array_match_udf(match_type, fuzzy_func, threshold, operator)(src_vals, cand_vals),
+        F.lit(False),
+    )
+    if allow_nulls:
+        return (src_empty & cand_empty) | ((~src_empty) & (~cand_empty) & base)
+    return (~src_empty) & (~cand_empty) & base
+
+
+# ARRAY set-membership functions (match_type == "fuzzy", no operator/threshold).
+# Semantics use source vs candidate as SETS of element values:
+#   intersect -> share ≥1 common element
+#   disjoint  -> share NO common element
+#   subset    -> source ⊆ candidate (every source element is in candidate)
+#   superset  -> source ⊇ candidate (every candidate element is in source)
+_ARRAY_SET_FUNCS = {"intersect", "disjoint", "subset", "superset"}
+
+
+def _array_set_match(src_vals, cand_vals, func, allow_nulls) -> F.Column:
+    """Set-based comparison over two string-array columns."""
+    _EMPTY     = F.array().cast("array<string>")
+    src_empty  = src_vals.isNull()  | (F.size(src_vals)  == 0)
+    cand_empty = cand_vals.isNull() | (F.size(cand_vals) == 0)
+    # coalesce to empty arrays so array_intersect/array_except never see NULL
+    s = F.coalesce(src_vals,  _EMPTY)
+    c = F.coalesce(cand_vals, _EMPTY)
+
+    if func == "intersect":
+        base = F.size(F.array_intersect(s, c)) > 0
+    elif func == "disjoint":
+        base = F.size(F.array_intersect(s, c)) == 0
+    elif func == "subset":      # source ⊆ candidate
+        base = F.size(F.array_except(s, c)) == 0
+    elif func == "superset":    # source ⊇ candidate
+        base = F.size(F.array_except(c, s)) == 0
+    else:
+        raise ValueError(f"Unsupported array set function: {func}")
+
+    if allow_nulls:
+        return base
+    # nulls not allowed → both sides must be present (non-empty)
+    return (~src_empty) & (~cand_empty) & base
+
+
+def build_condition_column(cond: dict, rule_allow_nulls: bool, complex_types: dict) -> F.Column:
+    """Boolean Column: does this condition pass for the current (source × candidate) row?
+
+    Type-aware via `complex_types` (attr -> native Spark DataType for STRUCT/ARRAY
+    attributes). Such columns are kept NATIVE, so:
+      - STRUCT + sub_field    -> col.getField(<sub_field>) on both sides
+      - STRUCT  (no sub_field)-> compare to_json(struct) on both sides
+      - ARRAY / ARRAY<STRUCT> -> transform native array -> element-wise 'any element matches'
+      - scalar                -> unchanged scalar comparison
+      - (declared-complex but stored as a string, no native type) -> JSON fallback
+        via get_json_object when a sub_field is given
+    """
+    attr        = cond["attribute"]
+    sub_field   = cond.get("sub_field")
+    match_type  = cond.get("match_type", "exact")
+    fuzzy_func  = cond.get("function")
+    threshold   = cond.get("threshold")
+    operator    = cond.get("operator", ">=")
+    allow_nulls = cond.get("allow_nulls", rule_allow_nulls)
+    case_insensitive = cond.get("case_insensitive", False)
+
+    # Normalize sub_field: treat missing / "" / literal "None" as no sub_field.
+    if sub_field in (None, "", "None", "null"):
+        sub_field = None
+
+    src_col  = F.col(attr)
+    cand_col = F.col(f"{attr}_matches")
+    dt       = (complex_types or {}).get(attr)
+
+    # ── Scalar attribute (unchanged behaviour) ──
+    if dt is None:
+        # Fallback: a declared-complex attr stored as a JSON string (no native
+        # Spark type captured). With a sub_field we can still extract it.
+        if sub_field:
+            s = F.get_json_object(src_col,  f"$.{sub_field}")
+            c = F.get_json_object(cand_col, f"$.{sub_field}")
+            return _scalar_condition(s, c, match_type, fuzzy_func, threshold, operator, allow_nulls)
+        return _scalar_condition(src_col, cand_col, match_type, fuzzy_func,
+                                 threshold, operator, allow_nulls)
+
+    is_struct   = isinstance(dt, StructType)
+    is_array    = isinstance(dt, ArrayType)
+    elem_struct = is_array and isinstance(dt.elementType, StructType)
+
+    # ── STRUCT (native) ──
+    if is_struct:
+        if sub_field:
+            s = src_col.getField(sub_field)
+            c = cand_col.getField(sub_field)
+        else:
+            # whole struct → compare canonical JSON serialization (to_json on a
+            # native struct is valid and gives a stable, order-preserving string)
+            s, c = F.to_json(src_col), F.to_json(cand_col)
+        return _scalar_condition(s, c, match_type, fuzzy_func, threshold, operator, allow_nulls)
+
+    # ── ARRAY / ARRAY<STRUCT> (native) → element-wise 'any element matches' ──
+    src_arr, cand_arr = src_col, cand_col   # already native arrays
+    if elem_struct and sub_field:
+        src_vals  = F.transform(src_arr,  lambda e: e.getField(sub_field).cast("string"))
+        cand_vals = F.transform(cand_arr, lambda e: e.getField(sub_field).cast("string"))
+    elif elem_struct:
+        src_vals  = F.transform(src_arr,  lambda e: F.to_json(e))
+        cand_vals = F.transform(cand_arr, lambda e: F.to_json(e))
+    else:
+        src_vals  = F.transform(src_arr,  lambda e: e.cast("string"))
+        cand_vals = F.transform(cand_arr, lambda e: e.cast("string"))
+
+    # Set-membership functions (intersect / disjoint / subset / superset) compare
+    # the two arrays as SETS; element-wise fuzzy/exact otherwise.
+    if fuzzy_func in _ARRAY_SET_FUNCS:
+        if case_insensitive:
+            src_vals  = F.transform(src_vals,  lambda e: F.lower(e))
+            cand_vals = F.transform(cand_vals, lambda e: F.lower(e))
+        return _array_set_match(src_vals, cand_vals, fuzzy_func, allow_nulls)
+
+    return _array_any_match(src_vals, cand_vals, match_type, fuzzy_func,
+                            threshold, operator, allow_nulls)
+
+
+def apply_rules(df_parsed: DataFrame, rules_config: list, complex_types: dict = None) -> DataFrame:
+    """Evaluate each rule per (source row × candidate), produce one
+    `<rule>_results` array column per rule containing matched candidate structs."""
+    complex_types = complex_types or {}
+    non_array_cols = [c for c in df_parsed.columns if c != "search_result_parsed"]
+
+    # A. Explode: one row per candidate
+    df_exp = df_parsed.withColumn("_candidate", F.explode("search_result_parsed"))
+
+    # B. Flatten candidate struct fields to top-level columns.
+    #    The candidate struct also carries `lakefusion_id`, which collides with
+    #    the source row's own `lakefusion_id`. Flatten it under a distinct name
+    #    so we can compare the two for self-match detection.
+    candidate_fields = [
+        f.name for f in
+        df_parsed.schema["search_result_parsed"].dataType.elementType.fields
+    ]
+    for field in candidate_fields:
+        if field == "lakefusion_id":
+            df_exp = df_exp.withColumn("candidate_lakefusion_id", F.col(f"_candidate.{field}"))
+        else:
+            df_exp = df_exp.withColumn(field, F.col(f"_candidate.{field}"))
+
+    # B.1 Self-match guard: a record must never match against its own id.
+    df_exp = df_exp.withColumn(
+        "_is_self_match",
+        F.col("candidate_lakefusion_id") == F.col("lakefusion_id"),
+    )
+
+    # C. Per rule: evaluate match flag (UDF runs on flat cols, not in a lambda)
+    for rule in rules_config:
+        rule_name        = rule["name"]
+        logical_op       = rule.get("logical_operator", "AND").upper()
+        rule_allow_nulls = rule.get("allow_nulls", False)
+
+        cond_flags = [build_condition_column(c, rule_allow_nulls, complex_types) for c in rule["conditions"]]
+        rule_flag  = cond_flags[0]
+        for flag in cond_flags[1:]:
+            rule_flag = (rule_flag & flag) if logical_op == "AND" else (rule_flag | flag)
+
+        # Exclude self-match: never count a candidate that is the source itself.
+        rule_flag = rule_flag & (~F.col("_is_self_match"))
+
+        # Coalesce 3VL NULL → False so passed rows don't disappear silently
+        df_exp = df_exp.withColumn(
+            f"_match_{rule_name}",
+            F.coalesce(rule_flag, F.lit(False)),
+        )
+
+    # D. Aggregate back: per rule, collect candidates where _match_{rule_name} is true
+    per_rule_aggs = []
+    for rule in rules_config:
+        rule_name = rule["name"]
+        per_rule_aggs.append(
+            F.collect_list(
+                F.when(F.col(f"_match_{rule_name}"), F.col("_candidate"))
+            ).alias(f"{rule_name}_results")
+        )
+
+    df_grouped = df_exp.groupBy(*[F.col(c) for c in non_array_cols]).agg(*per_rule_aggs)
+    return df_grouped
 def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) -> DataFrame:
-    """Pick first matching rule via coalesce (preserves rule priority order),
-    wrap matched candidates + rule metadata into deterministic_match_result."""
-    match_cols = [f"{r['name']}_results" for r in rules_config]
+    match_rules = [r for r in rules_config]
+    match_cols  = [f"{r['name']}_results" for r in match_rules]
 
     is_match_expr = F.lit(False)
     for c in match_cols:
@@ -332,7 +584,7 @@ def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) 
     df_out = df_with_rules.withColumn("is_deterministic_match", is_match_expr)
 
     when_exprs = []
-    for rule in rules_config:
+    for rule in match_rules:
         c      = f"{rule['name']}_results"
         action = rule["action_on_match"]
         when_exprs.append(
@@ -341,30 +593,80 @@ def compute_deterministic_matches(df_with_rules: DataFrame, rules_config: list) 
                 F.struct(
                     F.col(c).alias("rule_result"),
                     F.lit(rule["name"]).alias("rule_name"),
-                    F.lit(action).alias("action_on_match"),
+                    F.lit(action).alias("action_on_match")
                 )
             )
         )
 
     df_out = df_out.withColumn(
         "deterministic_match_result",
-        F.coalesce(*when_exprs) if when_exprs else F.lit(None),
+        F.coalesce(*when_exprs) if when_exprs else F.lit(None)
     )
     return df_out
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PIPELINE  (Golden Dedup — single source: source IS its own master)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
+# attribute_combined helpers
+#   _noprefix  → single-DataFrame context (no table alias yet)
+#   _prefixed  → after a join, where the alias disambiguates columns
+# ─────────────────────────────────────────────────────────────
+def _safe(col):
+    # neutralize the delimiter so a literal "|" in a value can't shift positions
+    return F.regexp_replace(F.coalesce(col.cast("string"), F.lit("")), r"\|", "/")
 
-# ── Step 1: Parse raw search_results
-# Inter-element separator can be `],[` (no space) or `], [`; \s* tolerates both.
+
+def build_attr_combined_noprefix(cols: list, id_col: str) -> F.Column:
+    """cols must already exclude id_col and helpers, in the SAME order used to parse."""
+    fields = [_safe(F.col(c)) for c in cols]
+    return F.concat_ws("|", *fields, _safe(F.col(id_col)))
+
+
+def build_attr_combined_prefixed(alias_prefix: str, cols: list, id_col: str) -> F.Column:
+    """cols must be the SAME list (same order) as the noprefix side."""
+    fields = [_safe(F.col(f"{alias_prefix}.{c}")) for c in cols]
+    return F.concat_ws("|", *fields, _safe(F.col(f"{alias_prefix}.{id_col}")))
+
+# ─────────────────────────────────────────────────────────────
+# Pipeline
+# ─────────────────────────────────────────────────────────────
+
+# 0. Complex (STRUCT / ARRAY / ARRAY<STRUCT>) attributes:
+#    snapshot their native Spark types in `complex_types`. They are kept NATIVE
+#    (no to_json): excluded from the scalar pipe-string, carried natively into
+#    the candidate struct, and compared with native ops (getField / transform)
+#    in build_condition_column.
+def _native_complex_dt(df, attr):
+    """Return the Spark DataType if `attr` is a native STRUCT/ARRAY column in df, else None."""
+    if attr in df.columns:
+        _dt = df.schema[attr].dataType
+        if isinstance(_dt, (StructType, ArrayType)):
+            return _dt
+    return None
+
+complex_types = {}   # attr -> native Spark DataType (StructType / ArrayType), when the column is native
+complex_attrs = set()  # attrs treated as complex (native OR declared STRUCT/ARRAY) — never scalar-cast
+for _attr in entity_attributes_datatype.keys():
+    _declared = (entity_attributes_datatype.get(_attr) or "").strip().upper()
+    _declared_complex = _declared.startswith(("STRUCT", "ARRAY"))
+    # Prefer a native type from either side (they should match; tolerate divergence).
+    _native_dt = _native_complex_dt(df_master, _attr) or _native_complex_dt(df_unified, _attr)
+    if _native_dt is not None:
+        complex_types[_attr] = _native_dt
+        complex_attrs.add(_attr)
+    elif _declared_complex:
+        # Declared complex but stored as a string (e.g. pre-serialized JSON):
+        # still skip the scalar cast; STRUCT sub-fields resolve via get_json_object.
+        complex_attrs.add(_attr)
+
+# Complex columns are kept in their NATIVE Spark types (STRUCT / ARRAY). They are
+# excluded from the scalar pipe-string round-trip, carried natively into the
+# candidate struct, and compared with native ops (getField / transform). No to_json.
+
+# 1. Parse scoring result → candidate lakefusion_ids
 df_cleaned = df_unified.withColumn(
     "search_results_array",
     F.split(F.regexp_replace(F.col("search_results"), r"^\[|\]$", ""), r"\],\s*\["),
 )
-
-# ── Step 2: Extract lakefusion_id from each search result item
 df_cleaned = df_cleaned.withColumn(
     "search_results_master_lakefusion_ids",
     F.transform(
@@ -373,92 +675,124 @@ df_cleaned = df_cleaned.withColumn(
     ),
 )
 
-# ── Step 3: Explode to one row per (source × candidate)
+# 2. Explode to one row per candidate master record
 df_exploded = df_cleaned.withColumn(
     "search_results_master_lakefusion_ids",
     F.explode("search_results_master_lakefusion_ids"),
-).alias("exp")
+)
 
+# 3. Build attribute_combined for the SOURCE side from ALL data columns,
+#    excluding the id and the scoring/helper scaffolding columns.
+
+helper_cols = {
+    id_key, "search_results", "search_results_array",
+    "search_results_master_lakefusion_ids", "attributes_combined","search_results","scoring_results","attributes_combined_embedding","record_status","source_path"
+    # add any other non-attribute columns here (embeddings, scores, etc.)
+}
+schema_order = list(entity_attributes_datatype.keys())
+
+# Preserve schema order, drop helpers AND complex attrs (complex stay native,
+# never go through the scalar pipe-string), keep only cols actually present
+present = set(df_exploded.columns)
+source_cols = [c for c in schema_order if c not in helper_cols and c not in complex_attrs and c in present]
+
+df_exploded = df_exploded.withColumn(
+    "attributes_combined_source",
+    build_attr_combined_noprefix(source_cols, id_key),
+).alias("exp")   # alias AFTER the column exists
+
+# # # 4. Join to master
 df_master = df_master.alias("mst")
-
-# ── Step 4: Join with master table
 df_joined = df_exploded.join(
     df_master,
     F.col("exp.search_results_master_lakefusion_ids") == F.col("mst.lakefusion_id"),
     "inner",
 )
 
-# ── Step 5: Build pipe-separated attribute string per master candidate
-df_joined = df_joined.withColumn(
-    "attributes_combined_master",
-    F.concat(
-        F.concat_ws(
-            " | ",
-            *[
-                F.coalesce(F.col(f"mst.{c}").cast("string"), F.lit(""))
-                for c in attributes
-            ]
-        ),
-        F.lit(", "),
-        F.coalesce(F.col("mst.lakefusion_id").cast("string"), F.lit(""))
-    )
+# # 5. Build attribute_combined for the MASTER side from ALL its data columns,
+# #    excluding lakefusion_id and any non-attribute master columns.
+MASTER_ID = "lakefusion_id"
+
+master_exclude = {
+    MASTER_ID, "attributes_combined", "attributes_combined_master",
+    "attributes_combined_embedding"
+}
+
+# Reuse the same schema_order derived earlier. Scalars go through the pipe-string;
+# complex master cols are carried natively into the candidate struct.
+present_master = set(df_master.columns)
+master_cols = [c for c in schema_order if c not in master_exclude and c not in complex_attrs and c in present_master]
+complex_master_cols = [c for c in schema_order if c in complex_attrs and c not in master_exclude and c in present_master]
+
+# Per-candidate struct: scalar pipe-string (_combined) + the master's pre-built
+# attributes_combined (for the display id) + NATIVE complex columns.
+master_candidate = F.struct(
+    build_attr_combined_prefixed("mst", master_cols, MASTER_ID).alias("_combined"),
+    F.col("mst.attributes_combined").alias("_cand_attributes_combined"),
+    *[F.col(f"mst.{c}").alias(c) for c in complex_master_cols],
 )
 
-
-# ── Step 6: Group back — one row per (source × candidate)
+# # # 6. Group back: one row per source record + list of master candidates.
+#     collect_list (NOT collect_set) — structs containing ARRAY fields aren't hashable.
 group_cols = [f"exp.{c}" for c in df_exploded.columns]
 df_result = (
     df_joined
     .groupBy(*group_cols)
-    .agg(F.collect_set("attributes_combined_master").alias("attributes_combined_master_array"))
-    .select("exp.*", "attributes_combined_master_array", "search_results_master_lakefusion_ids")
+    .agg(F.collect_list(master_candidate).alias("_master_candidates"))
+    .select("exp.*", "_master_candidates", "search_results_master_lakefusion_ids")
 )
 
-# ── Step 7: Parse candidate strings into typed structs
+# # # 7. Parse BOTH sides into structs. Scalars round-trip through the pipe-string;
+#     complex stay native. Source complex cols (excluded from source_cols) remain
+#     native columns already present from exp.*.
 df_parsed = df_result.withColumn(
     "search_result_parsed",
     F.transform(
-        F.col("attributes_combined_master_array"),
-        lambda x: build_dynamic_struct(x, attributes, entity_attributes_datatype),
+        F.col("_master_candidates"),
+        lambda c: build_candidate_struct(c, master_cols, complex_master_cols, entity_attributes_datatype, complex_attrs),
+    ),
+).withColumn(
+    "source_parsed",
+    build_dynamic_struct(
+        F.col("attributes_combined_source"), source_cols, entity_attributes_datatype, complex_attrs
     ),
 )
 
-# ── Step 8: Apply deterministic rules
-df_with_rules = apply_rules(df_parsed, rules_config)
+# # Flatten source scalar struct → plain <col> columns (complex source cols stay native)
+for col in source_cols:
+    df_parsed = df_parsed.withColumn(col, F.col(f"source_parsed.{col}_matches"))
 
-# ── Step 9: Compute deterministic match struct
+# # 8. Apply deterministic rules
+df_with_rules = apply_rules(df_parsed, rules_config, complex_types)
+
+# 9. Compute first-match deterministic result
 df_final = compute_deterministic_matches(df_with_rules, rules_config)
 
-# ── Step 10: Explode rule_result so each matched candidate gets its own row
-df_exploded = df_final.withColumn("rule", F.explode("deterministic_match_result.rule_result"))
+# 10. Explode matched rule results (one row per matched candidate)
+df_exploded = df_final.withColumn(
+    "rule", F.explode("deterministic_match_result.rule_result")
+)
 
-# ── Step 11: Build exploded_result struct (per matched candidate).
-# Score uses production thresholds so the downstream classifier sees rule-determined
-# entries in the right band (MATCH → merge_max, NO_MATCH → not_match_max).
-selected_rule_fields = [
-    f.name for f in df_exploded.schema["rule"].dataType.fields
-    if f.name != "lakefusion_id"
-]
-concat_col = F.concat_ws(" | ", *[F.col(f"rule.{f}") for f in selected_rule_fields])
+# # 11. Build exploded_result struct
+# `id` = the matched candidate's attributes_combined, which was built at load time
+# by build_attributes_combined_column (utils/attributes_combined). Reusing it means
+# the id is byte-identical to what the LLM / other steps display — STRUCT flattened
+# ("5 Elm Ave Quincy MA 02169"), etc. — and it works regardless of whether complex
+# columns are stored natively or as JSON strings (no re-flattening here).
+concat_col = F.col("rule._cand_attributes_combined")
 
 df_final = df_exploded.withColumn(
     "exploded_result",
     F.struct(
         concat_col.alias("id"),
         F.col("deterministic_match_result.action_on_match").alias("match"),
-        F.when(
-            F.col("deterministic_match_result.action_on_match") == "MATCH",
-            F.lit(merge_max),
-        ).when(
-            F.col("deterministic_match_result.action_on_match") == "NO_MATCH",
-            F.lit(not_match_max),
-        ).otherwise(F.lit(not_match_max)).cast("double").alias("score"),
+        F.lit(1.0).cast("double").alias("score"),
         F.concat(
             F.lit("Due to Match Rule: "),
             F.col("deterministic_match_result.rule_name"),
         ).alias("reason"),
         F.col("rule.lakefusion_id").alias("lakefusion_id"),
-    ),
+    )
 )
 
 # COMMAND ----------

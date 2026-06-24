@@ -83,14 +83,10 @@ def upload_json_to_databricks_volume(catalog_name: str, databricks_host: str, da
     Path format: /Volumes/{catalog}/metadata/metadata_files/entity_{id}_prod_{filename}
     """
     try:
-        from databricks.sdk import WorkspaceClient
-        
-        # Initialize Databricks client with explicit host and token
-        w = WorkspaceClient(
-            host=databricks_host,
-            token=databricks_token
-        )
-        
+        from lakefusion_utility.utils.databricks_util import _create_workspace_client
+
+        w = _create_workspace_client(databricks_token)
+
         # Build file path: /Volumes/{catalog}/metadata/metadata_files/entity_{id}_prod_{filename}
         file_path = f"/Volumes/{catalog_name}/metadata/metadata_files/entity_{entity_id}_prod_{file_name}"
         
@@ -217,7 +213,7 @@ def upgrade() -> None:
                 ih.modelid
             FROM entity e
             JOIN integration_hub ih ON e.id = ih.entity_id
-            WHERE e.is_active = 1 AND ih.is_active = 1
+            WHERE e.is_active = true AND ih.is_active = true
             ORDER BY e.id
         """)
         entities = session.execute(entities_query).fetchall()

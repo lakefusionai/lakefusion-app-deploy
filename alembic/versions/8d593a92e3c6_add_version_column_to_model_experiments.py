@@ -43,7 +43,7 @@ def sync_model_experiment_versions(session: Session):
         result = session.execute(text("""
             SELECT DISTINCT me.id as model_id, mjj.job_id
             FROM model_experiments me
-            LEFT JOIN match_maven_jobs mjj ON me.id = mjj.modelid AND me.entity_id = mjj.entity_id
+            LEFT JOIN match_maven_job mjj ON me.id = mjj.modelid AND me.entity_id = mjj.entity_id
             WHERE me.version IS NULL
         """))
         

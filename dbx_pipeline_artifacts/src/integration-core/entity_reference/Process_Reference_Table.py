@@ -30,6 +30,7 @@ dbutils.widgets.text("write_mode", "delta", "Write Mode (delta/lakebase)")
 dbutils.widgets.text("lakebase_instance_id", "", "lakebase_instance_id")
 dbutils.widgets.text("lakebase_branch_id", "", "lakebase_branch_id")
 dbutils.widgets.text("lakebase_endpoint_id", "", "lakebase_endpoint_id")
+dbutils.widgets.text("job_run_id", "", "job id for this run")
 
 # COMMAND ----------
 
@@ -45,6 +46,7 @@ write_mode = dbutils.widgets.get("write_mode")
 lakebase_instance_id = dbutils.widgets.get("lakebase_instance_id")
 lakebase_branch_id = dbutils.widgets.get("lakebase_branch_id")
 lakebase_endpoint_id = dbutils.widgets.get("lakebase_endpoint_id")
+job_run_id=dbutils.widgets.get("job_run_id")
 
 # COMMAND ----------
 
@@ -88,13 +90,14 @@ conflict_table_fqn = f"{catalog_name}.gold.{entity}_reference_conflict_queue_pro
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 from datetime import datetime
 import uuid
 
 try:
     # Works in Databricks Jobs — set automatically by the job scheduler
-    RUN_ID = f"RUN_{dbutils.jobs.taskValues.get(taskKey='run_id', default=str(uuid.uuid4()))}"
+    RUN_ID = f"RUN_{job_run_id}"
 except Exception:
     RUN_ID = f"RUN_{uuid.uuid4()}"
 RUN_ID=RUN_ID.replace('-','_')
@@ -127,6 +130,40 @@ def _audit_next_version_lookup(delta_audit, ref_ids_df):
         .groupBy("ref_lakefusion_id")
         .agg((F.max("version") + F.lit(1)).alias("_next_version"))
     )
+
+
+def _changed_since_last_merge(delta_audit, matched_src_df, biz_cols):
+    """Keep only matched source rows whose business values differ from what the
+    job last merged for that ref (the latest action_type='JOB_MERGE' audit row).
+
+    A matched row whose source values equal the last job-merged snapshot means the
+    SOURCE has not changed since then — re-merging it would only rewrite master,
+    burn a new audit version, and (worse) clobber any steward edit
+    (action_type='STEWARD_EDIT') reverse-synced in the meantime. Such rows are
+    dropped. Comparison is null-safe and baselined on JOB_MERGE rows only, so a
+    steward edit never counts as a source change. Refs with no prior JOB_MERGE
+    row are kept (treated as changed). Returns matched_src_df's original columns."""
+    audit_types = {f.name: f.dataType for f in delta_audit.schema}
+    w = Window.partitionBy("ref_lakefusion_id").orderBy(F.col("version").desc())
+    last_merge = (
+        delta_audit
+        .filter(F.col("action_type") == F.lit("JOB_MERGE"))
+        .withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .select(
+            "ref_lakefusion_id",
+            F.lit(True).alias("_has_prev"),
+            *[F.col(c).alias(f"_prev_{c}") for c in biz_cols],
+        )
+    )
+    joined = matched_src_df.join(last_merge, on="ref_lakefusion_id", how="left")
+    all_equal = F.lit(True)
+    for c in biz_cols:
+        # cast source value to the audit/master declared type so a type-only
+        # difference (e.g. source int vs declared string) isn't read as a change.
+        all_equal = all_equal & F.col(c).cast(audit_types[c]).eqNullSafe(F.col(f"_prev_{c}"))
+    unchanged = F.coalesce(F.col("_has_prev"), F.lit(False)) & all_equal
+    return joined.filter(~unchanged).select(*matched_src_df.columns)
 
 
 def _master_upsert(src_df, biz_cols):
@@ -333,6 +370,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     tmp_matched = f"_tmp_matched_{run_id}"
     tmp_master  = f"_tmp_target_master_{run_id}"
+    tmp_changed = f"_tmp_changed_{run_id}"
 
     def write_temp_snapshot(df, table_name):
         clean_df = df.select([
@@ -379,23 +417,40 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
         if strategy == "source_wins":
             # Job update: UPSERT master + flip-current+append in audit. Each
             # new audit row gets action_type='JOB_MERGE' and inherits the
-            # prior version's steward_locked value.
-            _scd2_expire_and_insert(delta_audit, matched_snap, biz_cols, action_type="JOB_MERGE")
-            print(
-                f"[on_match=source_wins] Versioned {matched_count} rows "
-                f"(UPSERT master + new audit versions)"
+            # prior version's steward_locked value. Only re-merge rows whose
+            # SOURCE values actually changed since the last JOB_MERGE — skipping
+            # unchanged rows avoids clobbering steward edits with stale source data.
+            changed_snap = write_temp_snapshot(
+                _changed_since_last_merge(delta_audit, matched_snap, biz_cols),
+                tmp_changed,
             )
+            changed_count = changed_snap.count()
+            if changed_count == 0:
+                print("[on_match=source_wins] No source rows changed since last merge — nothing to re-merge")
+            else:
+                _scd2_expire_and_insert(delta_audit, changed_snap, biz_cols, action_type="JOB_MERGE")
+                print(
+                    f"[on_match=source_wins] Versioned {changed_count} changed rows "
+                    f"(skipped {matched_count - changed_count} unchanged; UPSERT master + new audit versions)"
+                )
 
         elif strategy == "steward_wins":
             unlocked = matched_snap.join(locked_df, on="ref_lakefusion_id", how="left_anti")
             unlocked_count = unlocked.count()
             # Apply only to unlocked refs — locked rows keep their current
-            # version untouched on both master and audit.
-            _scd2_expire_and_insert(delta_audit, unlocked, biz_cols, action_type="JOB_MERGE")
-            skipped = matched_count - unlocked_count
+            # version untouched. Of the unlocked rows, only re-merge those whose
+            # SOURCE values actually changed since the last JOB_MERGE.
+            changed_snap = write_temp_snapshot(
+                _changed_since_last_merge(delta_audit, unlocked, biz_cols),
+                tmp_changed,
+            )
+            changed_count = changed_snap.count()
+            if changed_count > 0:
+                _scd2_expire_and_insert(delta_audit, changed_snap, biz_cols, action_type="JOB_MERGE")
             print(
-                f"[on_match=steward_wins] Versioned {unlocked_count} rows "
-                f"(expire+insert), skipped {skipped} locked rows"
+                f"[on_match=steward_wins] Versioned {changed_count} changed rows "
+                f"(skipped {matched_count - unlocked_count} locked, "
+                f"{unlocked_count - changed_count} unchanged)"
             )
 
         elif strategy == "flag_for_review":
@@ -485,6 +540,7 @@ def handle_match(config, matched_df, target_master_df, run_id, now):
     finally:
         spark.sql(f"DROP TABLE IF EXISTS {tmp_matched}")
         spark.sql(f"DROP TABLE IF EXISTS {tmp_master}")
+        spark.sql(f"DROP TABLE IF EXISTS {tmp_changed}")
 
 
 handle_match(entity_reference_config, matched, target_master, RUN_ID, NOW)

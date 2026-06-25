@@ -1,7 +1,7 @@
 """add display_order column to entityattributes
 
 Revision ID: d1s2p3o4r5d6
-Revises: lg1u2r3l4c5g
+Revises: f44bc0f2f539
 Create Date: 2026-06-23
 
 Adds display_order INT column to entityattributes table for user-defined
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "d1s2p3o4r5d6"
-down_revision: Union[str, None] = "lg1u2r3l4c5g"
+down_revision: Union[str, None] = "f44bc0f2f539"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

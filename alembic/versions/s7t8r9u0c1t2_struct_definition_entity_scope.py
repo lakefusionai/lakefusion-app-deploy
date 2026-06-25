@@ -1,7 +1,7 @@
 """scope struct_definition to an owning entity
 
 Revision ID: s7t8r9u0c1t2
-Revises: i7s8c9h0e1m2
+Revises: lg1u2r3l4c5g
 Create Date: 2026-06-17 00:00:00.000000
 
 Make struct definitions exclusive to a single entity so editing one entity's
@@ -24,7 +24,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = "s7t8r9u0c1t2"
-down_revision: Union[str, None] = "i7s8c9h0e1m2"
+down_revision: Union[str, None] = "lg1u2r3l4c5g"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1,7 +1,7 @@
 """Add RBAC group id columns to entity and role
 
 Revision ID: d7e8f9a0b1c2
-Revises: f5a6b7c8d9e0
+Revises: e4f5a6b7c8d9
 Create Date: 2026-04-23 10:00:00.000000
 
 Adds:
@@ -20,7 +20,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "d7e8f9a0b1c2"
-down_revision: Union[str, None] = "f5a6b7c8d9e0"
+down_revision: Union[str, None] = "e4f5a6b7c8d9"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1,7 +1,7 @@
 """RBAC backfill for existing entities
 
 Revision ID: f5a6b7c8d9e0
-Revises: e4f5a6b7c8d9
+Revises: d1s2p3o4r5d6
 Create Date: 2026-03-16 12:00:00.000000
 
 Provisions Databricks account-level groups, writes group IDs back onto
@@ -29,7 +29,7 @@ import sqlalchemy as sa
 
 
 revision: str = "f5a6b7c8d9e0"
-down_revision: Union[str, None] = "e4f5a6b7c8d9"
+down_revision: Union[str, None] = "d1s2p3o4r5d6"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

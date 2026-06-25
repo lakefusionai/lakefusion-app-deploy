@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from app.lakefusion_pim_service.utils.app_db import (
@@ -119,6 +120,17 @@ def get_global_attributes(
     """Get global attributes from MySQL entityattributes."""
     service = PimEntityBridgeService(db)
     return service.get_global_attributes(entity_id)
+
+
+@pim_entity_bridge_router.get("/entity-bridge/{entity_id}/tab-groups")
+def get_tab_groups(
+    entity_id: int,
+    check: dict = Depends(token_required_wrapper),
+    db: Session = Depends(get_db),
+):
+    """Get predefined tab groups for a product entity (drives the Tab Group dropdown)."""
+    service = PimEntityBridgeService(db)
+    return service.get_tab_groups(entity_id)
 
 
 @pim_entity_bridge_router.post("/entity-bridge/{entity_id}/initialize-local")

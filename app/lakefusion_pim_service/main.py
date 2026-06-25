@@ -23,6 +23,7 @@ from app.lakefusion_pim_service.api.pim_reference_route import pim_reference_rou
 from app.lakefusion_pim_service.api.pim_entity_route import pim_entity_router
 from app.lakefusion_pim_service.api.pim_assortment_route import pim_assortment_router
 from app.lakefusion_pim_service.api.pim_entity_tier_route import pim_entity_tier_router
+from app.lakefusion_pim_service.api.pim_tab_group_route import pim_tab_group_router
 from app.lakefusion_pim_service.api.pim_entity_bridge_route import pim_entity_bridge_router
 from app.lakefusion_pim_service.api.pim_model_serving_route import pim_model_serving_router
 
@@ -118,6 +119,7 @@ entity_scoped_router.include_router(pim_reference_router)
 entity_scoped_router.include_router(pim_entity_router)
 entity_scoped_router.include_router(pim_assortment_router)
 entity_scoped_router.include_router(pim_entity_tier_router)
+entity_scoped_router.include_router(pim_tab_group_router)
 app.include_router(entity_scoped_router, prefix=f'{app_prefix}', dependencies=pim_dependency)
 
 logger.info("PIM Service API up and running")

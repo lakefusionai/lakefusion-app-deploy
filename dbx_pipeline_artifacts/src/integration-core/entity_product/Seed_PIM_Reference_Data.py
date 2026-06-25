@@ -17,11 +17,12 @@ dbutils.library.restartPython()
 # MAGIC Delta stays the source of truth and the rows reach Lakebase through the
 # MAGIC synced tables created by `Create_PIM_Tables`.
 # MAGIC
-# MAGIC Seeds 5 tables, all now Delta-backed (Create_PIM_Tables builds Delta+synced
-# MAGIC for all 20 pim_* tables):
+# MAGIC Seeds these tables, all now Delta-backed (Create_PIM_Tables builds Delta+synced
+# MAGIC for all pim_* tables):
 # MAGIC   - pim_entity_tier      (from entity_subtype)
 # MAGIC   - pim_language_ref     (defaults)
 # MAGIC   - pim_unit_ref         (defaults)
+# MAGIC   - pim_tab_groups       (defaults)
 # MAGIC   - pim_attribute_definition (global attrs from entity.json)
 # MAGIC
 # MAGIC Each seed is idempotent: skipped if the Delta table already has rows.
@@ -157,6 +158,7 @@ TIER_TEMPLATES = _seed_constants.get("tier_templates") or {}
 TYPE_MAPPING = _seed_constants.get("type_mapping") or {}
 DEFAULT_LANGS = _seed_constants.get("default_langs") or []
 DEFAULT_UNITS = _seed_constants.get("default_units") or []
+DEFAULT_TAB_GROUPS = _seed_constants.get("default_tab_groups") or []
 if not TIER_TEMPLATES:
     raise ValueError("entity.json missing 'pim_seed_constants' — service must embed it.")
 
@@ -234,6 +236,23 @@ units_seeded = _seed(
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 3b. Tab groups (predefined; users cannot add tabs)
+
+# COMMAND ----------
+
+# display_order = position in the constant list; is_system / created_at are NOT NULL
+# in Delta with no DB-side default, so set them explicitly.
+tab_groups_seeded = _seed(
+    "pim_tab_groups",
+    [
+        {"name": g["name"], "label": g["label"], "display_order": i, "is_system": True, "created_at": now}
+        for i, g in enumerate(DEFAULT_TAB_GROUPS)
+    ],
+)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 4. Bulk global attributes (from entity.json)
 # MAGIC
 # MAGIC Reads the entity's attributes from the volume metadata (entity.json already
@@ -299,7 +318,7 @@ for attr in entity_attrs:
         "is_system": False,
         "is_identifier": bool(attr.get("is_primary_key", False)),
         "is_label": bool(attr.get("is_label", False)),
-        "group": type_config.get("group", "General"),
+        "group": type_config.get("group") or "general",
         "display_order": display_order,
         "created_at": now,
         "updated_at": now,
@@ -311,5 +330,5 @@ attrs_seeded = _seed("pim_attribute_definition", attr_rows)
 
 logger.info(
     f"PIM Seed complete — tiers={tiers_seeded}, languages={langs_seeded}, "
-    f"units={units_seeded}, attributes={attrs_seeded}"
+    f"units={units_seeded}, tab_groups={tab_groups_seeded}, attributes={attrs_seeded}"
 )

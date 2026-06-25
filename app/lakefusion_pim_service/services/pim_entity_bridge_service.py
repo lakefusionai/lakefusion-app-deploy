@@ -9,6 +9,7 @@ from lakefusion_utility.models.pim_constants import (
     TYPE_MAPPING,
     DEFAULT_LANGS,
     DEFAULT_UNITS,
+    DEFAULT_TAB_GROUPS,
 )
 
 app_logger = get_logger(__name__)
@@ -132,6 +133,37 @@ class PimEntityBridgeService:
         except Exception:
             data_db.rollback()
             raise
+        finally:
+            data_db.close()
+
+    def get_tab_groups(self, entity_id: int):
+        """List predefined tab groups for a product entity, ordered by display_order."""
+        from app.lakefusion_pim_service.utils.app_db import derive_db_name, get_or_create_engine
+        from lakefusion_utility.models.pim import PimTabGroup
+
+        entity = self._get_entity(entity_id)
+        entity_name = derive_db_name(entity.name)
+
+        try:
+            session_factory = get_or_create_engine(entity_name, self.mysql_db)
+        except HTTPException:
+            raise
+        except Exception as e:
+            app_logger.warning(f"Auto-reconnect for tab-groups failed: {e}")
+            raise HTTPException(status_code=503, detail="PIM not initialized. Run Initialize PIM first.")
+
+        data_db = session_factory()
+        try:
+            rows = data_db.query(PimTabGroup).order_by(PimTabGroup.display_order).all()
+            return [
+                {
+                    "name": r.name,
+                    "label": r.label,
+                    "display_order": r.display_order,
+                    "is_system": r.is_system,
+                }
+                for r in rows
+            ]
         finally:
             data_db.close()
 
@@ -327,7 +359,8 @@ class PimEntityBridgeService:
         }
 
     def _seed_local(self, data_db, entity, entity_name):
-        """Seed tiers (from entity_subtype) + default languages/units via raw SQL.
+        """Seed tiers (from entity_subtype) + default languages/units/tab groups +
+        global attributes via raw SQL.
 
         Mirrors Seed_PIM_Reference_Data for the local path. Uses pim_sql so the
         rows land in the same gold."pim_*" tables the service reads. Skips a table
@@ -357,7 +390,9 @@ class PimEntityBridgeService:
             for lang in DEFAULT_LANGS:
                 sql, params = pim_sql.build_insert(
                     entity_name, "pim_language_ref",
-                    {"id": lang["id"], "language_name": lang["language_name"]},
+                    # is_active is NOT NULL with no DB-side default — set explicitly
+                    # (raw SQL doesn't apply the ORM model default).
+                    {"id": lang["id"], "language_name": lang["language_name"], "is_active": True},
                     auto_id=False, auto_updated_at=False,
                 )
                 pim_sql.execute(data_db, sql, params)
@@ -368,11 +403,37 @@ class PimEntityBridgeService:
         if (pim_sql.fetch_scalar(data_db, f'SELECT COUNT(*) FROM {unit_tbl}') or 0) == 0:
             for unit in DEFAULT_UNITS:
                 sql, params = pim_sql.build_insert(
-                    entity_name, "pim_unit_ref", dict(unit),
+                    entity_name, "pim_unit_ref",
+                    # is_active is NOT NULL with no DB-side default — set explicitly.
+                    {**dict(unit), "is_active": True},
                     auto_id=False, auto_updated_at=False,
                 )
                 pim_sql.execute(data_db, sql, params)
             app_logger.info(f"[local] Seeded {len(DEFAULT_UNITS)} default measurement units")
+
+        # --- tab groups (caller PK = name, no updated_at column) ---
+        tab_tbl = pim_sql.pim_tbl(entity_name, "pim_tab_groups")
+        if (pim_sql.fetch_scalar(data_db, f'SELECT COUNT(*) FROM {tab_tbl}') or 0) == 0:
+            for order, g in enumerate(DEFAULT_TAB_GROUPS):
+                sql, params = pim_sql.build_insert(
+                    entity_name, "pim_tab_groups",
+                    {"name": g["name"], "label": g["label"], "display_order": order, "is_system": True},
+                    auto_id=False, auto_updated_at=False,
+                )
+                pim_sql.execute(data_db, sql, params)
+            app_logger.info(f"[local] Seeded {len(DEFAULT_TAB_GROUPS)} tab groups")
+
+        # --- global attributes (MySQL entityattributes -> pim_attribute_definition) ---
+        # Mirrors Seed_PIM_Reference_Data step 4: sync the entity's global attributes
+        # (and their SELECT/MULTISELECT options) into the local gold schema.
+        attr_tbl = pim_sql.pim_tbl(entity_name, "pim_attribute_definition")
+        if (pim_sql.fetch_scalar(data_db, f'SELECT COUNT(*) FROM {attr_tbl}') or 0) == 0:
+            from app.lakefusion_pim_service.services.pim_attribute_sync_service import PimAttributeSyncService
+            global_attrs = self.get_global_attributes(entity.id)
+            sync_service = PimAttributeSyncService(data_db, entity_name)
+            for attr in global_attrs:
+                sync_service.sync_attribute(attr)
+            app_logger.info(f"[local] Synced {len(global_attrs)} global attributes")
 
     # --- Private helpers ---
 

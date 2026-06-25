@@ -1,6 +1,12 @@
 import re
 from sqlalchemy.orm import Session
 from app.lakefusion_pim_service.utils import pim_sql
+from lakefusion_utility.models.pim import (
+    PimAttributeDefinition, PimSpecificationConfig,
+    PimValueText, PimValueNumber, PimValueBoolean,
+    PimValueDate, PimValueSelect, PimValueMultiselect, PimValueReference,
+    to_value_key,
+)
 from lakefusion_utility.utils.logging_utils import get_logger
 from app.lakefusion_pim_service.services.pim_attribute_service import PimAttributeService
 
@@ -89,12 +95,31 @@ class PimAttributeSyncService:
         if existing:
             # ---- UPDATE ----
             type_config = attr_data.get("type_config") or {}
-            if not isinstance(type_config, dict):
-                type_config = {}
-            new_group = type_config.get("group", "General")
-            new_display_order = type_config.get("display_order", 0)
-            new_is_localizable = bool(type_config.get("is_localizable", False))
-            new_level = type_config.get("level", None)
+            new_group = to_value_key(type_config.get("group") or "general") if isinstance(type_config, dict) else "general"
+            new_display_order = type_config.get("display_order", 0) if isinstance(type_config, dict) else 0
+
+            new_is_localizable = bool(type_config.get("is_localizable", False)) if isinstance(type_config, dict) else False
+            new_level = type_config.get("level", None) if isinstance(type_config, dict) else None
+
+            changed = False
+            if existing.label != label:
+                existing.label = label
+                changed = True
+            if existing.data_type != pim_type:
+                existing.data_type = pim_type
+                changed = True
+            if existing.group != new_group:
+                existing.group = new_group
+                changed = True
+            if existing.is_localizable != new_is_localizable:
+                existing.is_localizable = new_is_localizable
+                changed = True
+            if existing.display_order != new_display_order:
+                existing.display_order = new_display_order
+                changed = True
+            if new_level and existing.level != new_level:
+                existing.level = new_level
+                changed = True
             new_is_identifier = bool(attr_data.get("is_primary_key", False))
             new_is_label = bool(attr_data.get("is_label", False))
 
@@ -145,12 +170,15 @@ class PimAttributeSyncService:
         if attr_data.get("type_config") and attr_data["type"] == "REFERENCE_ENTITY":
             ref_entity_id = str(attr_data["type_config"].get("reference_entity_id", ""))
 
+        # Read group, level, and display_order from type_config (set by SI in MDM portal)
         type_config = attr_data.get("type_config") or {}
         if not isinstance(type_config, dict):
             type_config = {}
-        group = type_config.get("group", "General")
+        group = to_value_key(type_config.get("group") or "general")
         level = type_config.get("level", "PRODUCT")
         display_order = type_config.get("display_order", 0)
+
+        # Map MDM flags to PIM flags
         is_identifier = bool(attr_data.get("is_primary_key", False))
         is_label_flag = bool(attr_data.get("is_label", False))
 

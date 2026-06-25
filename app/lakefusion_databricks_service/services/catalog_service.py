@@ -2,6 +2,7 @@ from fastapi.security import HTTPBearer
 from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import CatalogService
 from lakefusion_utility.models.httpresponse import HttpResponse
+from lakefusion_utility.utils.dbx_error_handler import raise_on_dbx_permission_error
 import traceback
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,7 @@ def list_catalogs(token: str,db:Session):
         # Return the retrieved catalog list
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list catalogs")
         # Capture the traceback in case of an exception and log the error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the catalogs list. Reason - {message}')
@@ -56,6 +58,7 @@ def list_schemas(token: str, catalog_name: str,db:Session):
         # Return the retrieved schema list
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list schemas")
         # Capture the traceback in case of an exception and log the error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the schemas for catalog {catalog_name}. Reason - {message}')
@@ -85,6 +88,7 @@ def list_tables(token: str, catalog_name: str, schema_name: str,db:Session):
         # Return the retrieved table list
         return data
     except Exception as e:
+        raise_on_dbx_permission_error(e, "list tables")
         # Capture the traceback in case of an exception and log the error message
         message = traceback.format_exc()
         app_logger.exception(f'Unable to fetch the tables for catalog {catalog_name} and schema {schema_name}. Reason - {message}')
@@ -142,6 +146,7 @@ def list_uc_objects(token: str, object_type: str, catalog_name: str = None, sche
             scope_parts.append(f"schema={schema_name}")
         scope = ", ".join(scope_parts)
 
+        raise_on_dbx_permission_error(e, f"list UC {object_type}")
         app_logger.exception(f'Unable to fetch UC objects: {scope}. Reason - {message}')
         raise HttpResponse(
             status_code=500,

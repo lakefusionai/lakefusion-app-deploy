@@ -370,7 +370,7 @@ def upgrade() -> None:
                 job_id_1, job_id_2, version, pipeline_mode,
                 is_active
             FROM integration_hub
-            WHERE is_active = 1
+            WHERE is_active = true
             ORDER BY id
         """)
         

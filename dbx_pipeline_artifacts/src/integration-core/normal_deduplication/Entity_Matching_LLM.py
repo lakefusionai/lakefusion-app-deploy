@@ -137,6 +137,53 @@ attributes = json.loads(attributes)
 config_thresholds = json.loads(config_thresholds)
 max_potential_matches = int(max_potential_matches)
 
+# full attribute records for LLM prompt enrichment.
+try:
+    _attr_records_raw = dbutils.jobs.taskValues.get(
+        taskKey="Parse_Entity_Model_JSON",
+        key="entity_attribute_records",
+        debugValue="[]",
+    )
+    entity_attribute_records = json.loads(_attr_records_raw) if _attr_records_raw else []
+except Exception:
+    entity_attribute_records = []
+
+import os as _pp_os
+import sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _pp_src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _pp_src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _pp_src_path)
+        break
+
+try:
+    from lakefusion_core_engine.utils.attribute_prompt_utils import (
+        build_attribute_descriptors as _build_attribute_descriptors,
+        merge_selected_sub_fields as _merge_selected_sub_fields,
+    )
+except Exception:
+    def _build_attribute_descriptors(names, records=None, separator=" | "):
+        return separator.join(names)
+    def _merge_selected_sub_fields(records, selection):
+        return list(records or [])
+
+# Per-attribute sub-field selection from model config.
+try:
+    _selected_sub_fields_raw = dbutils.jobs.taskValues.get(
+        taskKey="Parse_Entity_Model_JSON",
+        key="model_selected_sub_fields",
+        debugValue="{}",
+    )
+    model_selected_sub_fields = json.loads(_selected_sub_fields_raw) if _selected_sub_fields_raw else {}
+except Exception:
+    model_selected_sub_fields = {}
+
+entity_attribute_records = _merge_selected_sub_fields(
+    entity_attribute_records, model_selected_sub_fields
+)
+
 # COMMAND ----------
 
 merge_thresholds = config_thresholds.get('merge', [0.9, 1.0])
@@ -496,6 +543,64 @@ if records_to_process == 0:
     logger.info("STEP 5: UPDATE PROCESSED UNIFIED FROM SCORING RESULTS")
     logger.info("=" * 80)
 
+    # ── Deterministic-only run: synthesize scoring_results before the rebuild ────
+    # When the only new ACTIVE records are deterministic hits, records_to_process
+    # is 0 — positive matches AND fully-filtered no-match records are both excluded
+    # from filter_query — so the main path (STEP 7 union_clause + STEP 9 skip-LLM
+    # synthesis) never runs and these records would exit here ACTIVE with empty
+    # scoring_results, never reaching processed_unified and never merging. Replicate
+    # both pieces here so they land in processed_unified below.
+    #   - Positive matches: keep MATCH/POTENTIAL_MATCH candidates, reclassify by the
+    #     same score bands STEP 8 uses (score is 1.0 → MATCH).
+    #   - Skip-LLM no-match: every-candidate-filtered records keep their det match.
+    if deteministic_unified_table_exists:
+        df_det_scoring = spark.sql(f"""
+            WITH det_rows AS (
+                SELECT
+                    d.{unified_id_key} AS {unified_id_key},
+                    named_struct(
+                        'id',            det.exploded_result.id,
+                        'match',         CASE
+                            WHEN det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH')
+                                 AND det.exploded_result.score BETWEEN {merge_min} AND {merge_max} THEN 'MATCH'
+                            WHEN det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH')
+                                 AND det.exploded_result.score BETWEEN {matches_min} AND {matches_max} THEN 'POTENTIAL_MATCH'
+                            ELSE det.exploded_result.match
+                        END,
+                        'score',         CAST(det.exploded_result.score AS DOUBLE),
+                        'reason',        det.exploded_result.reason,
+                        'lakefusion_id', det.exploded_result.lakefusion_id
+                    ) AS r
+                FROM _det_filter d
+                JOIN {unified_deteministic_table} det
+                  ON det.{unified_id_key} = d.{unified_id_key}
+                JOIN {unified_table} u
+                  ON u.{unified_id_key} = d.{unified_id_key}
+                WHERE u.record_status = 'ACTIVE'
+                  AND (u.scoring_results IS NULL OR u.scoring_results = '')
+                  AND (
+                        (d.has_positive_match = true
+                            AND det.exploded_result.match IN ('MATCH', 'POTENTIAL_MATCH'))
+                     OR (d.has_positive_match = false
+                            AND d.filtered_search_results IS NULL
+                            AND det.exploded_result.match NOT IN ('MATCH', 'POTENTIAL_MATCH'))
+                  )
+            )
+            SELECT {unified_id_key}, to_json(collect_list(r)) AS scoring_results
+            FROM det_rows
+            GROUP BY {unified_id_key}
+        """)
+
+        _det_scoring_count = df_det_scoring.count()
+        if _det_scoring_count:
+            logger.info(f"  Synthesizing scoring_results for {_det_scoring_count} deterministic-only record(s)")
+            DeltaTable.forName(spark, unified_table).alias("target").merge(
+                source=df_det_scoring.alias("source"),
+                condition=f"target.{unified_id_key} = source.{unified_id_key}"
+            ).whenMatchedUpdate(
+                set={"scoring_results": "source.scoring_results"}
+            ).execute()
+
     active_with_scoring_count = spark.sql(f"""
         select count(*) as cnt
         from {unified_table}
@@ -620,7 +725,7 @@ logger.info("\n" + "=" * 80)
 logger.info("STEP 5: BUILD LLM QUERY")
 logger.info("=" * 80)
 
-attribute_order = ' | '.join(attributes)
+attribute_order = _build_attribute_descriptors(attributes, entity_attribute_records)
 additional_instructions_text = additional_instructions.strip() if additional_instructions else ""
 
 logger.info(f"Building LLM query for {max_potential_matches} matches per record")
@@ -689,7 +794,7 @@ else:
         base_prompt,
         entity=entity,
         additional_instructions=additional_instructions,
-        attributes=' | '.join(attributes),
+        attributes=attribute_order, # enriched
         max_potential_matches=max_potential_matches
     )
     safe_prompt = formatted_prompt.replace("'", "\\'")
@@ -1269,6 +1374,43 @@ df_scoring_updates = df_with_match_status.groupBy(unified_id_key).agg(
     "scoring_results",
     to_json(col("results_array"))
 ).select(unified_id_key, "scoring_results")
+
+# ── Skip-LLM no-match records ─────────────────────────────────────────────────
+# When deterministic NOT_A_MATCH / NO_MATCH rules remove EVERY candidate, the
+# record is excluded from LLM (has_positive_match=false AND filtered_search_results
+# IS NULL) and ends up ACTIVE with empty scoring_results — never finalized into its
+# own master. Synthesize a NO_MATCH scoring_results from its deterministic rows so
+# it (1) gets scoring_results populated and (2) lands in processed_unified as
+# no-match → Process_Unmatched_Records finalizes it (record_status=MERGED).
+# LLM-FAILED records had remaining candidates (filtered_search_results IS NOT NULL),
+# so they are NOT in this set and are correctly left for retry/error handling.
+if deteministic_unified_table_exists:
+    df_skip_llm_scoring = spark.sql(f"""
+        SELECT
+            d.{unified_id_key},
+            to_json(collect_list(named_struct(
+                'id',            det.exploded_result.id,
+                'match',         det.exploded_result.match,
+                'score',         CAST(det.exploded_result.score AS DOUBLE),
+                'reason',        det.exploded_result.reason,
+                'lakefusion_id', det.exploded_result.lakefusion_id
+            ))) AS scoring_results
+        FROM _det_filter d
+        JOIN {unified_deteministic_table} det
+          ON det.{unified_id_key} = d.{unified_id_key}
+        WHERE d.has_positive_match = false
+          AND d.filtered_search_results IS NULL
+          AND det.exploded_result.match NOT IN ('MATCH', 'POTENTIAL_MATCH')
+        GROUP BY d.{unified_id_key}
+    """)
+    # Guard: never override a record that was actually LLM-scored this run.
+    df_skip_llm_scoring = df_skip_llm_scoring.join(
+        df_scoring_updates.select(unified_id_key), on=unified_id_key, how="left_anti"
+    )
+    _skip_count = df_skip_llm_scoring.count()
+    if _skip_count:
+        logger.info(f"  Synthesizing NO_MATCH scoring_results for {_skip_count} skip-LLM record(s)")
+        df_scoring_updates = df_scoring_updates.unionByName(df_skip_llm_scoring)
 
 unified_delta = DeltaTable.forName(spark, unified_table)
 

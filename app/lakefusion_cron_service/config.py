@@ -19,7 +19,10 @@ db_type = os.environ.get("DB_TYPE", "mysql").lower()
 if deployment_env:
     sql_db_name = f'{sql_db_name}_{deployment_env}'
 
-lakefusion_databricks_dapi = os.environ.get('LAKEFUSION_DATABRICKS_DAPI', '')
+# (Removed: lakefusion_databricks_dapi config — PAT use is forbidden under
+# Marketplace best practice. Code now uses get_app_sp_token() which prefers
+# the auto-injected App SP and falls back to LAKEFUSION_DATABRICKS_DAPI env
+# only for local/K8s deployments without an App SP available.)
 
 run_dbx_pipeline_artifacts_import = os.environ.get("RUN_DBX_PIPELINE_ARTIFACTS_IMPORT", "True").lower() == "true"
 

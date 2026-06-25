@@ -51,6 +51,10 @@ from lakefusion_core_engine.models import RecordStatus, ActionType
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/rdm_resolver
+
+# COMMAND ----------
+
 # WIDGETS
 dbutils.widgets.text("entity", "", "Entity Name")
 dbutils.widgets.text("primary_table", "", "Primary Table")
@@ -98,6 +102,15 @@ attributes = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSON", "match_attri
 # Parse task sets: TaskValueKey.DEFAULT_SURVIVORSHIP_RULES.value
 survivorship_config = dbutils.jobs.taskValues.get("Parse_Entity_Model_JSON", "default_survivorship_rules", debugValue=survivorship_config if survivorship_config else "[]")
 
+# RDM configs (per (source_id, source_attr) — used for inline mapping resolution
+# at ingestion via utils/rdm_resolver). When the entity has no REFERENCE_ENTITY
+# attrs, this is an empty list and the resolver short-circuits.
+rdm_configs = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON",
+    "rdm_configs",
+    debugValue="[]",
+)
+
 # Get info from Check_Increments_Exists
 has_updates = dbutils.jobs.taskValues.get("Check_Increments_Exists", "has_updates", debugValue=True)
 tables_with_updates = dbutils.jobs.taskValues.get("Check_Increments_Exists", "tables_with_updates", debugValue="[]")
@@ -121,6 +134,16 @@ attributes = json.loads(attributes)
 survivorship_config = json.loads(survivorship_config) if survivorship_config else []
 tables_with_updates = json.loads(tables_with_updates)
 table_version_info = json.loads(table_version_info)
+rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
+
+# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    import uuid as _uuid_mod
+    run_id = str(_uuid_mod.uuid4())
+
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # Convert has_updates to boolean
 if isinstance(has_updates, str):
@@ -212,10 +235,19 @@ def get_mapping_for_table(source_table: str):
     return {}
 
 def generate_attributes_combined(record_dict, attributes_list):
-    """Generate attributes_combined string from attribute values"""
+    """Generate attributes_combined string from attribute values.
+
+    For REFERENCE_ENTITY attributes, the record_dict is expected to already
+    contain `<attr>__display` (from the resolver); we use that when present,
+    otherwise fall through to the raw column value. This keeps the survivorship
+    rebuild path consistent with the Spark-side ingestion path."""
     values = []
     for attr in attributes_list:
-        value = record_dict.get(attr, '')
+        display_key = f"{attr}__display"
+        if display_key in record_dict and record_dict[display_key] is not None:
+            value = record_dict[display_key]
+        else:
+            value = record_dict.get(attr, '')
         if value is None:
             value = ''
         values.append(str(value))
@@ -376,7 +408,10 @@ for source_table in tables_with_updates:
     logger.info(f"\n{'='*60}")
     logger.info(f" Processing: {source_table}")
     logger.info(f"{'='*60}")
-    
+
+    # Pull this source's dataset_id (drives RDM mapping lookups via rdm_configs)
+    source_id_for_resolver = (dataset_objects.get(source_table) or {}).get("id")
+
     version_info = table_version_info.get(source_table)
     
     if not version_info or not version_info.get("has_updates", False):
@@ -601,11 +636,49 @@ for source_table in tables_with_updates:
             logger.error(f"   Available columns: {sorted(df_transformed.columns)}")
     
     if available_attributes:
+        # Resolve REFERENCE_ENTITY attrs inline via mapping table (creates mapping
+        # if needed, MERGEs new resolutions). Approved rows continue to unified;
+        # PENDING / NO_MATCH rows are split off and routed to the pending table.
+        df_transformed, df_pending_ref = resolve_reference_attributes(
+            spark,
+            df_transformed,
+            rdm_configs,
+            source_id=source_id_for_resolver,
+        )
+
+        concat_inputs = []
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            src = display_col if display_col in df_transformed.columns else c
+            concat_inputs.append(regexp_replace(trim(col(src).cast("string")), r'\s+', ' '))
+
         df_transformed = df_transformed.withColumn(
             "attributes_combined",
             concat_ws(" | ", *[coalesce(regexp_replace(trim(col(c)), r'\s+', ' '), lit("")) for c in available_attributes])
         )
+
+        # Drop the resolver's __display columns before downstream writes
+        for c in available_attributes:
+            display_col = f"{c}__display"
+            if display_col in df_transformed.columns:
+                df_transformed = df_transformed.drop(display_col)
+
         logger.info(f" Generated attributes_combined with {len(available_attributes)} attributes: {available_attributes}")
+
+        # Route PENDING / NO_MATCH rows to the unified error log instead of
+        # writing to unified. Steward review fixes the mapping later, then a
+        # backfill can promote the row.
+        if df_pending_ref is not None and not df_pending_ref.isEmpty():
+            unified_error_handler = UnifiedErrorHandler(spark, unified_table)
+            unified_error_handler.log_errors(
+                df_pending_ref.select(
+                    col("surrogate_key"),
+                    col("_rdm_pending_reason").alias("error_message"),
+                ),
+                stage="RDM",
+                run_id=run_id,
+            )
+            logger.info(f" Logged {df_pending_ref.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
     else:
         logger.info(f" ERROR: No match attributes available for attributes_combined generation!")
         df_transformed = df_transformed.withColumn("attributes_combined", lit(""))

@@ -49,6 +49,11 @@ match_attributes = dbutils.jobs.taskValues.get(
     "Parse_Entity_Model_JSON", "match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    taskKey="Parse_Entity_Model_JSON",
+    key="reference_attribute_config",
+    debugValue="{}"
+)
 master_id = dbutils.widgets.get("master_id")
 unmerge_unified_dataset_ids = dbutils.widgets.get("unified_dataset_ids")
 
@@ -60,10 +65,19 @@ default_survivorship_rules = json.loads(default_survivorship_rules)
 dataset_objects = json.loads(dataset_objects)
 match_attributes = json.loads(match_attributes)
 unmerge_unified_dataset_ids = json.loads(unmerge_unified_dataset_ids)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
 
 # COMMAND ----------
 
 # MAGIC %run ../../utils/execute_utils
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/rdm_resolver
 
 # COMMAND ----------
 
@@ -431,21 +445,20 @@ for attr in entity_attributes:
     else:
         insert_cols.append(col(attr).alias(attr))
 
-# Add attributes_combined generation using match_attributes
+# attributes_combined: resolve REFERENCE_ENTITY attrs through ref tables.
+# These rows hold a single ref_id per attribute (single contributor, no
+# concat aggregation in this path), but the helper handles both cases.
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(attr).cast("string"), lit("")))
-    
-    if concat_cols:
-        insert_cols.append(
-            concat_ws(" | ", *concat_cols).alias("attributes_combined")
-        )
-    else:
-        insert_cols.append(lit("").alias("attributes_combined"))
+    insert_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,  # don't skip any attr here
+            reference_attribute_config=reference_attribute_config,
+            source_prefix=None,
+        ).alias("attributes_combined")
+    )
 else:
     insert_cols.append(lit("").alias("attributes_combined"))
 
@@ -472,18 +485,19 @@ for attr in entity_attributes:
     master_update_cols.append(merged_record_column(attr, target_type))
 
 if match_attributes:
-    # Build concat expression for match attributes
-    concat_cols = []
-    for attr in match_attributes:
-        if attr in entity_attributes:
-            # Coalesce to handle nulls
-            concat_cols.append(coalesce(col(f"merged_record.{attr}").cast("string"), lit("")))
-    
-    if concat_cols:
-        master_update_cols.append(
-            concat_ws(" | ", *concat_cols).alias("attributes_combined")
-        )
-        logger.info(f"  Generated attributes_combined from: {match_attributes}")
+    # Master rebuild after unmerge — survivorship may have produced a
+    # concat-aggregated multi-id value; helper splits and resolves each id.
+    master_update_cols.append(
+        build_attributes_combined_column(
+            spark=spark,
+            match_attributes=match_attributes,
+            entity_attributes=entity_attributes,
+            id_key=None,
+            reference_attribute_config=reference_attribute_config,
+            source_prefix="merged_record",
+        ).alias("attributes_combined")
+    )
+    logger.info(f"  Generated attributes_combined from: {match_attributes}")
     else:
         master_update_cols.append(lit("").alias("attributes_combined"))
         logger.warning("No valid match attributes found, using empty string")
@@ -732,6 +746,101 @@ try:
     logger.info(f"Steward decision written for MANUAL_UNMERGE master={master_id}")
 except Exception as e:
     logger.warning(f"Could not write steward decision: {e}")
+
+# COMMAND ----------
+
+# --- Update Golden Dedup Health ---
+logger.info("\n" + "="*80)
+logger.info("STEP: UPDATE GOLDEN DEDUP HEALTH")
+logger.info("="*80)
+
+try:
+    _gd_master_table = f"{catalog_name}.gold.{entity}_master"
+    _gd_unified_table = f"{catalog_name}.silver.{entity}_unified"
+    _gd_pm_dedup_table = f"{catalog_name}.gold.{entity}_master_potential_match_deduplicate"
+    if experiment_id:
+        _gd_master_table += f"_{experiment_id}"
+        _gd_unified_table += f"_{experiment_id}"
+        _gd_pm_dedup_table += f"_{experiment_id}"
+    _gd_ma_table = f"{_gd_master_table}_merge_activities"
+
+    if spark.catalog.tableExists(_gd_pm_dedup_table):
+        _gd_sk_list_sql = ", ".join(f"'{sk}'" for sk in unmerge_surrogate_keys)
+        _gd_affected = spark.sql(f"""
+            SELECT DISTINCT ma.master_id AS original_master
+            FROM {_gd_ma_table} ma
+            WHERE ma.match_id IN ({_gd_sk_list_sql})
+              AND ma.action_type IN ('JOB_INSERT','JOB_MERGE','MANUAL_MERGE','INITIAL_LOAD')
+              AND ma.master_id != '{master_id}'
+              AND ma.master_id NOT IN (SELECT lakefusion_id FROM {_gd_master_table})
+        """).collect()
+        _gd_affected_masters = [r['original_master'] for r in _gd_affected]
+
+        if not _gd_affected_masters:
+            logger.info("  No affected merged masters found in golden dedup, skipping")
+        else:
+            logger.info(f"  Affected merged masters: {_gd_affected_masters}")
+
+            for _gd_merged_id in _gd_affected_masters:
+                _gd_health = spark.sql(f"""
+                    WITH source_records AS (
+                        SELECT DISTINCT ma.match_id AS source_sk
+                        FROM {_gd_ma_table} ma
+                        WHERE ma.master_id = '{_gd_merged_id}'
+                          AND ma.action_type IN ('JOB_INSERT','JOB_MERGE','MANUAL_MERGE','INITIAL_LOAD')
+                          AND ma.match_id LIKE 'sk_%'
+                    )
+                    SELECT
+                        COUNT(DISTINCT sr.source_sk) AS total,
+                        COUNT(DISTINCT CASE
+                            WHEN u.master_lakefusion_id = '{master_id}' AND u.record_status != 'DELETED'
+                            THEN sr.source_sk END) AS remaining
+                    FROM source_records sr
+                    LEFT JOIN {_gd_unified_table} u ON u.{unified_id_key} = sr.source_sk
+                """).collect()[0]
+                _gd_remaining = _gd_health['remaining']
+                _gd_total = _gd_health['total']
+                logger.info(f"  Master {_gd_merged_id}: remaining={_gd_remaining}, total={_gd_total}")
+
+                if _gd_total == 0:
+                    logger.info(f"  No source records found for {_gd_merged_id}, skipping")
+                    continue
+                elif _gd_remaining == 0:
+                    logger.info(f"  Fully unmerged — removing {_gd_merged_id}")
+                    spark.sql(f"""
+                        UPDATE {_gd_pm_dedup_table}
+                        SET potential_matches = FILTER(potential_matches, x -> x.lakefusion_id != '{_gd_merged_id}')
+                        WHERE lakefusion_id = '{master_id}'
+                    """)
+                elif _gd_remaining < _gd_total:
+                    logger.info(f"  Partially merged — updating {_gd_merged_id} to MASTER_PARTIAL_MERGE ({_gd_remaining}/{_gd_total})")
+                    _gd_struct_parts = []
+                    for _gd_attr in entity_attributes:
+                        _gd_struct_parts.append(f"'{_gd_attr}', x.{_gd_attr}")
+                    _gd_struct_parts.extend([
+                        "'__score__', x.__score__",
+                        "'__reason__', x.__reason__",
+                        "'lakefusion_id', x.lakefusion_id",
+                        "'__mergestatus__', 'MASTER_PARTIAL_MERGE'",
+                        f"'__merge_remaining__', CAST({_gd_remaining} AS STRING)",
+                        f"'__merge_total__', CAST({_gd_total} AS STRING)",
+                        "'__attributes_combined__', x.__attributes_combined__",
+                    ])
+                    _gd_ns = f"named_struct({', '.join(_gd_struct_parts)})"
+                    spark.sql(f"""
+                        UPDATE {_gd_pm_dedup_table}
+                        SET potential_matches = TRANSFORM(potential_matches, x ->
+                            IF(x.lakefusion_id = '{_gd_merged_id}', {_gd_ns}, x))
+                        WHERE lakefusion_id = '{master_id}'
+                    """)
+                else:
+                    logger.info(f"  Still fully merged ({_gd_remaining}/{_gd_total}), no update needed")
+
+            logger.info("  Golden dedup health update complete")
+    else:
+        logger.info("  Golden dedup table does not exist, skipping")
+except Exception as e:
+    logger.warning(f"Golden dedup health update failed (non-fatal): {e}")
 
 # COMMAND ----------
 

@@ -65,6 +65,17 @@ primary_table = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", k
 primary_key = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="primary_key", debugValue=primary_key)
 dataset_tables = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="dataset_tables", debugValue=dataset_tables)
 attributes_mapping_json = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="attributes_mapping", debugValue=attributes_mapping_json)
+# full mapping records (with mode + sub_field_map) needed to
+# validate Sub-field Assembly source columns. Default to empty when not set.
+try:
+    attributes_mapping_full = json.loads(
+        dbutils.jobs.taskValues.get(
+            taskKey="Parse_Entity_Model_JSON", key="attributes_mapping_full", debugValue="[]"
+        )
+        or "[]"
+    )
+except Exception:
+    attributes_mapping_full = []
 catalog_name = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="catalog_name", debugValue=catalog_name)
  
 # Get values from Check_Increments_Exists
@@ -178,17 +189,39 @@ cdf_cache = {}
 # COMMAND ----------
 
 def get_mapping_for_table(source_table):
-    """Get attribute mapping for a source table. Returns {entity_attr: dataset_attr}."""
+    """Get attribute mapping for a source table.
+
+    Returns ``{entity_attr: dataset_attr}``. For Sub-field Assembly mappings
+    the legacy ``attributes_mapping`` only carries the last sub-field value,
+    so we *also* fold in every source column referenced by ``sub_field_map``
+    keyed under a synthetic ``__sub_field__<entity_attr>__<sub_field>``
+    entry so schema-drift / column-existence checks catch missing source
+    columns for those targets too.
+    """
+    def _augment_with_subfields(base_map: dict, table_path_to_match: str) -> dict:
+        out = dict(base_map or {})
+        for entry in attributes_mapping_full:
+            for tbl_path, records in entry.items():
+                if tbl_path != table_path_to_match:
+                    continue
+                for rec in records or []:
+                    if (rec.get("mode") == "subfield_assembly") and rec.get("sub_field_map"):
+                        ent_attr = rec.get("entity_attribute") or "?"
+                        for sf_name, src_col in rec["sub_field_map"].items():
+                            if src_col:
+                                out[f"__sub_field__{ent_attr}__{sf_name}"] = src_col
+        return out
+
     # Pass 1: exact match
     for mapping_entry in attributes_mapping_json:
         for table_path, mapping in mapping_entry.items():
             if table_path == source_table:
-                return mapping
+                return _augment_with_subfields(mapping, table_path)
     # Pass 2: _cleaned suffix match (for DQ-enabled tables)
     for mapping_entry in attributes_mapping_json:
         for table_path, mapping in mapping_entry.items():
             if source_table == f"{table_path}_cleaned":
-                return mapping
+                return _augment_with_subfields(mapping, table_path)
     return None
 
 

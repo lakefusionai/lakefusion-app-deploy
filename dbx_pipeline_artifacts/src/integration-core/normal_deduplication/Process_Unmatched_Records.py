@@ -33,12 +33,43 @@ match_attributes = dbutils.jobs.taskValues.get(
     key="match_attributes",
     debugValue=dbutils.widgets.get("match_attributes")
 )
+entity_attribute_records_raw = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON", "entity_attribute_records", debugValue="[]",
+)
+reference_attribute_config = dbutils.jobs.taskValues.get(
+    "Parse_Entity_Model_JSON", "reference_attribute_config", debugValue="{}",
+)
 
 # COMMAND ----------
+
+
 
 # Parse JSON parameters
 entity_attributes = json.loads(entity_attributes)
 match_attributes = json.loads(match_attributes)
+reference_attribute_config = (
+    json.loads(reference_attribute_config)
+    if isinstance(reference_attribute_config, str)
+    else (reference_attribute_config or {})
+)
+try:
+    entity_attribute_records = json.loads(entity_attribute_records_raw) if entity_attribute_records_raw else []
+except Exception:
+    entity_attribute_records = []
+
+# Make utils importable for build_attributes_combined_column.
+import os as _pp_os, sys as _pp_sys
+_pp_parts = _pp_os.getcwd().split(_pp_os.sep)
+for _i in range(len(_pp_parts) - 1, -1, -1):
+    if _pp_parts[_i] == "src":
+        _src_path = _pp_os.sep.join(_pp_parts[: _i + 1])
+        if _src_path not in _pp_sys.path:
+            _pp_sys.path.insert(0, _src_path)
+        break
+
+# COMMAND ----------
+
+# MAGIC %run ../../utils/attributes_combined
 
 # COMMAND ----------
 
@@ -153,14 +184,17 @@ from pyspark.sql.functions import concat_ws, coalesce
 # Select entity attributes plus lakefusion_id
 master_columns = [id_key] + [attr for attr in entity_attributes if attr != id_key]
 
-# Create attributes_combined by concatenating all attributes (except lakefusion_id)
+# Complex-type aware attributes_combined: STRUCT collapses to space-joined
+# sub-fields, ARRAY/ARRAY<STRUCT> JSON-serialize, scalars cast to string.
 combine_attrs = [attr for attr in match_attributes]
-
-new_masters_df = unmatched_with_id_df.select(*master_columns) \
-    .withColumn(
-        "attributes_combined",
-        concat_ws(" | ", *[coalesce(col(attr).cast("string"), lit("")) for attr in combine_attrs])
-    )
+new_masters_pre = unmatched_with_id_df.select(*master_columns)
+# Resolve REFERENCE_ENTITY attrs (ref_lakefusion_id -> display) into
+# attributes_combined; the raw {attr} columns stay as ref ids. These unmatched
+# unified rows carry ref ids (no __display), so join the ref table.
+new_masters_df = add_attributes_combined(
+    new_masters_pre, combine_attrs, entity_attribute_records,
+    reference_attribute_config=reference_attribute_config, spark=spark,
+)
 
 logger.info("Prepared new master records")
 logger.info(f"  Columns: {', '.join(master_columns + ['attributes_combined'])}")

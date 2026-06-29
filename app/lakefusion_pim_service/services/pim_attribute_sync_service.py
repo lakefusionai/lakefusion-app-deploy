@@ -101,25 +101,6 @@ class PimAttributeSyncService:
             new_is_localizable = bool(type_config.get("is_localizable", False)) if isinstance(type_config, dict) else False
             new_level = type_config.get("level", None) if isinstance(type_config, dict) else None
 
-            changed = False
-            if existing.label != label:
-                existing.label = label
-                changed = True
-            if existing.data_type != pim_type:
-                existing.data_type = pim_type
-                changed = True
-            if existing.group != new_group:
-                existing.group = new_group
-                changed = True
-            if existing.is_localizable != new_is_localizable:
-                existing.is_localizable = new_is_localizable
-                changed = True
-            if existing.display_order != new_display_order:
-                existing.display_order = new_display_order
-                changed = True
-            if new_level and existing.level != new_level:
-                existing.level = new_level
-                changed = True
             new_is_identifier = bool(attr_data.get("is_primary_key", False))
             new_is_label = bool(attr_data.get("is_label", False))
 

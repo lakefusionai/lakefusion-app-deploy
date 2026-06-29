@@ -206,7 +206,20 @@ def update_dataset_records(token: str, db, dataset_id: int, warehouse_id: str, p
         
         # Initialize DataSetSQLService to execute SQL queries on the dataset
         sqlservice_conn = DataSetSQLService(token, warehouse_id)
-        
+
+        # Fetch column DDL types (e.g. STRUCT<street: STRING, ...>, ARRAY<STRING>).
+        # Binding a Python dict/list as a parameter makes Databricks infer
+        # MAP<VOID,VOID> / array(), which mismatches the real STRUCT/ARRAY column
+        # type. We rebuild those values with from_json(?, '<ddl>') instead.
+        col_ddl_types = {}
+        try:
+            w = _create_workspace_client(token)
+            table_info = w.tables.get(full_name=dataset.path)
+            for c in (table_info.columns or []):
+                col_ddl_types[c.name] = (getattr(c, "type_text", None) or "").strip()
+        except Exception as type_err:
+            app_logger.warning(f"Column type fetch failed (non-fatal): {type_err}")
+
         # Use all updates without validation check
         valid_updates = updates
         
@@ -227,8 +240,22 @@ def update_dataset_records(token: str, db, dataset_id: int, warehouse_id: str, p
                 data = update.get('data', {})
                 
                 if column in data:
-                    case_when_parts.append(f"WHEN {common_utils.apply_tilde(primary_field)} = ? THEN ?")
-                    query_parameters.extend([primary_field_value, data[column]])
+                    value = data[column]
+                    ddl = col_ddl_types.get(column, "")
+                    # STRUCT / ARRAY / MAP values: rebuild from JSON so the type
+                    # matches the column instead of binding a raw dict/list.
+                    if isinstance(value, (dict, list)) and ddl:
+                        ddl_literal = ddl.replace("'", "\\'")
+                        case_when_parts.append(
+                            f"WHEN {common_utils.apply_tilde(primary_field)} = ? "
+                            f"THEN from_json(?, '{ddl_literal}')"
+                        )
+                        query_parameters.extend([primary_field_value, json.dumps(value)])
+                    else:
+                        case_when_parts.append(
+                            f"WHEN {common_utils.apply_tilde(primary_field)} = ? THEN ?"
+                        )
+                        query_parameters.extend([primary_field_value, value])
             
             if case_when_parts:
                 case_when_clause = f"""

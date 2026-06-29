@@ -493,6 +493,7 @@ class PimAttributeService:
                         "code": code, "label": data.label, "data_type": data.data_type or 'TEXT',
                         "description": data.description, "is_localizable": data.is_localizable,
                         "level": level, "scope": data.scope or 'specifications',
+                        "is_system": False, "is_identifier": False, "is_label": False,
                         "group": group, "display_order": data.display_order or 0,
                     },
                 )

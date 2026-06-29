@@ -409,8 +409,18 @@ for source_table in tables_with_updates:
     logger.info(f" Processing: {source_table}")
     logger.info(f"{'='*60}")
 
-    # Pull this source's dataset_id (drives RDM mapping lookups via rdm_configs)
-    source_id_for_resolver = (dataset_objects.get(source_table) or {}).get("id")
+    # Derive this source's dataset_id the SAME way rdm_configs is keyed (by
+    # source_table). resolve_reference_attributes filters its configs with
+    # `cfg["source_id"] == source_id`, so the id passed here MUST equal the
+    # configs' source_id. Reading it from dataset_objects[...]["id"] can yield a
+    # different value than rdm_configs' source_id (which prefers the top-level
+    # dataset_id), which makes the resolver a silent no-op — leaving the raw
+    # source value (not ref_lakefusion_id) in the column. Mirrors the working
+    # primary path in Load_Primary_Source.
+    source_id_for_resolver = next(
+        (cfg["source_id"] for cfg in rdm_configs if cfg.get("source_table") == source_table),
+        None,
+    )
 
     version_info = table_version_info.get(source_table)
     
@@ -652,9 +662,13 @@ for source_table in tables_with_updates:
             src = display_col if display_col in df_transformed.columns else c
             concat_inputs.append(regexp_replace(trim(col(src).cast("string")), r'\s+', ' '))
 
+        # Use concat_inputs (the resolver's <attr>__display value for REF attrs)
+        # — NOT the raw columns — so attributes_combined carries the
+        # human-readable display value, never the ref_lakefusion_id baked into
+        # {attr}.
         df_transformed = df_transformed.withColumn(
             "attributes_combined",
-            concat_ws(" | ", *[coalesce(regexp_replace(trim(col(c)), r'\s+', ' '), lit("")) for c in available_attributes])
+            concat_ws(" | ", *[coalesce(ci, lit("")) for ci in concat_inputs])
         )
 
         # Drop the resolver's __display columns before downstream writes

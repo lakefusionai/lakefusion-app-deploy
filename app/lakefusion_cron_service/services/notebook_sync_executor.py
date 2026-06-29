@@ -234,9 +234,10 @@ def _compute_survivorship_hash() -> str:
         from lakefusion_core_engine.survivorship.strategies import source_system_strategy as source_mod
         from lakefusion_core_engine.survivorship.strategies import aggregation_strategy as agg_mod
         from lakefusion_core_engine.survivorship.strategies import frequency_strategy as freq_mod
+        from lakefusion_core_engine.survivorship.strategies import struct_merge_strategy as struct_mod
 
         modules = [helpers_mod, config_mod, result_mod, base_mod,
-                   recency_mod, source_mod, agg_mod, freq_mod, engine_mod]
+                   recency_mod, source_mod, agg_mod, freq_mod, struct_mod, engine_mod]
         combined = "".join(inspect.getsource(mod) for mod in modules)
         return hashlib.md5(combined.encode()).hexdigest()
     except Exception as e:

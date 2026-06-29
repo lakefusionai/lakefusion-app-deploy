@@ -18,8 +18,9 @@ gap:
   4. Promotes rows now resolving to an approved status (AUTO_APPROVED / KEEP_RDM
      / APPROVED / MANUALLY_ADDED) into unified
      (and into master, if they came from the primary source)
-  5. Deletes the promoted entries from the error log
-  6. Re-logs still-pending rows with the latest error_message
+  5. Deletes from the error log ONLY the entries whose mapping is now approved
+     (fully resolved). Still-pending rows are left untouched so they stay
+     flagged for the steward and are re-evaluated on the next incremental run.
 
 Schema-compatible with both normal_dedup ({entity}_unified) and golden_dedup
 ({entity}_unified_deduplicate). Driven by the is_single_source task value.
@@ -47,7 +48,6 @@ setup_lakefusion_engine()
 
 from lakefusion_core_engine.identifiers import generate_surrogate_key, generate_lakefusion_id
 from lakefusion_core_engine.models import RecordStatus
-from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # COMMAND ----------
 
@@ -293,8 +293,9 @@ def _project_to_table_schema(df, target_table):
 
 promoted_unified_dfs = []      # ready-to-append to unified
 promoted_master_dfs = []       # ready-to-append to master (primary source only)
-all_promoted_keys = []         # collected for error-log cleanup
-still_pending_dfs = []         # to re-log with fresh error_message
+resolved_keys_dfs = []         # surrogate_keys whose mapping is now APPROVED
+                               # (fully resolved) — the ONLY keys cleared from
+                               # the error log
 
 for source_table in dataset_tables:
     logger.info(f"\n--- Processing source: {source_table} ---")
@@ -355,8 +356,16 @@ for source_table in dataset_tables:
         continue
     logger.info(f"  Re-resolving {candidate_count} candidate rows")
 
-    # Re-run RDM resolver against the (now-updated) mapping table
-    source_id_for_resolver = (dataset_objects.get(source_table) or {}).get("id")
+    # Re-run RDM resolver against the (now-updated) mapping table.
+    # Derive source_id the SAME way rdm_configs is keyed (by source_table) so
+    # the resolver's `cfg["source_id"] == source_id` filter matches its configs.
+    # dataset_objects[...]["id"] can differ from rdm_configs' source_id, making
+    # the resolver a no-op — which would return ALL candidates as "approved"
+    # (empty pending) and wrongly clear every RDM error entry.
+    source_id_for_resolver = next(
+        (cfg["source_id"] for cfg in rdm_configs if cfg.get("source_table") == source_table),
+        None,
+    )
     approved_df, still_pending_df = resolve_reference_attributes(
         spark, candidates_df, rdm_configs, source_id=source_id_for_resolver,
     )
@@ -387,10 +396,20 @@ for source_table in dataset_tables:
             )
 
         promoted_unified_dfs.append(approved_df)
-        all_promoted_keys.append(approved_df.select("surrogate_key"))
 
-    if pending_count > 0:
-        still_pending_dfs.append(still_pending_df)
+        # Clear from the error log ONLY rows that are now FULLY resolved.
+        # Under the keep_null action, approved_df also retains rows whose ref
+        # attr is still unresolved (kept in master, attr nulled) — those rows
+        # also appear in still_pending_df and MUST stay flagged. Subtract them
+        # so a still-pending record's error entry is never deleted.
+        resolved_keys_df = approved_df.select("surrogate_key")
+        if still_pending_df is not None and pending_count > 0:
+            resolved_keys_df = resolved_keys_df.join(
+                still_pending_df.select("surrogate_key"),
+                on="surrogate_key",
+                how="left_anti",
+            )
+        resolved_keys_dfs.append(resolved_keys_df)
 
 # COMMAND ----------
 
@@ -467,51 +486,37 @@ logger.info(
 
 # COMMAND ----------
 
-# DBTITLE 1, Delete promoted entries from the error log
+# DBTITLE 1, Delete ONLY now-approved (fully-resolved) entries from the error log
 
-if all_promoted_keys:
-    promoted_keys_df = all_promoted_keys[0]
-    for d in all_promoted_keys[1:]:
-        promoted_keys_df = promoted_keys_df.unionByName(d)
-    promoted_keys_df = promoted_keys_df.distinct()
+if resolved_keys_dfs:
+    resolved_keys_df = resolved_keys_dfs[0]
+    for d in resolved_keys_dfs[1:]:
+        resolved_keys_df = resolved_keys_df.unionByName(d)
+    resolved_keys_df = resolved_keys_df.distinct()
 
     delta_error = DeltaTable.forName(spark, error_table)
     (
         delta_error.alias("e")
         .merge(
-            promoted_keys_df.alias("p"),
+            resolved_keys_df.alias("p"),
             "e.surrogate_key = p.surrogate_key AND e.error_stage = 'RDM'",
         )
         .whenMatchedDelete()
         .execute()
     )
-    logger.info(f"Cleared {promoted_keys_df.count()} entries from error log")
+    logger.info(f"Cleared {resolved_keys_df.count()} now-approved entries from error log")
 else:
-    logger.info("No entries to clear from error log")
+    logger.info("No approved entries to clear from error log")
 
 # COMMAND ----------
 
-# DBTITLE 1, Re-log still-pending rows with fresh error_message
-
-if still_pending_dfs:
-    still_pending_df = still_pending_dfs[0]
-    for d in still_pending_dfs[1:]:
-        still_pending_df = still_pending_df.unionByName(d)
-
-    if not still_pending_df.isEmpty():
-        handler = UnifiedErrorHandler(spark, unified_table)
-        handler.log_errors(
-            still_pending_df.select(
-                F.col("surrogate_key"),
-                F.col("_rdm_pending_reason").alias("error_message"),
-            ),
-            stage="RDM",
-            run_id=run_id,
-        )
-        logger.info(
-            f"Re-logged {still_pending_df.count()} still-pending rows "
-            f"to unified error table (stage=RDM)"
-        )
+# DBTITLE 1, Still-pending rows are left in place
+# Still-pending RDM rows are intentionally LEFT untouched in the error log:
+# their entries were never deleted above, so they stay flagged for the steward
+# and are re-evaluated on the next incremental run. (Previously they were
+# deleted alongside the approved rows and then re-logged — which churned
+# run_id/timestamp, created duplicate entries, and risked permanent data loss
+# if the re-log failed after the delete had already committed.)
 
 # COMMAND ----------
 

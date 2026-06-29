@@ -255,15 +255,6 @@ for _i in range(len(_pp_parts) - 1, -1, -1):
             _pp_sys.path.insert(0, _src_path)
         break
 
-# run_id used by UnifiedErrorHandler when routing PENDING / NO_MATCH rows
-try:
-    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
-except Exception:
-    import uuid as _uuid_mod
-    run_id = str(_uuid_mod.uuid4())
-
-from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
-
 # Parse processed_records - format: "[start, end]" or "[0, 2000]"
 processed_records = json.loads(processed_records) if processed_records else [0, 2000]
 record_start = processed_records[0]
@@ -460,21 +451,31 @@ def create_attributes_combined(df, combine_attrs, source_id):
     attributes_combined using the canonical display value for REF attrs and
     raw value for the rest.
 
+    Match Maven NEVER filters records to the error table or holds them back
+    from master/unified — for BOTH keep_null and move_to_error configs. (Only
+    the integration-hub pipeline honours move_to_error and routes those rows to
+    the error table.) So we force keep_null semantics for every ref attr: the
+    resolver keeps ALL rows and simply nulls any unresolved ref attr. Its
+    pending DataFrame is discarded — nothing is logged to the error table here.
+
     Args:
         df: DataFrame with match attribute columns
         combine_attrs: List of attribute names to combine into attributes_combined
         source_id: dataset_id of the source being loaded; drives mapping lookup
 
     Returns:
-        (approved_df, pending_df) where:
-          - approved_df has attributes_combined and REF columns replaced with
-            ref_lakefusion_id; safe to write to unified/master.
-          - pending_df holds rows whose REF attrs are PENDING / NO_MATCH; caller
-            routes them to UnifiedErrorHandler with stage="RDM" using
-            log_rdm_pending().
+        df with attributes_combined and REF columns replaced with
+        ref_lakefusion_id (unresolved ref attrs nulled); every input row is
+        retained — safe to write to unified/master.
     """
-    df, pending_df = resolve_reference_attributes(
-        spark, df, rdm_configs, source_id=source_id
+    # Force keep_null for every ref attr so move_to_error does NOT exclude any
+    # row in Match Maven; the resolver then keeps all rows and nulls unresolved
+    # attrs. The returned pending_df is intentionally ignored (no error table).
+    maven_rdm_configs = [
+        {**cfg, "unresolved_action": "keep_null"} for cfg in (rdm_configs or [])
+    ]
+    df, _pending_df = resolve_reference_attributes(
+        spark, df, maven_rdm_configs, source_id=source_id
     )
 
     # Complex-type aware combined string. STRUCT collapses to space-joined
@@ -528,27 +529,7 @@ def create_attributes_combined(df, combine_attrs, source_id):
         if display_col in df.columns:
             df = df.drop(display_col)
 
-    return df, pending_df
-
-
-def log_rdm_pending(pending_df, target_unified_table):
-    """Route PENDING / NO_MATCH rows to the unified error log (stage=RDM).
-
-    The unified error table sits alongside `target_unified_table` so master
-    inserts and unified inserts share the same error-handler context.
-    """
-    if pending_df is None or pending_df.isEmpty():
-        return
-    handler = UnifiedErrorHandler(spark, target_unified_table)
-    handler.log_errors(
-        pending_df.select(
-            col("surrogate_key"),
-            col("_rdm_pending_reason").alias("error_message"),
-        ),
-        stage="RDM",
-        run_id=run_id,
-    )
-    logger.info(f"  Logged {pending_df.count()} PENDING / NO_MATCH rows to unified error table (stage=RDM)")
+    return df
 
 # COMMAND ----------
 
@@ -607,7 +588,7 @@ if is_single_source:
     # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
     combine_attrs = [attr for attr in match_attributes if attr in id_df.columns]
     primary_source_id = (dataset_objects.get(primary_table) or {}).get("id")
-    id_df, id_pending_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
+    id_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
 
     # Prepare master insert
     master_columns = ["lakefusion_id"] + [attr for attr in entity_attributes if attr != "lakefusion_id"] + ["attributes_combined"]
@@ -615,9 +596,6 @@ if is_single_source:
 
     # Insert into master table
     master_insert_df.write.format("delta").mode("append").saveAsTable(master_table)
-
-    # Route PENDING / NO_MATCH rows to the unified error log
-    log_rdm_pending(id_pending_df, unified_dedup_table)
 
     # Now clone master to unified_dedup for self-comparison
     logger.info("\n" + "-"*60)
@@ -689,16 +667,13 @@ if not is_single_source:
         # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
         combine_attrs = [attr for attr in match_attributes if attr in id_df.columns]
         primary_source_id = (dataset_objects.get(primary_table) or {}).get("id")
-        id_df, id_pending_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
+        id_df = create_attributes_combined(id_df, combine_attrs, primary_source_id)
 
         # Prepare and insert into master
         master_columns = ["lakefusion_id"] + [attr for attr in entity_attributes if attr != "lakefusion_id"] + ["attributes_combined"]
         master_insert_df = id_df.select(*master_columns)
 
         master_insert_df.write.format("delta").mode("append").saveAsTable(master_table)
-
-        # Route PENDING / NO_MATCH rows to the unified error log
-        log_rdm_pending(id_pending_df, unified_table)
 
         # NOTE: In the experiment pipeline, primary records do NOT go into Unified.
         # - Multi-source: Only secondary records go to Unified (with ACTIVE status)
@@ -802,12 +777,9 @@ if not is_single_source:
             # Create attributes_combined (resolves REFERENCE_ENTITY attrs via mapping table)
             combine_attrs = [attr for attr in match_attributes if attr in mapped_df.columns]
             secondary_source_id = (dataset_objects.get(secondary_table) or {}).get("id")
-            mapped_df, mapped_pending_df = create_attributes_combined(
+            mapped_df = create_attributes_combined(
                 mapped_df, combine_attrs, secondary_source_id
             )
-
-            # Route PENDING / NO_MATCH rows to the unified error log
-            log_rdm_pending(mapped_pending_df, unified_table)
 
             # Prepare for unified insert (SIMPLIFIED - no master_lakefusion_id)
             unified_select_cols = [

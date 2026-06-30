@@ -5,6 +5,7 @@ from lakefusion_utility.utils.logging_utils import get_logger
 from lakefusion_utility.utils.databricks_util import DataSetSQLService, ComputeService, CommonUtilities, _create_workspace_client
 from lakefusion_utility.models.httpresponse import HttpResponse
 from lakefusion_utility.services.dataset_service import DatasetService
+from lakefusion_utility.services._filter_sql import build_single_filter_sql
 from lakefusion_utility.services.quality_tasks import QualityTaskService
 from lakefusion_utility.utils.dbx_error_handler import raise_on_dbx_permission_error
 from databricks import sql
@@ -42,59 +43,22 @@ def build_filter_clauses(filters):
                 return "", []
                 
             filter_clauses = []
-            for i, filter_item in enumerate(filters):
-                attribute_name = filter_item.get('attributeName')
-                operator = filter_item.get('operator')
-                value = filter_item.get('value')
+            for filter_item in filters:
                 conjunction = filter_item.get('conjunction', 'AND')
-                
-                if not attribute_name or not operator:
-                    continue
-                    
-                # column = f"{table_prefix}.{attribute_name}"
-                
-                sql_clause = ""
-                
-                # Text/String operators
-                if operator == 'eq':  # is equal to
-                    sql_clause = f"{attribute_name} = '{value}'"
-                elif operator == 'neq':  # is not equal to
-                    sql_clause = f"{attribute_name} != '{value}'"
-                elif operator == 'contains':  # contains
-                    sql_clause = f"{attribute_name} LIKE '%{value}%'"
-                elif operator == 'icontains':  # contains (case-insensitive)
-                    sql_clause = f"{attribute_name} ILIKE '%{value}%'"
-                elif operator == 'not_contains':  # does not contain
-                    sql_clause = f"{attribute_name} NOT LIKE '%{value}%'"
-                elif operator == 'starts_with':  # starts with
-                    sql_clause = f"{attribute_name} LIKE '{value}%'"
-                elif operator == 'ends_with':  # ends with
-                    sql_clause = f"{attribute_name} LIKE '%{value}'"
-                
-                # Numeric operators
-                elif operator == 'gt':  # is greater than
-                    sql_clause = f"{attribute_name} > {value}"
-                elif operator == 'lt':  # is less than
-                    sql_clause = f"{attribute_name} < {value}"
-                elif operator == 'gte':  # is greater than or equal to
-                    sql_clause = f"{attribute_name} >= {value}"
-                elif operator == 'lte':  # is less than or equal to
-                    sql_clause = f"{attribute_name} <= {value}"
-                
-                # Null operators
-                elif operator == 'is_null':  # is null
-                    sql_clause = f"{attribute_name} IS NULL"
-                elif operator == 'is_not_null':  # is not null
-                    sql_clause = f"{attribute_name} IS NOT NULL"
-                
-                # Boolean operators
-                elif operator == 'eq_true':  # is true
-                    sql_clause = f"{attribute_name} = TRUE"
-                elif operator == 'eq_false':  # is false
-                    sql_clause = f"{attribute_name} = FALSE"
-                
+                if conjunction.upper() not in ('AND', 'OR'):
+                    conjunction = 'AND'
+
+                # Type-aware, injection-safe SQL generation (scalar / struct
+                # field / array EXISTS) is centralized in the shared builder —
+                # the same one Entity Search uses — so complex (ARRAY/STRUCT)
+                # columns no longer get a bare `col = 'x'` that raises
+                # DATATYPE_MISMATCH. No table prefix here (SELECT * FROM table).
+                sql_clause = build_single_filter_sql(filter_item, table_prefix=None)
+
                 if sql_clause:
-                    if i > 0:
+                    # Emit a conjunction only once a left-hand clause exists, so a
+                    # skipped (unsupported) leading filter can't produce "AND ...".
+                    if filter_clauses:
                         filter_clauses.append(conjunction)
                     filter_clauses.append(sql_clause)
             

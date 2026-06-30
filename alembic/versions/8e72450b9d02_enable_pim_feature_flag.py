@@ -5,8 +5,8 @@ Revises: d33c14388fed
 Create Date: 2026-04-17 16:03:21.154592
 
 Adds ENABLE_PIM feature flag to gate PIM (Product Information Management) endpoints.
-- ACTIVE (default): PIM module is accessible
-- INACTIVE: All PIM endpoints return 404
+- INACTIVE (default): All PIM endpoints return 404 — PIM is opt-in per customer.
+- ACTIVE: PIM module is accessible (set when a customer subscribes to PIM).
 """
 from typing import Sequence, Union
 
@@ -33,7 +33,7 @@ def upgrade() -> None:
         conn.execute(sa.text(
             "INSERT INTO feature_flags "
             "(name, status, description, owner_team, created_at, updated_at, expires_at) "
-            "VALUES ('ENABLE_PIM', 'ACTIVE', :desc, 'LakeFusion', "
+            "VALUES ('ENABLE_PIM', 'INACTIVE', :desc, 'LakeFusion', "
             "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)"
         ), {"desc": "Enables PIM (Product Information Management) module — taxonomy, attributes, products, and pricing endpoints"})
 

@@ -5,9 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Body
 from lakefusion_utility.services.validation_functions_service import ValidationFunctionsService
 from sqlalchemy.orm import Session
 from app.lakefusion_middlelayer_service.utils.app_db import get_db,token_required_wrapper  # Importing get_db from the specified location
-from lakefusion_utility.models.entity import Entity, EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityAttributeReorderRequest, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags, EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse  # Import your Pydantic models
+from lakefusion_utility.models.entity import Entity, EntityCreate, EntityResponse,EntityDnBCreate, EntityAttributeCreate, EntityAttributeResponse, EntityAttributeReorderRequest, EntityDatasetMappingCreate, EntityDatasetMappingResponse,EntityResponseTags, EntityDnBCreate,EntityDnBResponse, SurvivorshipRulesCreate, SurvivorshipRulesResponse, ValidationFunctionCreate, ValidationFunctionResponse, MappingSuggestionRequest, MappingSuggestionResponse  # Import your Pydantic models
 from lakefusion_utility.models.api_response import ApiResponse
-from lakefusion_utility.services.entity_service import EntityService, EntityDnBService, EntityAttributeService, SurvivorshipRuleService, EntityDatasetMappingService # Import the EntityService class
+from lakefusion_utility.services.entity_service import EntityService, EntityDnBService, EntityAttributeService, SurvivorshipRuleService, EntityDatasetMappingService, MappingSuggestionService # Import the EntityService class
 from fastapi.responses import FileResponse
 from typing import List, Optional
 from lakefusion_utility.utils.logging_utils import get_logger
@@ -262,6 +262,19 @@ def get_entity_dataset_mapping_by_id(entity_id: int,dataset_id:int, db: Session 
     if Entity is None:
         raise HTTPException(status_code=404, detail="Entity not found")
     return Entity
+
+
+# AI-Assisted Mapping Suggestion
+@entity_router.post("/suggest-mapping", response_model=MappingSuggestionResponse)
+def suggest_mapping(request: MappingSuggestionRequest, check: dict = Depends(token_required_wrapper)):
+    token = check.get('token', '')
+    service = MappingSuggestionService(token, request.warehouse_id)
+    return service.suggest_mappings(
+        entity_attributes=[attr.model_dump() for attr in request.entity_attributes],
+        dataset_columns=[col.model_dump() for col in request.dataset_columns],
+        dataset_path=request.dataset_path,
+        llm_endpoint=request.llm_endpoint,
+    )
 
 # Toggle `is_active` flag for a Entity
 @entity_router.patch("/{entity_id}/attributemapping/toggle", response_model=EntityAttributeResponse)

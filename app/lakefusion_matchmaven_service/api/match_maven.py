@@ -26,6 +26,13 @@ def list_foundation_model(check: dict = Depends(token_required_wrapper)):
     list_foundation_model = FoundationModelService(token)
     return list_foundation_model.list_foundation_models()
 
+@match_maven_router.get("/serving-endpoints")
+def list_all_serving_endpoints(check: dict = Depends(token_required_wrapper)):
+    """List all model serving endpoints (foundation, external, custom)."""
+    token = check.get('token')
+    service = FoundationModelService(token)
+    return service.list_all_serving_endpoints()
+
 @match_maven_router.get("/vs-endpoint")
 def list_foundation_model(check: dict = Depends(token_required_wrapper)):
     """

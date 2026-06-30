@@ -154,41 +154,73 @@ def remove_primary_from_attr_mapping(attributes_mapping_json):
 
 # COMMAND ----------
 
-from pyspark.sql.functions import udf, col
-from pyspark.sql.types import BooleanType
+from pyspark.sql.functions import expr
 import re
 
+# attr_name is interpolated into the SQL DDL used to register the temporary
+# Python UDF, so restrict it to a plain identifier (SQL-injection guard).
+_SAFE_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 def validation_function_exec(validation_function_list, df):
-
+    # Each rule's customer-supplied function_definition is registered as a Unity
+    # Catalog temporary Python UDF (LANGUAGE PYTHON) and applied to the target
+    # column, rather than run with exec() on the driver. A UC Python UDF runs in
+    # a sandboxed worker process with no access to dbutils, secrets, the
+    # filesystem, or internal services, so a malicious validation function
+    # cannot read the App service principal's credentials. Requires Unity
+    # Catalog + DBR 13.3 LTS+ (or a serverless/pro SQL warehouse).
     for rule in validation_function_list:
+        attr_name = rule["attribute_name"]
 
-        local_ns = {}
-
-        # execute function definition
-        exec(rule["function_definition"], {"re": re}, local_ns)
-
-        # get first callable function
-        functions = [
-            v for v in local_ns.values()
-            if callable(v)
-        ]
-
-        if not functions:
+        if not _SAFE_IDENTIFIER.match(attr_name or ""):
             raise ValueError(
-                f"No function found in rule {rule['validation_id']}"
+                f"Unsafe attribute_name for validation UDF: {attr_name!r}"
             )
 
-        validation_function = functions[0]
+        # Declare the UDF parameter with the column's own Spark type so the
+        # function receives the same Python type it did under udf().
+        sql_type = df.schema[attr_name].dataType.simpleString()
+        udf_name = f"lf_validate_{attr_name}"
 
-        # IMPORTANT FIX
-        validation_function.__module__ = "__main__"
+        # Resolve the validation function by its declared name; fall back to the
+        # first function defined when the name is missing/non-identifier (the
+        # old behavior). Only a plain identifier is embedded, so function_name
+        # can't break out of the $$-quoted body. `re`/`datetime` were implicitly
+        # available under the old exec; inject them so existing functions keep
+        # working unchanged.
+        fn_name = rule.get("function_name")
+        safe_fn_name = fn_name if _SAFE_IDENTIFIER.match(fn_name or "") else None
 
-        # create udf
-        validate_udf = udf(validation_function, BooleanType())
+        # A bare $$ in the customer-supplied function_definition would terminate
+        # the dollar-quoted SQL string early and let arbitrary DDL run in the
+        # Spark session *before* the UC sandbox is entered. Reject it.
+        if "$$" in rule["function_definition"]:
+            raise ValueError(
+                "function_definition may not contain '$$' "
+                "(would break out of the dollar-quoted UDF body)"
+            )
+        body = (
+            "import re\n"
+            "import types\n"
+            "from datetime import datetime\n"
+            f"{rule['function_definition']}\n"
+            f"_lf_fn = locals().get({safe_fn_name!r})\n"
+            "if not isinstance(_lf_fn, types.FunctionType):\n"
+            "    _lf_cands = [v for v in list(locals().values()) "
+            "if isinstance(v, types.FunctionType)]\n"
+            "    if not _lf_cands:\n"
+            "        raise ValueError('No function defined in function_definition')\n"
+            "    _lf_fn = _lf_cands[0]\n"
+            "return _lf_fn(value)\n"
+        )
+        spark.sql(
+            f"CREATE OR REPLACE TEMPORARY FUNCTION {udf_name}(value {sql_type}) "
+            f"RETURNS BOOLEAN LANGUAGE PYTHON AS $$\n{body}$$"
+        )
 
         df = df.withColumn(
             f"is_valid_{rule['attribute_name']}",
-            validate_udf(col(rule["attribute_name"]))
+            expr(f"{udf_name}(`{attr_name}`)")
         )
 
     df = df.drop(

@@ -16,6 +16,7 @@ from fastapi import HTTPException
 from mlflow.deployments import get_deploy_client
 
 from lakefusion_utility.utils.logging_utils import get_logger
+from lakefusion_utility.utils.databricks_util import get_app_sp_token, generate_pat
 from app.lakefusion_matchmaven_service.services.llm_response_parser import (
     LLMResponseParser,
     ResultNormalizer,
@@ -73,15 +74,25 @@ class LLMService:
             else None
         )
 
-    def _setup_environment(self, token: str) -> None:
-        """Set up environment for MLflow client."""
-        os.environ['DATABRICKS_TOKEN'] = token
+    def _setup_environment(self) -> None:
+        """Authenticate the MLflow deploy client as the App service principal.
+
+        Uses the app SP token (LAKEFUSION_DATABRICKS_DAPI in K8s/local-dev, a
+        freshly minted App-SP OAuth token in Databricks Apps) instead of the
+        caller's bearer token, mirroring how cron jobs and entity_search
+        authenticate to Databricks. The caller's token only gates access to
+        this feature (see execute); it is never used as the Databricks
+        credential.
+        """
+        sp_token = get_app_sp_token() or generate_pat()
+        if sp_token:
+            os.environ['DATABRICKS_TOKEN'] = sp_token
         if not os.environ.get('DATABRICKS_HOST'):
             os.environ['DATABRICKS_HOST'] = DATABRICKS_HOST
 
-    def _check_endpoint(self, endpoint: str, token: str) -> bool:
+    def _check_endpoint(self, endpoint: str) -> bool:
         """Check if endpoint is ready."""
-        self._setup_environment(token)
+        self._setup_environment()
         client = get_deploy_client("databricks")
         start = time.time()
         timeout = self.config.endpoint_check_timeout
@@ -130,10 +141,10 @@ class LLMService:
 
         endpoint = llm_endpoint or self.config.default_endpoint
 
-        if not self._check_endpoint(endpoint, token):
+        if not self._check_endpoint(endpoint):
             raise HTTPException(status_code=503, detail=f"Endpoint {endpoint} not ready")
 
-        self._setup_environment(token)
+        self._setup_environment()
         client = get_deploy_client("databricks")
         start_time = time.time()
 

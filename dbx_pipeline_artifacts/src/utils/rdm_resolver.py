@@ -491,15 +491,24 @@ def resolve_reference_attributes(spark, batch_df, rdm_configs, source_id):
                 )
             )
         else:
+            # The raw attr column may be a non-string type — e.g. a numeric
+            # source column projected without an entity-type cast, as in
+            # Promote_Pending_RDM (the loaders pre-cast, so they're unaffected).
+            # _mp_*_id / _mp_*_display are STRING (ref_lakefusion_id / ref_value),
+            # so coalescing them with a numeric raw column makes Spark coerce the
+            # whole expression to that numeric type and cast the ref id string ->
+            # DOUBLE at runtime (CAST_INVALID_INPUT). Cast the raw fallback to
+            # string so a resolved REFERENCE_ENTITY column is always string.
+            attr_as_str = F.col(attr_name).cast("string")
             approved_df = (
                 approved_df
                 .withColumn(
                     attr_name,
-                    F.coalesce(F.col(f"_mp_{attr_name}_id"), F.col(attr_name)),
+                    F.coalesce(F.col(f"_mp_{attr_name}_id"), attr_as_str),
                 )
                 .withColumn(
                     f"{attr_name}__display",
-                    F.coalesce(F.col(f"_mp_{attr_name}_display"), F.col(attr_name)),
+                    F.coalesce(F.col(f"_mp_{attr_name}_display"), attr_as_str),
                 )
             )
 

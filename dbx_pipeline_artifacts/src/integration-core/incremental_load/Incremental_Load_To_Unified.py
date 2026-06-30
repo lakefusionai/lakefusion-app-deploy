@@ -62,15 +62,28 @@ from delta.tables import DeltaTable
 
 # COMMAND ----------
 
+# MAGIC %run ../../utils/rdm_resolver
+
+# COMMAND ----------
+
 # MAGIC %run ../../utils/attributes_combined
 
 # COMMAND ----------
+
+# NOTE: attributes_combined MUST be %run AFTER rdm_resolver. Both define a
+# build_attributes_combined_column (different signatures), and the later %run
+# wins in the shared namespace. add_attributes_combined (from attributes_combined)
+# calls its own build_attributes_combined_column with selected_sub_fields_by_attr,
+# which rdm_resolver's version doesn't accept — so attributes_combined must load
+# last. We only need resolve_reference_attributes from rdm_resolver, which does
+# not use build_attributes_combined_column.
 
 setup_lakefusion_engine()
 
 # COMMAND ----------
 
 from lakefusion_core_engine.survivorship import SurvivorshipEngine
+from lakefusion_core_engine.services.unified_error_handler import UnifiedErrorHandler
 
 # COMMAND ----------
 
@@ -122,6 +135,19 @@ try:
     )
 except Exception:
     reference_attribute_config = {}
+
+# RDM configs drive the source-value -> ref_lakefusion_id resolution + the
+# mapping-table MERGE that queues PENDING / NO_MATCH rows for steward review.
+# Empty list → resolve_reference_attributes short-circuits (no ref attrs).
+try:
+    rdm_configs = json.loads(
+        dbutils.jobs.taskValues.get(
+            "Parse_Entity_Model_JSON", "rdm_configs", default="[]"
+        )
+        or "[]"
+    )
+except Exception:
+    rdm_configs = []
 
 ref_lookup = {}
 for _attr_name, _ref_cfg in (reference_attribute_config or {}).items():
@@ -205,6 +231,12 @@ master_table               = f"{catalog_name}.gold.{entity}_master{suffix}"
 meta_info_table            = f"{catalog_name}.silver.table_meta_info"
 merge_activities_table     = f"{master_table}_merge_activities"
 attr_version_sources_table = f"{master_table}_attribute_version_sources"
+
+# run_id stamped on rows routed to the unified RDM error table.
+try:
+    run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
+except Exception:
+    run_id = None
 
 logger.info("=" * 80)
 logger.info(f"Incremental Load To Unified — entity={entity}")
@@ -483,6 +515,45 @@ for source_table in dataset_tables:
     # entities keep the legacy concat_ws output byte-for-byte.
     available_match_attrs = [a for a in match_attributes if a in df_renamed.columns]
     if available_match_attrs:
+        # Bake source value -> ref_lakefusion_id into REFERENCE_ENTITY {attr}
+        # columns (mapping-table resolution) and route unresolved rows to the
+        # RDM error table. Without this the raw source value stays in {attr}
+        # (never a ref id) and nothing is parked for Promote_Pending_RDM to drain
+        # after a mapping is approved. Mirrors Increment_Inserts. source_id is
+        # read from rdm_configs by source_table so the resolver's
+        # cfg["source_id"] == source_id filter always matches its configs.
+        # Only insert/update rows carry data to resolve; deletes just flip
+        # record_status in the MERGE, so leave them untouched.
+        src_id_for_resolver = next(
+            (cfg["source_id"] for cfg in rdm_configs if cfg.get("source_table") == source_table),
+            None,
+        )
+        _is_ins_upd  = F.col("_change_type").isin("insert", "update_postimage")
+        to_resolve   = df_renamed.filter(_is_ins_upd)
+        passthrough  = df_renamed.filter(~_is_ins_upd)
+        resolved_df, pending_df = resolve_reference_attributes(
+            spark, to_resolve, rdm_configs, source_id=src_id_for_resolver,
+        )
+        # Drop the resolver's __display columns — attributes_combined is built
+        # separately below from the now-baked ref ids via reference_attribute_config.
+        for _a in available_match_attrs:
+            _dc = f"{_a}__display"
+            if _dc in resolved_df.columns:
+                resolved_df = resolved_df.drop(_dc)
+        df_renamed = resolved_df.unionByName(passthrough, allowMissingColumns=True)
+
+        # Park unresolved (PENDING / NO_MATCH) rows in the RDM error table so a
+        # steward can fix the mapping and Promote_Pending_RDM can reprocess them.
+        if pending_df is not None and not pending_df.isEmpty():
+            UnifiedErrorHandler(spark, unified_table).log_errors(
+                pending_df.select(
+                    F.col("surrogate_key"),
+                    F.col("_rdm_pending_reason").alias("error_message"),
+                ),
+                stage="RDM",
+                run_id=run_id,
+            )
+
         # Resolve REFERENCE_ENTITY attrs (ref_lakefusion_id -> display) into
         # attributes_combined; raw {attr} columns are left as ref ids.
         df_renamed = add_attributes_combined(
@@ -782,12 +853,30 @@ if master_updates:
         include_lakefusion_id=False,
         attributes=entity_attribute_records or None,
     )
+    # Survivorship returns scalar values as strings (safe_str); complex attrs
+    # were parsed back to native dict/list above. createDataFrame against a typed
+    # schema rejects a string in a numeric column (ArrowInvalid: '500500' ->
+    # int64). Build the frame with scalar columns as StringType (matching the
+    # str() values) and complex columns at their real nested type, then cast each
+    # scalar to its declared type — cast() coerces '500500' -> 500500 etc. and
+    # matches the typed master table for the MERGE below. REFERENCE_ENTITY attrs
+    # are StringType, so their ref ids cast string->string (unchanged).
+    _scalar_cast_targets = []
+    _creation_fields = []
+    for _f in _attr_fields:
+        if isinstance(_f.dataType, (StructType, ArrayType)):
+            _creation_fields.append(_f)
+        else:
+            _creation_fields.append(StructField(_f.name, StringType(), _f.nullable))
+            _scalar_cast_targets.append((_f.name, _f.dataType))
     master_schema = StructType(
         [StructField("lakefusion_id", StringType(), False)]
-        + _attr_fields
+        + _creation_fields
         + [StructField("attributes_combined", StringType(), True)]
     )
     df_master_updates = spark.createDataFrame(master_updates, schema=master_schema)
+    for _name, _dtype in _scalar_cast_targets:
+        df_master_updates = df_master_updates.withColumn(_name, F.col(_name).cast(_dtype))
     update_cols = [a for a in entity_attributes if a != "lakefusion_id"] + ["attributes_combined"]
 
     (

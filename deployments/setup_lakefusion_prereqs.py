@@ -5,9 +5,12 @@
 # MAGIC This notebook sets up the infrastructure prerequisites for LakeFusion.
 # MAGIC
 # MAGIC **What this notebook does:**
+# MAGIC 1. Create Secrets Scope and store OIDC credentials
 # MAGIC 2. Create Lakebase Database Instance
 # MAGIC 3. Create PostgreSQL Database in the Instance
 # MAGIC 4. Register Database as Unity Catalog
+# MAGIC
+# MAGIC **Note:** After app creation, run `setup_lakefusion_post_install` to grant the App SP READ access to the secrets scope.
 
 # COMMAND ----------
 
@@ -166,8 +169,7 @@ def check_secrets_scope_exists(scope_name):
 def create_secrets_scope(scope_name):
     """Create a secrets scope."""
     response = api_request("POST", "/api/2.0/secrets/scopes/create", {
-        "scope": scope_name,
-        "initial_manage_principal": "users"
+        "scope": scope_name
     })
     if response.status_code == 200:
         print(f"Created secrets scope: {scope_name}")

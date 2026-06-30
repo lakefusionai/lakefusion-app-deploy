@@ -8,6 +8,7 @@
 # MAGIC 3. Set up secrets scope and secrets
 # MAGIC 4. Configure app resources (database, secrets)
 # MAGIC
+# MAGIC
 # MAGIC ## Prerequisites
 # MAGIC - Databricks workspace admin access
 # MAGIC - Service principal for OIDC authentication (optional, for SSO)
@@ -182,8 +183,7 @@ def check_secrets_scope_exists(scope_name):
 def create_secrets_scope(scope_name):
     """Create a secrets scope."""
     response = api_request("POST", "/api/2.0/secrets/scopes/create", {
-        "scope": scope_name,
-        "initial_manage_principal": "users"
+        "scope": scope_name
     })
     if response.status_code == 200:
         print(f"Created secrets scope: {scope_name}")
@@ -793,12 +793,53 @@ if final_app_info:
     print("\n" + "=" * 50)
     print("Next Steps:")
     print("=" * 50)
-    print("1. Sync your app code to the source code path")
-    print("2. Start the app compute if stopped")
-    print("3. Deploy the app")
+    print("1. Grant App SP READ access to secrets scope (Step 5a below)")
+    print("2. Deploy the app")
     print(f"\nApp URL: {final_app_info.get('url', 'N/A')}")
 else:
     print("Failed to retrieve app information")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Step 5a: Grant App SP READ Access to Secrets Scope
+# MAGIC
+# MAGIC The secrets scope is created with admin-only access. The App SP needs READ access
+# MAGIC to retrieve OIDC credentials and other secrets at runtime.
+
+# COMMAND ----------
+
+if final_app_info and CREATE_SECRETS:
+    print("=" * 50)
+    print("Step 5a: Granting App SP READ Access to Secrets Scope")
+    print("=" * 50)
+
+    app_sp_id = final_app_info.get("service_principal_client_id")
+    if app_sp_id:
+        response = api_request("POST", "/api/2.0/secrets/acls/put", {
+            "scope": SECRETS_SCOPE,
+            "principal": str(app_sp_id),
+            "permission": "READ"
+        })
+        if response.status_code == 200:
+            print(f"Granted READ permission on scope '{SECRETS_SCOPE}' to App SP '{app_sp_id}'")
+        else:
+            print(f"Failed to grant ACL: {response.text}")
+
+        # Verify ACLs
+        acl_response = api_request("GET", f"/api/2.0/secrets/acls/list?scope={SECRETS_SCOPE}")
+        if acl_response.status_code == 200:
+            print("\nCurrent ACLs:")
+            for acl in acl_response.json().get("items", []):
+                print(f"  {acl.get('principal')}: {acl.get('permission')}")
+    else:
+        print("Could not determine App SP ID from app info.")
+        print("Run setup_lakefusion_post_install manually with the App SP ID.")
+else:
+    if not CREATE_SECRETS:
+        print("Skipping ACL grant (CREATE_SECRETS=false)")
+    else:
+        print("Skipping ACL grant — app info not available")
 
 # COMMAND ----------
 

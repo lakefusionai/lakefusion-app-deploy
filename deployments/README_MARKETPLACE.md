@@ -55,7 +55,22 @@ Run `setup_lakefusion_prereqs.py` in a Databricks notebook to provision infrastr
 
 ---
 
-## Step 4: Post-Installation Setup
+## Step 4: Grant App SP Access to Secrets Scope
+
+After the app is created, run `setup_lakefusion_post_install.py` to grant the App Service Principal READ access to the secrets scope.
+
+**Widgets:**
+
+| Widget | Description |
+|--------|-------------|
+| `secrets_scope` | The secrets scope name used in Step 2 (e.g., `lakefusion`) |
+| `app_service_principal_id` | The SP application ID from **Apps** > your app > **Overview** |
+
+> **Why this step?** The secrets scope is created with admin-only access by default. The App SP needs READ access to retrieve OIDC credentials and other secrets at runtime. No other workspace users are granted access.
+
+---
+
+## Step 5: Post-Installation Configuration
 
 After the app is running, configure LakeFusion settings:
 
@@ -72,7 +87,7 @@ After the app is running, configure LakeFusion settings:
 
 ---
 
-## Step 5: Set Up Data Catalog
+## Step 6: Set Up Data Catalog
 
 The App Service Principal needs write access to the data catalog. Run the following SQL to create the required schemas and volumes:
 
@@ -90,7 +105,7 @@ CREATE VOLUME IF NOT EXISTS <catalog_name>.metadata.metadata_files;
 CREATE VOLUME IF NOT EXISTS <catalog_name>.default.pipeline_logs;
 ```
 
-Replace `<catalog_name>` with the catalog name you configured in Step 4 (e.g., `lakefusion_ai`).
+Replace `<catalog_name>` with the catalog name you configured in Step 5 (e.g., `lakefusion_ai`).
 
 **Grant permissions to the App Service Principal:**
 
@@ -116,7 +131,7 @@ The App SP also needs **CAN MANAGE** permission on the notebooks root folder (`/
 
 ---
 
-## Step 6: Configure User Authorization Scopes
+## Step 7: Configure User Authorization Scopes
 
 Configure user authorization scopes in the Databricks UI:
 
@@ -137,7 +152,7 @@ Configure user authorization scopes in the Databricks UI:
 
 ---
 
-## Step 7: Grant App Permissions
+## Step 8: Grant App Permissions
 
 Grant **CAN USE** permission to users/groups who need access:
 

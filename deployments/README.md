@@ -51,7 +51,7 @@ Run `setup_lakefusion_app.py` to create and configure the Databricks App:
 1. Creates the Databricks App (if not exists)
 2. Runs prerequisites (if not already done)
 3. Configures app resources (database, secrets)
-4. Updates app.yml with your configuration
+4. Grants READ permission on secrets scope to the App SP
 5. Deploys the app
 
 **Additional Widgets (beyond prereqs):**
@@ -63,6 +63,21 @@ Run `setup_lakefusion_app.py` to create and configure the Databricks App:
 | `source_code_path` | `/Workspace/Users/{user}/lakefusion-app-deploy` | Source code path |
 | `lakegraph_url` | _(empty)_ | LakeGraph URL (optional) |
 | `deploy_app` | `true` | Whether to deploy after setup |
+
+---
+
+## Step 3a: Post-Installation (Standalone)
+
+If you ran `setup_lakefusion_prereqs.py` and created the app separately (e.g., via Marketplace), run `setup_lakefusion_post_install.py` to grant the App SP READ access to the secrets scope.
+
+**Widgets:**
+
+| Widget | Description |
+|--------|-------------|
+| `secrets_scope` | The secrets scope name from Step 2 |
+| `app_service_principal_id` | The SP application ID from **Apps** > your app > **Overview** |
+
+> **Note:** This step is not needed if you used `setup_lakefusion_app.py` — it handles ACL grants automatically.
 
 ---
 

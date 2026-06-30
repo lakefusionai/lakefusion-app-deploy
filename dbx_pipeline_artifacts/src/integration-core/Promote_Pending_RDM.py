@@ -421,12 +421,28 @@ for source_table in dataset_tables:
 
 total_master_candidates = 0
 total_master_inserted = 0
+total_master_updated = 0
 total_unified_candidates = 0
 total_unified_inserted = 0
+total_unified_updated = 0
+
+# Columns to refresh on a record that ALREADY exists in the target — a keep_null
+# row whose REFERENCE_ENTITY attr was nulled at ingestion and is now resolved:
+# the re-resolved {attr} ref ids plus attributes_combined. Every other column
+# (record_status, master_lakefusion_id, non-ref attrs) is left as the MERGE
+# found it. Without this, whenNotMatchedInsertAll alone skips the existing row
+# and the attr stays NULL forever — while its error-log entry is still cleared
+# below, so the record would never be revisited.
+_ref_attr_names = sorted({
+    cfg["attribute_name"]
+    for cfg in rdm_configs
+    if cfg.get("attribute_name") and cfg.get("attribute_name") in entity_attributes
+})
+_backfill_cols = _ref_attr_names + ["attributes_combined"]
 
 
 def _read_delta_metrics(table_name):
-    """Read the most recent MERGE's numTargetRowsInserted from Delta history."""
+    """Read the most recent MERGE's (inserted, updated) row counts from history."""
     try:
         h = (
             DeltaTable.forName(spark, table_name)
@@ -435,15 +451,27 @@ def _read_delta_metrics(table_name):
             .collect()
         )
         if h and h[0]["operationMetrics"]:
-            return int(h[0]["operationMetrics"].get("numTargetRowsInserted", 0))
+            m = h[0]["operationMetrics"]
+            return (
+                int(m.get("numTargetRowsInserted", 0)),
+                int(m.get("numTargetRowsUpdated", 0)),
+            )
     except Exception:
         pass
-    return 0
+    return 0, 0
 
 
 # ── Master writes (primary-source rows only) ──────────────────────────────
+# whenMatchedUpdate backfills an EXISTING master row's nulled ref attr; for a
+# single-source / golden-dedup entity the master is 1:1 with the primary row so
+# this is exact. For a multi-source entity the master is survivorship output —
+# this fills a NULL ref attr from the primary source's now-approved mapping
+# (a non-null survived value wouldn't have been NULL to begin with); a full
+# survivorship re-run would be the strictly-correct refresh but is out of scope
+# here. whenNotMatchedInsertAll still covers move_to_error rows held out earlier.
 if promoted_master_dfs:
     master_delta = DeltaTable.forName(spark, master_table)
+    _master_update_set = {c: f"src.{c}" for c in _backfill_cols}
     for df in promoted_master_dfs:
         out = _project_to_table_schema(df, master_table)
         candidates = out.count()
@@ -452,15 +480,23 @@ if promoted_master_dfs:
         (
             master_delta.alias("tgt")
             .merge(out.alias("src"), "tgt.lakefusion_id = src.lakefusion_id")
+            .whenMatchedUpdate(set=_master_update_set)
             .whenNotMatchedInsertAll()
             .execute()
         )
+        _ins, _upd = _read_delta_metrics(master_table)
         total_master_candidates += candidates
-        total_master_inserted += _read_delta_metrics(master_table)
+        total_master_inserted += _ins
+        total_master_updated += _upd
 
 # ── Unified writes (primary + secondary) ──────────────────────────────────
+# A keep_null row already lives in unified (attr nulled at ingestion); the
+# whenMatchedUpdate backfills its now-resolved ref ids + attributes_combined.
+# The per-source unified value is unambiguous, so this update is always safe.
+# whenNotMatchedInsertAll still covers move_to_error rows held out earlier.
 if promoted_unified_dfs:
     unified_delta = DeltaTable.forName(spark, unified_table)
+    _unified_update_set = {c: f"src.{c}" for c in _backfill_cols}
     for df in promoted_unified_dfs:
         out = _project_to_table_schema(df, unified_table)
         candidates = out.count()
@@ -469,19 +505,22 @@ if promoted_unified_dfs:
         (
             unified_delta.alias("tgt")
             .merge(out.alias("src"), "tgt.surrogate_key = src.surrogate_key")
+            .whenMatchedUpdate(set=_unified_update_set)
             .whenNotMatchedInsertAll()
             .execute()
         )
+        _ins, _upd = _read_delta_metrics(unified_table)
         total_unified_candidates += candidates
-        total_unified_inserted += _read_delta_metrics(unified_table)
+        total_unified_inserted += _ins
+        total_unified_updated += _upd
 
 logger.info(
-    f"\nUnified: {total_unified_inserted} inserted "
-    f"({total_unified_candidates - total_unified_inserted} skipped — already present)"
+    f"\nUnified: {total_unified_inserted} inserted, {total_unified_updated} updated "
+    f"({total_unified_candidates - total_unified_inserted - total_unified_updated} unchanged)"
 )
 logger.info(
-    f"Master:  {total_master_inserted} inserted "
-    f"({total_master_candidates - total_master_inserted} skipped — already present)"
+    f"Master:  {total_master_inserted} inserted, {total_master_updated} updated "
+    f"({total_master_candidates - total_master_inserted - total_master_updated} unchanged)"
 )
 
 # COMMAND ----------

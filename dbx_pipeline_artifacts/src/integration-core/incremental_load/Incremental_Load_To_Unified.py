@@ -139,13 +139,15 @@ except Exception:
 # RDM configs drive the source-value -> ref_lakefusion_id resolution + the
 # mapping-table MERGE that queues PENDING / NO_MATCH rows for steward review.
 # Empty list → resolve_reference_attributes short-circuits (no ref attrs).
+# Parse_Entity_Model_JSON sets rdm_configs as a raw list (not json.dumps'd), so
+# taskValues.get returns a list — json.loads() on it raises and would silently
+# leave rdm_configs=[], making the resolver a no-op for EVERY source. Guard on
+# isinstance(str) like Load_Primary_Source / Load_Secondary_Sources do.
 try:
-    rdm_configs = json.loads(
-        dbutils.jobs.taskValues.get(
-            "Parse_Entity_Model_JSON", "rdm_configs", default="[]"
-        )
-        or "[]"
+    rdm_configs = dbutils.jobs.taskValues.get(
+        "Parse_Entity_Model_JSON", "rdm_configs", default="[]"
     )
+    rdm_configs = json.loads(rdm_configs) if isinstance(rdm_configs, str) else (rdm_configs or [])
 except Exception:
     rdm_configs = []
 
@@ -511,6 +513,17 @@ for source_table in dataset_tables:
                 spark_dtype = get_spark_data_type(entity_attrs_dtype.get(attr, "string"))
             df_renamed = df_renamed.withColumn(attr, F.lit(None).cast(spark_dtype))
 
+    # REFERENCE_ENTITY {attr} columns must be STRING — they hold ref_lakefusion_id
+    # after resolution. When the source column is numeric (e.g. a code stored as
+    # 1.0 / 0), it arrives as DOUBLE and stays DOUBLE on any row the resolver
+    # doesn't rewrite (deletes routed to passthrough, or a source that skips the
+    # resolve block). Casting up front makes the type consistent so neither the
+    # resolved/passthrough union, the cross-source unionByName, nor the MERGE
+    # collides a string ref id against a DOUBLE slot (CAST_INVALID_INPUT).
+    for _ref_attr in reference_attribute_config:
+        if _ref_attr in df_renamed.columns:
+            df_renamed = df_renamed.withColumn(_ref_attr, F.col(_ref_attr).cast("string"))
+
     # Blocker F (unified side): complex-aware attributes_combined. Scalar-only
     # entities keep the legacy concat_ws output byte-for-byte.
     available_match_attrs = [a for a in match_attributes if a in df_renamed.columns]
@@ -528,18 +541,28 @@ for source_table in dataset_tables:
             (cfg["source_id"] for cfg in rdm_configs if cfg.get("source_table") == source_table),
             None,
         )
+        # TEMP RDM diagnostic — confirm the resolver sees configs (matched_configs>0)
+        # and the ref attr names line up with df columns. Remove once verified.
+        _cfg_for_src = [c for c in rdm_configs if c.get("source_id") == src_id_for_resolver]
+        logger.info(
+            f"[RDM-DIAG] source_table={source_table!r} "
+            f"src_id_for_resolver={src_id_for_resolver!r} "
+            f"matched_configs={len(_cfg_for_src)} "
+            f"all_cfg_source_tables={sorted({c.get('source_table') for c in rdm_configs})} "
+            f"ref_attr_names={sorted({c.get('attribute_name') for c in rdm_configs})} "
+            f"df_renamed_cols={df_renamed.columns}"
+        )
         _is_ins_upd  = F.col("_change_type").isin("insert", "update_postimage")
         to_resolve   = df_renamed.filter(_is_ins_upd)
         passthrough  = df_renamed.filter(~_is_ins_upd)
         resolved_df, pending_df = resolve_reference_attributes(
             spark, to_resolve, rdm_configs, source_id=src_id_for_resolver,
         )
-        # Drop the resolver's __display columns — attributes_combined is built
-        # separately below from the now-baked ref ids via reference_attribute_config.
-        for _a in available_match_attrs:
-            _dc = f"{_a}__display"
-            if _dc in resolved_df.columns:
-                resolved_df = resolved_df.drop(_dc)
+        # Keep the resolver's <attr>__display columns through the union — they
+        # carry the canonical display value computed in the SAME join that baked
+        # the ref id, so they can't go stale. passthrough (deletes) has no
+        # __display; allowMissingColumns fills it null (a delete's
+        # attributes_combined is irrelevant — the MERGE only flips record_status).
         df_renamed = resolved_df.unionByName(passthrough, allowMissingColumns=True)
 
         # Park unresolved (PENDING / NO_MATCH) rows in the RDM error table so a
@@ -554,12 +577,30 @@ for source_table in dataset_tables:
                 run_id=run_id,
             )
 
-        # Resolve REFERENCE_ENTITY attrs (ref_lakefusion_id -> display) into
-        # attributes_combined; raw {attr} columns are left as ref ids.
-        df_renamed = add_attributes_combined(
-            df_renamed, available_match_attrs, entity_attribute_records,
-            reference_attribute_config=reference_attribute_config, spark=spark,
+        # Build attributes_combined from the resolver's <attr>__display values —
+        # the display resolved during baking. Do NOT re-resolve via
+        # add_attributes_combined / resolve_reference_display_columns: that second
+        # ref-table join coalesces to the RAW ref id whenever it misses, leaking
+        # ref ids into the text vector search embeds and the LLM reads. Using
+        # __display mirrors the working Load_Primary_Source path. The raw {attr}
+        # columns keep their ref ids untouched.
+        _ref_display_cols = {
+            a: f"{a}__display"
+            for a in available_match_attrs
+            if f"{a}__display" in df_renamed.columns
+        }
+        df_renamed = df_renamed.withColumn(
+            "attributes_combined",
+            build_attributes_combined_column(
+                df_renamed, available_match_attrs, entity_attribute_records,
+                ref_display_cols=_ref_display_cols,
+            ),
         )
+        # Drop the resolver's __display helper columns now attributes_combined is built.
+        for _a in available_match_attrs:
+            _dc = f"{_a}__display"
+            if _dc in df_renamed.columns:
+                df_renamed = df_renamed.drop(_dc)
     else:
         df_renamed = df_renamed.withColumn("attributes_combined", F.lit(""))
 

@@ -433,78 +433,92 @@ Take into account:
         formatted_text: str,
         config: Dict[str, Any],
         token: str,
+        warehouse_id: str,
         top_n: int = 3
     ) -> List[Dict[str, Any]]:
         """
-        Query vector search index and return candidates with all attributes.
-        
+        Query vector search index for ranking, then hydrate attributes from the
+        master table.
+
+        The master_prod VS index only syncs the primary key, the searchable text
+        and the embedding vector — attribute columns (including ARRAY/STRUCT) are
+        NOT synced because VS Delta Sync rejects complex types. So the index is
+        used purely to rank candidates by similarity; the full attribute values
+        (complex types included) are read back from the master table by id.
+
         Args:
             formatted_text: Text to search for
             config: Entity configuration
             token: Databricks token
+            warehouse_id: SQL warehouse ID used to read the master table
             top_n: Number of results to return
-            
+
         Returns:
             List of candidate records with scores and all attributes
-            
+
         Raises:
             HTTPException: If vector search fails
         """
         try:
             app_logger.info(f"Querying vector search index: {config['vs_index_name']}")
-            
+
             os.environ['DATABRICKS_TOKEN'] = token
             if not os.environ.get('DATABRICKS_HOST'):
                 os.environ['DATABRICKS_HOST'] = DATABRICKS_HOST
-            
+
             client = VectorSearchClient(disable_notice=True)
             index = client.get_index(index_name=config['vs_index_name'])
-            
-            # Request ALL columns from the index
-            all_column_names = [attr['name'] for attr in config['all_entity_attributes']]
-            columns_to_fetch = ["lakefusion_id", "attributes_combined"] + all_column_names
-            
+
+            # Only the primary key is synced to the index — fetch ranking only.
             if config.get('embedding_mode') == 'precomputed':
                 query_vector = self._compute_query_embedding(formatted_text, config, token)
                 results = index.similarity_search(
                     query_vector=query_vector,
-                    columns=columns_to_fetch,
+                    columns=["lakefusion_id"],
                     num_results=top_n
                 )
             else:
                 results = index.similarity_search(
                     query_text=formatted_text,
-                    columns=columns_to_fetch,
+                    columns=["lakefusion_id"],
                     num_results=top_n
                 )
-            
-            # Parse results
-            candidates = []
+
+            # Preserve VS ranking order and the per-candidate similarity score.
             data_array = results.get("result", {}).get("data_array", [])
-            
+            ranked_ids = []
+            score_by_id = {}
             for row in data_array:
-                if len(row) >= 3:
-                    # Extract lakefusion_id, attributes_combined, and score
-                    lakefusion_id = row[0]
-                    attributes_combined = row[1]
-                    vector_score = float(row[-1])  # Score is always last
-                    
-                    # Parse all attributes from the row
-                    # Row format: [lakefusion_id, attributes_combined, attr1, attr2, ..., score]
-                    attributes_dict = {}
-                    for i, attr in enumerate(config['all_entity_attributes']):
-                        # Attributes start at index 2, score is last
-                        attr_index = i + 2
-                        if attr_index < len(row) - 1:  # -1 to exclude score
-                            attributes_dict[attr['name']] = row[attr_index]
-                    
-                    candidates.append({
-                        "lakefusion_id": lakefusion_id,
-                        "attributes_combined": attributes_combined,
-                        "vector_score": vector_score,
-                        "attributes": attributes_dict
-                    })
-            
+                if not row:
+                    continue
+                lakefusion_id = row[0]
+                ranked_ids.append(lakefusion_id)
+                score_by_id[lakefusion_id] = float(row[-1])  # Score is always last
+
+            if not ranked_ids:
+                app_logger.info("Vector search returned no candidates")
+                return []
+
+            # Hydrate full attribute values (incl. complex types) from master table.
+            master_rows = self._fetch_master_records(ranked_ids, config, token, warehouse_id)
+
+            attribute_names = [attr['name'] for attr in config['all_entity_attributes']]
+            candidates = []
+            for lakefusion_id in ranked_ids:
+                record = master_rows.get(lakefusion_id)
+                if record is None:
+                    app_logger.warning(
+                        f"Candidate {lakefusion_id} not found in master table — skipping"
+                    )
+                    continue
+                attributes_dict = {name: record.get(name) for name in attribute_names}
+                candidates.append({
+                    "lakefusion_id": lakefusion_id,
+                    "attributes_combined": record.get("attributes_combined"),
+                    "vector_score": score_by_id[lakefusion_id],
+                    "attributes": attributes_dict
+                })
+
             app_logger.info(f"Vector search returned {len(candidates)} candidates with all attributes")
             return candidates
             
@@ -519,6 +533,28 @@ Take into account:
                     "detail": {"index_name": config.get('vs_index_name')}
                 }
             )
+
+    def _fetch_master_records(
+        self,
+        lakefusion_ids: List[str],
+        config: Dict[str, Any],
+        token: str,
+        warehouse_id: str
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Read full master records (all attribute columns, incl. ARRAY/STRUCT) for
+        the given ids from the master_prod table, keyed by lakefusion_id.
+        """
+        table = f"`{self.catalog_name}`.`gold`.`{config['entity_name']}_master_prod`"
+        quoted_ids = ", ".join(f"'{lf_id}'" for lf_id in lakefusion_ids)
+        rows = DataSetSQLService(token, warehouse_id).execute_dataset(
+            f"SELECT * FROM {table} WHERE lakefusion_id IN ({quoted_ids})"
+        )
+        return {
+            row["lakefusion_id"]: row
+            for row in rows
+            if row.get("lakefusion_id") is not None
+        }
 
     def score_with_llm(
         self,
@@ -704,6 +740,7 @@ Possible entities: {json.dumps(candidates_for_llm)}"""
                 formatted_text,
                 config,
                 token,
+                warehouse_id,
                 top_n=config['max_potential_matches']
             )
             
@@ -832,6 +869,7 @@ Possible entities: {json.dumps(candidates_for_llm)}"""
                 formatted_text,
                 config,
                 token,
+                warehouse_id,
                 top_n=top_n
             )
             

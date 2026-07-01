@@ -95,36 +95,36 @@ query = f"""
     from
         (
         SELECT
-            u.master_{id_key},
+            u.{id_key},
             collect_set(
             struct(u.*)
             ) AS potential_matches
         FROM
             (
-                select pu.*, uo.* except ({id_key}) from 
+                select pu.*, uo.* except (master_{id_key}) from 
                 {processed_unified_table} pu
                 inner join {unified_table} uo
-                on pu.{id_key} = uo.{id_key}
+                on pu.{id_key} = uo.master_{id_key}
             ) u
-            JOIN {master_table} m ON m.{id_key} = u.master_{id_key}
+            JOIN {master_table} m ON m.{id_key} = u.{id_key}
             LEFT ANTI JOIN no_match on (
-            u.master_{id_key} = no_match.master_{id_key}
-            AND u.{id_key} = no_match.{id_key}
-            AND u.dataset.path = no_match.`source`
+            u.{id_key} = no_match.master_id
+            AND u.surrogate_key = no_match.match_id
+            AND u.source_path = no_match.`source`
             )
             LEFT ANTI JOIN merges on (
-            u.master_{id_key} = merges.master_{id_key}
-            AND u.{id_key} = merges.{id_key}
-            AND u.dataset.path = merges.`source`
+            u.{id_key} = merges.master_id
+            AND u.surrogate_key = merges.match_id
+            AND u.source_path = merges.`source`
             )
         WHERE
             u.exploded_result.match = 'MATCH'
         GROUP BY
-            u.master_{id_key}
+            u.{id_key}
         ) pu,
         {master_table} ma
     where
-        pu.master_{id_key} = ma.{id_key}
+        pu.{id_key} = ma.{id_key}
     )
     SELECT
     *

@@ -763,8 +763,7 @@ class DeterministicRulesService:
         for rule in rules:
             rule_name = rule.get("name", "")
             action = rule.get("action_on_match", "MATCH")
-            # rule-level logical_operator is kept for backward compat but per-condition takes precedence
-            rule_level_op = rule.get("logical_operator", "AND").upper()
+            logical_op = rule.get("logical_operator", "AND").upper()
             conditions = rule.get("conditions", [])
 
             cond_masks: List[pd.Series] = []
@@ -799,17 +798,14 @@ class DeterministicRulesService:
 
             if not cond_masks:
                 rule_mask = pd.Series([False] * n, dtype=bool)
-            else:
-                # Use per-condition logical_operator when available (condition[i].logical_operator
-                # connects condition[i] to condition[i+1]). Falls back to rule-level operator
-                # for old data that only has rule-level logical_operator.
+            elif logical_op == "OR":
                 rule_mask = cond_masks[0].copy()
-                for i in range(1, len(cond_masks)):
-                    op = (conditions[i - 1].get("logical_operator") or rule_level_op).upper()
-                    if op == "OR":
-                        rule_mask |= cond_masks[i]
-                    else:
-                        rule_mask &= cond_masks[i]
+                for m in cond_masks[1:]:
+                    rule_mask |= m
+            else:  # AND
+                rule_mask = cond_masks[0].copy()
+                for m in cond_masks[1:]:
+                    rule_mask &= m
 
             for i in range(n):
                 rule_matched = bool(rule_mask.iloc[i])

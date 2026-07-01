@@ -119,6 +119,13 @@ attribute_objects = model_json.get('attributes', '')
 attributes = [attribute.get('name') for attribute in attribute_objects]
 config_thresholds = model_json.get('config_thresold')
 vs_endpoint = model_json.get('vs_endpoint')
+# VS endpoint type + precomputed index version live under the embedding_model object
+# (see entity_<id>_..._model.json). Default to STANDARD / v2 to match the model schema
+# and the VS-notebook widget fallbacks. Set as task values below so all three VS Search
+# notebooks (normal/golden/match_maven) read them from this single source.
+_embedding_model_cfg = model_json.get('embedding_model', {}) or {}
+vs_endpoint_type = _embedding_model_cfg.get('vs_endpoint_type') or 'STANDARD'
+vs_index_version = _embedding_model_cfg.get('vs_index_version') or 'v2'
 additional_instructions = model_json.get('additional_instructions', '').replace("'", "''")
 max_potential_matches = model_json.get('max_potential_matches')
 embedding_mode = model_json.get('embedding_mode', 'managed')
@@ -282,6 +289,8 @@ dbutils.jobs.taskValues.set(TaskValueKey.MATCH_ATTRIBUTES.value, json.dumps(attr
 dbutils.jobs.taskValues.set(TaskValueKey.CONFIG_THRESHOLDS.value, json.dumps(config_thresholds))
 dbutils.jobs.taskValues.set(TaskValueKey.PROCESS_RECORDS.value, process_records)
 dbutils.jobs.taskValues.set(TaskValueKey.VS_ENDPOINT.value, vs_endpoint)
+dbutils.jobs.taskValues.set(TaskValueKey.VS_ENDPOINT_TYPE.value, vs_endpoint_type)
+dbutils.jobs.taskValues.set(TaskValueKey.VS_INDEX_VERSION.value, vs_index_version)
 dbutils.jobs.taskValues.set(TaskValueKey.ADDITIONAL_INSTRUCTIONS.value, additional_instructions)
 dbutils.jobs.taskValues.set(TaskValueKey.MAX_POTENTIAL_MATCHES.value, max_potential_matches)
 dbutils.jobs.taskValues.set(TaskValueKey.LLM_PROVISIONLESS.value, llm_provisionless)
@@ -315,6 +324,8 @@ logger.info(f"  match_attributes:      {attributes}")
 logger.info(f"  config_thresholds:     {config_thresholds}")
 logger.info(f"  max_potential_matches: {max_potential_matches}")
 logger.info(f"  vs_endpoint:           {vs_endpoint}")
+logger.info(f"  vs_endpoint_type:      {vs_endpoint_type}")
+logger.info(f"  vs_index_version:      {vs_index_version}")
 logger.info(f"  llm_provisionless:     {llm_provisionless}")
 logger.info(f"  embedding_provisionless:{embedding_provisionless}")
 logger.info(f"  base_prompt:           {base_prompt[:100] if base_prompt else '(none)'}...")

@@ -117,6 +117,20 @@ logger.info(f"Shared embeddings table ready: {embeddings_table}")
 # COMMAND ----------
 
 # DBTITLE 1,Step 2: Probe Embedding Dimension
+# Prewarm the embedding endpoint (handles scale-from-zero) before probing / bulk ai_query.
+# In precomputed mode the VS layer skips embedding warm-up, so Compute_Embeddings is the
+# only place the embedding endpoint is exercised — warm it here to avoid cold-start failures.
+try:
+    warm_up_embedding_endpoint(
+        embedding_endpoint=embedding_endpoint,
+        max_retries=10,
+        retry_interval_seconds=60,
+        timeout_minutes=10,
+    )
+    logger.info(f"Embedding endpoint '{embedding_endpoint}' is warm and ready")
+except Exception as e:
+    logger.warning(f"Embedding warm-up failed: {e}. Proceeding with dimension probe anyway...")
+
 from pyspark.sql.functions import size as spark_size
 
 probe_df = spark.sql(f"""

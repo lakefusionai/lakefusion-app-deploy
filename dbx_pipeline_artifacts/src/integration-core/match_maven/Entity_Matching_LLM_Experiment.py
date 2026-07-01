@@ -45,7 +45,7 @@ dbutils.widgets.text("is_single_source", "false", "Is Single Source (Golden Dedu
 dbutils.widgets.text("llm_temperature", "0.0", "LLM Temperature")
 dbutils.widgets.dropdown("reasoning_effort", "low", ["low", "medium", "high"], "LLM reasoning_effort")
 dbutils.widgets.text("llm_max_tokens", "4096", "LLM max_tokens")
-dbutils.widgets.text("chunk_size", "50000", "Records per LLM chunk")
+dbutils.widgets.text("chunk_size", "250000", "Records per LLM chunk")
 dbutils.widgets.text("llm_max_retries", "2", "LLM Max Retries")
 
 # COMMAND ----------
@@ -64,7 +64,7 @@ is_single_source = dbutils.widgets.get("is_single_source")
 llm_temperature = dbutils.widgets.get("llm_temperature")
 reasoning_effort = dbutils.widgets.get("reasoning_effort") or "low"
 llm_max_tokens = int(dbutils.widgets.get("llm_max_tokens") or "4096")
-chunk_size = int(dbutils.widgets.get("chunk_size") or "50000")
+chunk_size = int(dbutils.widgets.get("chunk_size") or "250000")
 llm_max_retries = int(dbutils.widgets.get("llm_max_retries") or "2")
 try:
     run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()

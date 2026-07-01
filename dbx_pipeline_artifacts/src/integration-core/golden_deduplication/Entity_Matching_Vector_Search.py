@@ -30,10 +30,12 @@ dbutils.widgets.dropdown("embedding_model_source", "databricks_foundation", ["da
 dbutils.widgets.text("catalog_name", "", "catalog name")
 dbutils.widgets.text("vs_endpoint", "", "vs endpointname")
 dbutils.widgets.text("max_potential_matches", "", "Max Potential Matches")
-dbutils.widgets.text("vs_max_workers", "1", "VS Max Workers (ThreadPool)")
+dbutils.widgets.text("vs_max_workers", "2", "VS Max Workers (ThreadPool)")
 dbutils.widgets.text("vs_max_concurrency", "50", "VS Max Concurrent Calls (Partitions)")
 dbutils.widgets.text("vs_max_retries", "2", "VS Max Retries")
 dbutils.widgets.dropdown("vs_strict_match_count", "false", ["true", "false"], "Require exact match count from VS")
+dbutils.widgets.dropdown("vs_endpoint_type", "STANDARD", ["STANDARD", "STORAGE_OPTIMIZED"], "VS Endpoint Type")
+dbutils.widgets.text("vs_index_version", "v2", "VS Index Version (precomputed)")
 
 # COMMAND ----------
 
@@ -47,10 +49,12 @@ embedding_model_source = dbutils.widgets.get("embedding_model_source")
 catalog_name = dbutils.widgets.get("catalog_name")
 vs_endpoint = dbutils.widgets.get("vs_endpoint")
 max_potential_matches = dbutils.widgets.get("max_potential_matches")
-vs_max_workers = int(dbutils.widgets.get("vs_max_workers") or "1")
+vs_max_workers = int(dbutils.widgets.get("vs_max_workers") or "2")
 vs_max_concurrency = int(dbutils.widgets.get("vs_max_concurrency") or "50")
 vs_max_retries = int(dbutils.widgets.get("vs_max_retries") or "2")
 vs_strict_match_count = dbutils.widgets.get("vs_strict_match_count").lower() == "true"
+vs_endpoint_type = dbutils.widgets.get("vs_endpoint_type") or "STANDARD"
+vs_index_version = dbutils.widgets.get("vs_index_version") or "v2"
 try:
     run_id = dbutils.notebook.entry_point.getDbutils().notebook().getContext().currentRunId().toString()
 except Exception:
@@ -66,6 +70,8 @@ attributes = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key=
 max_potential_matches = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="max_potential_matches", debugValue=max_potential_matches)
 embedding_model_source = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="embedding_model_source", debugValue=embedding_model_source)
 embedding_mode = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="embedding_mode", debugValue="managed")
+vs_endpoint_type = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="vs_endpoint_type", debugValue=vs_endpoint_type)
+vs_index_version = dbutils.jobs.taskValues.get(taskKey="Parse_Entity_Model_JSON", key="vs_index_version", debugValue=vs_index_version)
 
 # COMMAND ----------
 
@@ -220,29 +226,27 @@ logger.info("\n" + "="*60)
 logger.info("STEP 2: SETUP VECTOR SEARCH ENDPOINT")
 logger.info("="*60)
 
-client = create_vs_client(disable_notice=True)
-
-try:
-    # Safely list existing endpoints
-    response = client.list_endpoints()
-    existing_endpoints = [ep['name'] for ep in response.get('endpoints', [])]
-except Exception as e:
-    logger.info(f"Could not fetch Vector Search endpoints: {e}")
-    existing_endpoints = []
-
-# Check if endpoint already exists
-if vs_endpoint in existing_endpoints:
-    logger.info(f"Endpoint '{vs_endpoint}' already exists. Skipping creation.")
-else:
+def get_or_create_vs_endpoint(client, endpoint_name, endpoint_type="STANDARD"):
+    """Create the VS endpoint if it doesn't already exist (STANDARD or STORAGE_OPTIMIZED)."""
     try:
-        logger.info(f"Creating new endpoint '{vs_endpoint}' ...")
-        client.create_endpoint(
-            name=vs_endpoint,
-            endpoint_type="STANDARD"
-        )
-        logger.info(f"Endpoint '{vs_endpoint}' created successfully.")
+        response = client.list_endpoints()
+        existing = [ep['name'] for ep in response.get('endpoints', [])]
+    except Exception as e:
+        logger.info(f"Could not fetch Vector Search endpoints: {e}")
+        existing = []
+    if endpoint_name in existing:
+        logger.info(f"Endpoint '{endpoint_name}' already exists. Skipping creation.")
+        return
+    try:
+        logger.info(f"Creating new endpoint '{endpoint_name}' (type={endpoint_type}) ...")
+        client.create_endpoint(name=endpoint_name, endpoint_type=endpoint_type)
+        logger.info(f"Endpoint '{endpoint_name}' created successfully ({endpoint_type}).")
     except Exception as e:
         logger.info(f"Exception occurred while creating the Vector Search endpoint: {e}")
+
+
+client = create_vs_client(disable_notice=True)
+get_or_create_vs_endpoint(client, vs_endpoint, vs_endpoint_type)
 
 # COMMAND ----------
 
@@ -266,327 +270,45 @@ logger.info("="*60)
 
 import time
 
-index = None
-# Index is created on master table (same as normal dedup)
-# unified_dedup records will query against this master index
-index_name = f"{master_table}_index_v2" if embedding_mode == "precomputed" else f"{master_table}_index"
+index_name = f"{master_table}_index_{vs_index_version}" if embedding_mode == "precomputed" else f"{master_table}_index"
 
-# Configuration constants
-MAX_WAIT_SECONDS = 3 * 60 * 60  # 3 hours
-POLL_INTERVAL = 20          # seconds
-MAX_PIPELINE_FAILURES = 3   # fail on 3rd occurrence
-REGISTRATION_TIMEOUT = 1800 # 30 minutes for index registration
-
-# -------------------------------------------------
-# STEP 4.0: Warm up embedding endpoint before index creation
-# -------------------------------------------------
-if embedding_mode == "managed":
-    logger.info("Warming up embedding endpoint before index creation...")
+# Precomputed mode needs the embedding dimension produced by the upstream Compute_Embeddings task.
+embedding_dim = None
+if embedding_mode == "precomputed":
     try:
-        warm_up_embedding_endpoint(
-            embedding_endpoint=embedding_endpoint,
-            max_retries=10,
-            retry_interval_seconds=60,
-            timeout_minutes=10
+        embedding_dim_raw = dbutils.jobs.taskValues.get(
+            taskKey="Compute_Embeddings", key="embedding_dim", debugValue=None
         )
-        logger.info(f"Embedding endpoint '{embedding_endpoint}' is warm and ready")
     except Exception as e:
-        logger.warning(f"Embedding warm-up failed: {e}. Proceeding with index creation anyway...")
-else:
-    logger.info("Skipping embedding warm-up (precomputed mode — index syncs pre-existing vectors)")
-
-# -------------------------------------------------
-# STEP 4.1: Create index (tolerant approach)
-# -------------------------------------------------
-try:
-    logger.info(f"Attempting to create index: {index_name}")
-    if embedding_mode == "precomputed":
-        try:
-            embedding_dim_raw = dbutils.jobs.taskValues.get(
-                taskKey="Compute_Embeddings", key="embedding_dim", debugValue=None
-            )
-        except Exception as e:
-            # Databricks raises "Task key does not exist in run: Compute_Embeddings" when
-            # the task isn't in the DAG at all (vs. failed or hasn't run). This happens
-            # on Integration jobs created before 4.3.0: the DAG is persisted at job-
-            # creation time and the upgrade doesn't rebuild existing jobs.
-            if "task key does not exist" in str(e).lower():
-                raise RuntimeError(
-                    "embedding_mode='precomputed' but the Compute_Embeddings task is not in "
-                    "this job's DAG. Rebuild the DAG and re-run."
-                ) from e
-            raise
-        if embedding_dim_raw is None:
+        # "task key does not exist" => Compute_Embeddings isn't in this job's DAG (e.g. a job
+        # created before 4.3.0; the DAG is fixed at job-creation time). Rebuild the DAG and re-run.
+        if "task key does not exist" in str(e).lower():
             raise RuntimeError(
-                "embedding_mode='precomputed' requires Compute_Embeddings task to set embedding_dim. "
-                "Check DAG ordering — Compute_Embeddings must run before this task."
-            )
-        embedding_dim = int(embedding_dim_raw)
-        index = client.create_delta_sync_index(
-            endpoint_name=vs_endpoint,
-            source_table_name=master_table,
-            index_name=index_name,
-            pipeline_type="TRIGGERED",
-            primary_key=master_id_key,
-            embedding_vector_column=embedding_vector_column,
-            embedding_dimension=embedding_dim,
-        )
-    else:
-        index = client.create_delta_sync_index(
-            endpoint_name=vs_endpoint,
-            source_table_name=master_table,
-            index_name=index_name,
-            pipeline_type="TRIGGERED",
-            primary_key=master_id_key,
-            embedding_source_column=merged_desc_column,
-            embedding_model_endpoint_name=embedding_endpoint,
-            sync_computed_embeddings=True,
-        )
-    logger.info(f"Create request submitted for index: {index_name}")
-
-except Exception as e:
-    error_msg = str(e)
-    error_lower = error_msg.lower()
-
-    # Case 1: Timeout/temporarily unavailable - creation may still be in progress
-    if ("temporarily_unavailable" in error_lower or
-        "504" in error_lower or
-        "taking too long" in error_lower or
-        "timeout" in error_lower):
-        logger.warning(f"Create request timed out — creation may still be in progress: {error_msg}")
-        # Don't raise, proceed to wait loop
-
-    # Case 2: Index already exists - this is fine, proceed to wait loop
-    elif "already exists" in error_lower:
-        logger.info(f"Index already exists, proceeding to sync: {error_msg}")
-
-    # Case 3: Permanent errors - fail immediately
-    elif ("maximum number of indexes" in error_lower or
-          "permission denied" in error_lower or
-          "unauthorized" in error_lower):
-        raise RuntimeError(f"Index creation failed: {error_msg}")
-
-    # Case 4: Other unexpected errors - raise
-    else:
-        raise RuntimeError(f"Index creation failed unexpectedly: {error_msg}")
-
-# -------------------------------------------------
-# STEP 4.2: Wait for index registration
-# -------------------------------------------------
-logger.info("Waiting for index registration...")
-start = time.time()
-
-while index is None:
-    if time.time() - start > REGISTRATION_TIMEOUT:
-        raise TimeoutError(
-            f"Index '{index_name}' not registered within {REGISTRATION_TIMEOUT}s"
-        )
-
-    try:
-        index = client.get_index(
-            endpoint_name=vs_endpoint,
-            index_name=index_name,
-        )
-        logger.info("Index is now registered and accessible")
-
-    except Exception as e:
-        error_lower = str(e).lower()
-        # Handle both "does not exist" (message) and "does_not_exist" (API code)
-        if "not exist" in error_lower or "not_exist" in error_lower:
-            logger.info("  Index not visible yet — waiting...")
-            time.sleep(20)
-        else:
-            raise RuntimeError(f"Unexpected error while locating index: {e}")
-
-# -------------------------------------------------
-# Helper: Log detailed sync progress metrics
-# -------------------------------------------------
-def log_sync_progress(idx, desc=None):
-    """Log detailed sync progress metrics from the index description."""
-    try:
-        if desc is None:
-            desc = idx.describe()
-        st = desc.get("status", {})
-        detailed_state = st.get("detailed_state", "UNKNOWN")
-        indexed_rows = st.get("indexed_row_count", 0)
-        ready = st.get("ready", False)
-
-        # Progress lives in different places depending on sync phase:
-        #   - Initial snapshot: status.provisioning_status.initial_pipeline_sync_progress
-        #   - Triggered update: status.triggered_update_status.triggered_update_progress
-        prov = (
-            st.get("triggered_update_status", {}).get("triggered_update_progress")
-            or st.get("provisioning_status", {}).get("initial_pipeline_sync_progress")
-            or {}
-        )
-        total_rows = prov.get("total_rows_to_sync", 0)
-        synced_rows = prov.get("num_synced_rows", 0)
-        pct = prov.get("sync_progress_completion", 0.0)
-        eta_sec = prov.get("estimated_completion_time_seconds", 0.0)
-        current_version = prov.get("latest_version_currently_processing")
-
-        metrics = prov.get("pipeline_metrics", {})
-        ms_per_row = metrics.get("total_sync_time_per_row_ms", 0)
-        ing = metrics.get("ingestion_metrics", {})
-        emb = metrics.get("embedding_metrics", {})
-
-        remaining = total_rows - synced_rows
-
-        logger.info("=" * 70)
-        logger.info(f"Index:         {desc.get('name')}")
-        logger.info(f"State:         {detailed_state}  (ready={ready})")
-        if current_version is not None:
-            logger.info(f"Version:       {current_version}")
-        logger.info("-" * 70)
-        logger.info(f"Progress:      {synced_rows:,} / {total_rows:,}  ({pct * 100:.2f}%)")
-        logger.info(f"Indexed rows:  {indexed_rows:,}   (queryable snapshot)")
-        logger.info(f"Remaining:     {remaining:,} rows")
-        if eta_sec > 0:
-            import time as _t
-            logger.info(f"ETA:           {eta_sec:.0f}s  (~{eta_sec / 60:.1f} min)")
-            logger.info(f"               Expected finish: {_t.strftime('%H:%M:%S', _t.localtime(_t.time() + eta_sec))}")
-        logger.info("-" * 70)
-        if ms_per_row > 0:
-            logger.info(f"Throughput:    {ms_per_row:.2f} ms/row  (~{1000 / ms_per_row:.0f} rows/sec)")
-            logger.info(f"  Ingestion:   {ing.get('ingestion_time_per_row_ms', 0):.2f} ms/row, "
-                         f"batch={ing.get('ingestion_batch_size')}")
-            logger.info(f"  Embedding:   {emb.get('embedding_generation_time_per_row_ms', 0):.2f} ms/row, "
-                         f"batch={emb.get('embedding_generation_batch_size')}")
-        # Commit lag for triggered updates
-        if detailed_state in ("ONLINE_TRIGGERED_UPDATE", "ONLINE_UPDATING_PIPELINE_RESOURCES"):
-            tus = st.get("triggered_update_status", {})
-            last_v = tus.get("last_processed_commit_version")
-            if last_v is not None and current_version is not None:
-                logger.info(f"Commit lag:    processed={last_v}, current={current_version} ({current_version - last_v} behind)")
-        logger.info("=" * 70)
-    except Exception as e:
-        logger.debug(f"log_sync_progress failed (non-fatal): {e}")
-
-# -------------------------------------------------
-# STEP 4.3: Wait for index to be ready before sync
-# -------------------------------------------------
-logger.info("Waiting for index to be ready before sync...")
-wait_start = time.time()
-
-while True:
-    if time.time() - wait_start > MAX_WAIT_SECONDS:
-        raise TimeoutError(
-            f"Index '{index_name}' did not reach a post-provisioning state within {MAX_WAIT_SECONDS}s"
-        )
-    log_sync_progress(index)
-    try:
-        desc = index.describe()
-        st = desc.get("status", {}).get("detailed_state", "UNKNOWN")
-        if st in ("ONLINE_NO_PENDING_UPDATE", "ONLINE_TRIGGERED_UPDATE",
-                   "ONLINE_UPDATING_PIPELINE_RESOURCES", "ONLINE_PIPELINE_FAILED"):
-            break
-    except Exception as e:
-        logger.warning(f"describe() failed during pre-sync wait (continuing): {e}")
-    time.sleep(POLL_INTERVAL)
-logger.info("Index is ready")
-
-# -------------------------------------------------
-# STEP 4.4: Trigger sync (if not already running)
-# -------------------------------------------------
-# Log current status for debugging
-index_status = index.describe()['status']
-current_status = index_status.get('detailed_state', 'UNKNOWN')
-logger.info(f"Current index status: {current_status}")
-
-# Log additional details if pipeline failed
-if current_status == "ONLINE_PIPELINE_FAILED":
-    status_message = index_status.get('message', 'No message available')
-    logger.warning(f"Pipeline failure details: {status_message}")
-    logger.warning(f"  Full index status: {index_status}")
-
-# Only trigger sync if not already running (can't sync while RUNNING)
-if current_status in ["ONLINE_TRIGGERED_UPDATE", "ONLINE_UPDATING_PIPELINE_RESOURCES", "ONLINE_PIPELINE_FAILED"]:
-    logger.info("Sync already in progress or failed. Skipping sync trigger...")
-else:
-    logger.info("Triggering index sync (with scale-from-zero retry handling)...")
-    try:
-        sync_index_with_retry(
-            index=index,
-            embedding_endpoint_name=embedding_endpoint,
-            max_retries=10,
-            retry_interval_seconds=60,
-            timeout_minutes=10
-        )
-        logger.info("Index sync initiated successfully!")
-    except Exception as sync_error:
-        error_msg = f"ERROR: Index sync failed: {str(sync_error)}"
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-# -------------------------------------------------
-# STEP 4.5: Tolerant wait loop for sync completion
-# -------------------------------------------------
-if index:
-    logger.info("Waiting for index to be ready and synced...")
-    start_time = time.time()
-    pipeline_failed_count = 0
-
-    try:
-        index.wait_until_ready()
-
-        while True:
-            desc = index.describe()
-            index_status_info = desc['status']
-            status = index_status_info.get('detailed_state', 'UNKNOWN')
-            logger.info(f"  Index status: {status}")
-            log_sync_progress(index, desc=desc)
-
-            # ✅ Success
-            if status == "ONLINE_NO_PENDING_UPDATE":
-                logger.info("Index is fully synced and ready.")
-                break
-
-            # 🔄 Actively updating - reset timer (no timeout while making progress)
-            if status in ["ONLINE_TRIGGERED_UPDATE", "ONLINE_UPDATING_PIPELINE_RESOURCES"]:
-                start_time = time.time()  # Reset timer since progress is being made
-                logger.info("  Sync in progress, resetting timeout timer...")
-
-            # ⚠️ Transient failure handling - apply timeout only when failed
-            if status == "ONLINE_PIPELINE_FAILED":
-                pipeline_failed_count += 1
-                # Log failure details
-                status_message = index_status_info.get('message', 'No message available')
-                logger.warning(
-                    f"ONLINE_PIPELINE_FAILED detected "
-                    f"({pipeline_failed_count}/{MAX_PIPELINE_FAILURES})"
-                )
-                logger.warning(f"  Failure reason: {status_message}")
-
-                # Check timeout only when in failed state
-                elapsed = time.time() - start_time
-                if elapsed > MAX_WAIT_SECONDS:
-                    error_message = (
-                        f"ERROR: Index sync timed out after "
-                        f"{int(elapsed)} seconds in failed state"
-                    )
-                    logger.error(error_message)
-                    raise TimeoutError(error_message)
-
-                if pipeline_failed_count >= MAX_PIPELINE_FAILURES:
-                    error_message = (
-                        f"ERROR: Index entered ONLINE_PIPELINE_FAILED "
-                        f"state 3 times. Last message: {status_message}"
-                    )
-                    logger.info(f"{error_message}")
-                    raise Exception(error_message)
-
-            # ⏳ Still processing
-            time.sleep(POLL_INTERVAL)
-
-    except Exception as e:
-        error_message = f"ERROR: Index failed to sync: {e}"
-        logger.info(f"{error_message}")
+                "embedding_mode='precomputed' but the Compute_Embeddings task is not in this "
+                "job's DAG. Rebuild the DAG and re-run."
+            ) from e
         raise
+    if embedding_dim_raw is None:
+        raise RuntimeError(
+            "embedding_mode='precomputed' requires Compute_Embeddings task to set embedding_dim. "
+            "Check DAG ordering -- Compute_Embeddings must run before this task."
+        )
+    embedding_dim = int(embedding_dim_raw)
 
-else:
-    error_message = "ERROR: Index object is None after creation/retrieval attempts"
-    logger.info(f"{error_message}")
-    raise Exception(error_message)
+# Full create -> register -> provision-wait -> sync -> sync-wait (shared; see utils/vs_utils).
+index = create_and_sync_index(
+    client, spark,
+    endpoint_name=vs_endpoint,
+    index_name=index_name,
+    source_table=master_table,
+    primary_key=master_id_key,
+    embedding_mode=embedding_mode,
+    embedding_vector_column=embedding_vector_column,
+    embedding_dimension=embedding_dim,
+    embedding_source_column=merged_desc_column,
+    embedding_model_endpoint=embedding_endpoint,
+    endpoint_type=vs_endpoint_type,
+)
 
 # COMMAND ----------
 

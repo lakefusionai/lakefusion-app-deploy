@@ -19,16 +19,17 @@ def start_experiment(
     model_id: int,
     is_more_records: bool,
     existing_cluster: Optional[str]=None,
+    llm_shard_count: Optional[int]=1,
     check: dict = Depends(token_required_wrapper),
     db: Session = Depends(get_db)
 ):
     try:
         created_by = check.get('decoded', {}).get('sub', '')  # Extract created_by from the token
         token = check.get('token', '')  # Extract the token
-        
-        
+
+
         job_response = Model_Databricks_Job_Service(db)
-        job_id = job_response.start_experiment(entity_id, model_id, is_more_records, existing_cluster, created_by, token)
+        job_id = job_response.start_experiment(entity_id, model_id, is_more_records, existing_cluster, created_by, token, llm_shard_count=llm_shard_count)
         
         ## Commented out the below code as it's now handled within ExperimentService.start_experiment
 

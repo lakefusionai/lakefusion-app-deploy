@@ -53,6 +53,8 @@ class TaskValueKey(str, Enum):
     CONFIG_THRESHOLDS = "config_thresholds"
     PROCESS_RECORDS = "process_records"
     VS_ENDPOINT = "vs_endpoint"
+    VS_ENDPOINT_TYPE = "vs_endpoint_type"
+    VS_INDEX_VERSION = "vs_index_version"
     ADDITIONAL_INSTRUCTIONS = "additional_instructions"
     MAX_POTENTIAL_MATCHES = "max_potential_matches"
     BASE_PROMPT = "base_prompt"

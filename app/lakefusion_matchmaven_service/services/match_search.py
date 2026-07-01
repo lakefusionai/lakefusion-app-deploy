@@ -145,8 +145,11 @@ Take into account:
             # Build vector search index name
             entity_name = entity.name.lower().replace(' ', '_')
             embedding_mode = model_experiment.embedding_mode or "managed"
+            # Index version lives in the embedding_model JSON (single source of truth shared
+            # with the dbx notebooks); precomputed mode is versioned, managed is not.
+            vs_index_version = (model_experiment.embedding_model or {}).get("vs_index_version", "v2")
             if embedding_mode == "precomputed":
-                vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index_v2"
+                vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index_{vs_index_version}"
             else:
                 vs_index_name = f"{self.catalog_name}.gold.{entity_name}_master_prod_index"
             

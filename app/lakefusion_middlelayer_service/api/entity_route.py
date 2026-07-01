@@ -423,6 +423,7 @@ async def import_entity(
     except HTTPException:
         raise
     except Exception as e:
+        _webhook_logger.error(f"Failed to import entity: {e}")
         raise HTTPException(
-            status_code=500, detail=f"Failed to import entity: {str(e)}"
+            status_code=500, detail="Failed to import entity. Check server logs for details."
         )

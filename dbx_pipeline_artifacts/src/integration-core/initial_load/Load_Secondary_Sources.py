@@ -366,8 +366,6 @@ for idx, secondary_table in enumerate(secondary_tables, 1):
                 break
 
         if _has_complex_attrs and _full_records_for_table:
-            from utils.complex_type_mapping import project_source_to_target
-
             logger.info(f" Using complex-type projection")
             mapped_df = project_source_to_target(
                 secondary_df, _full_records_for_table, entity_attribute_records
